@@ -161,6 +161,8 @@ services:
   postgres:
     profiles: ['postgres'] # Optional service - only runs when profile is specified
     image: postgres:16-alpine
+    ports:
+      - '${POSTGRES_PORT:-5432}:${POSTGRES_PORT:-5432}'
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-agor}
       POSTGRES_USER: ${POSTGRES_USER:-agor}
