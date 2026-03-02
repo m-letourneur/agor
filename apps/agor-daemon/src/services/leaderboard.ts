@@ -29,10 +29,12 @@ export interface LeaderboardQuery {
   userId?: string;
   worktreeId?: string;
   repoId?: string;
+  boardId?: string; // NEW: Filter by board (joins through worktrees.board_id)
 
   // Time period (optional - ISO timestamps)
   startDate?: string;
   endDate?: string;
+  period?: 'today' | 'week' | 'month' | 'all'; // NEW: Convenience presets
 
   // Group by dimension (optional - defaults to all three)
   groupBy?:
@@ -75,6 +77,35 @@ export interface LeaderboardResult {
 }
 
 /**
+ * Parse period preset into start/end dates
+ */
+function parsePeriod(period?: string): { startDate?: Date; endDate?: Date } {
+  if (!period || period === 'all') {
+    return {};
+  }
+
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+  switch (period) {
+    case 'today':
+      return { startDate: today, endDate: new Date() };
+    case 'week': {
+      const weekAgo = new Date(now);
+      weekAgo.setDate(weekAgo.getDate() - 7);
+      return { startDate: weekAgo, endDate: now };
+    }
+    case 'month': {
+      const monthAgo = new Date(now);
+      monthAgo.setMonth(monthAgo.getMonth() - 1);
+      return { startDate: monthAgo, endDate: now };
+    }
+    default:
+      return {};
+  }
+}
+
+/**
  * Leaderboard service
  *
  * Custom service that doesn't use DrizzleService adapter since we need
@@ -98,14 +129,23 @@ export class LeaderboardService {
       userId,
       worktreeId,
       repoId,
-      startDate,
-      endDate,
+      boardId,
+      period,
       groupBy = 'user,worktree,repo',
       sortBy = 'cost',
       sortOrder = 'desc',
       limit = 50,
       offset = 0,
     } = query;
+
+    // Parse period into date range (overrides explicit startDate/endDate if provided)
+    let startDate = query.startDate;
+    let endDate = query.endDate;
+    if (period) {
+      const dates = parsePeriod(period);
+      if (dates.startDate) startDate = dates.startDate.toISOString();
+      if (dates.endDate) endDate = dates.endDate.toISOString();
+    }
 
     // Parse groupBy dimensions
     const dimensions = groupBy.split(',').map((d) => d.trim());
@@ -126,6 +166,10 @@ export class LeaderboardService {
 
     if (repoId) {
       conditions.push(eq(worktrees.repo_id, repoId));
+    }
+
+    if (boardId) {
+      conditions.push(eq(worktrees.board_id, boardId));
     }
 
     if (startDate) {

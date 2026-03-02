@@ -24,6 +24,7 @@ export const sessions = schema.sessions;
 export const tasks = schema.tasks;
 export const messages = schema.messages;
 export const boards = schema.boards;
+export const boardBudgets = schema.boardBudgets;
 export const repos = schema.repos;
 export const worktrees = schema.worktrees;
 export const worktreeOwners = schema.worktreeOwners;

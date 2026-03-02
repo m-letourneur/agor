@@ -209,3 +209,41 @@ export interface BoardExportBlob {
   // Custom context for templates
   custom_context?: Record<string, unknown>;
 }
+
+/**
+ * Board Budget - Cost tracking and limits per board
+ *
+ * Phase 1: Foundation for future budget enforcement
+ * Phase 2: Will include enforcement logic to block sessions when limits exceeded
+ */
+export interface BoardBudget {
+  /** Board this budget belongs to */
+  board_id: BoardID;
+
+  /** Daily spending limit in USD (null = no limit) */
+  daily_limit_usd?: number;
+
+  /** Monthly spending limit in USD (null = no limit) */
+  monthly_limit_usd?: number;
+
+  /**
+   * Alert threshold as percentage (0-100)
+   * Default: 80 (alert when 80% of budget used)
+   */
+  alert_threshold: number;
+
+  /**
+   * Whether to enforce budget limits (block sessions when exceeded)
+   * Phase 2 feature - currently no-op
+   */
+  enforce: boolean;
+
+  /** When this budget was created */
+  created_at: string;
+
+  /** When this budget was last updated */
+  updated_at?: string;
+
+  /** User who created this budget */
+  created_by?: string;
+}

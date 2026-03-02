@@ -934,7 +934,7 @@ export function setupMCPRoutes(app: Application, db: Database): void {
             {
               name: 'agor_analytics_leaderboard',
               description:
-                'Get usage analytics leaderboard showing token and cost breakdown. Supports dynamic grouping by user, worktree, or repo (or combinations). Use groupBy parameter to control aggregation level.',
+                'Get usage analytics leaderboard showing token and cost breakdown. Supports dynamic grouping by user, worktree, repo, or board. Use groupBy parameter to control aggregation level. Use boardId to scope to a specific board. Use period for convenient time ranges (today, week, month).',
               inputSchema: {
                 type: 'object',
                 properties: {
@@ -950,6 +950,10 @@ export function setupMCPRoutes(app: Application, db: Database): void {
                     type: 'string',
                     description: 'Filter by repository ID (optional)',
                   },
+                  boardId: {
+                    type: 'string',
+                    description: 'Filter by board ID (UUIDv7 or short ID, optional)',
+                  },
                   startDate: {
                     type: 'string',
                     description: 'Filter by start date (ISO 8601 format, optional)',
@@ -957,6 +961,12 @@ export function setupMCPRoutes(app: Application, db: Database): void {
                   endDate: {
                     type: 'string',
                     description: 'Filter by end date (ISO 8601 format, optional)',
+                  },
+                  period: {
+                    type: 'string',
+                    enum: ['today', 'week', 'month', 'all'],
+                    description:
+                      'Convenience time period preset (overrides startDate/endDate if provided, optional)',
                   },
                   groupBy: {
                     type: 'string',
@@ -3153,8 +3163,10 @@ export function setupMCPRoutes(app: Application, db: Database): void {
           if (args?.userId) query.userId = args.userId;
           if (args?.worktreeId) query.worktreeId = args.worktreeId;
           if (args?.repoId) query.repoId = args.repoId;
+          if (args?.boardId) query.boardId = args.boardId;
           if (args?.startDate) query.startDate = args.startDate;
           if (args?.endDate) query.endDate = args.endDate;
+          if (args?.period) query.period = args.period;
 
           // Add groupBy
           if (args?.groupBy) query.groupBy = args.groupBy;

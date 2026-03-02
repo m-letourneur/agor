@@ -3,6 +3,7 @@
  */
 
 export * from './base';
+export * from './board-budgets';
 export * from './board-comments';
 export * from './board-objects';
 export * from './boards';

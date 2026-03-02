@@ -18,6 +18,7 @@ import {
   index,
   integer,
   primaryKey,
+  real,
   sqliteTable,
   text,
   uniqueIndex,
@@ -320,6 +321,37 @@ export const boards = sqliteTable(
   (table) => ({
     nameIdx: index('boards_name_idx').on(table.name),
     slugIdx: index('boards_slug_idx').on(table.slug),
+  })
+);
+
+/**
+ * Board Budgets table - Cost tracking and budget limits per board
+ * Phase 1: Schema foundation for future budget enforcement
+ */
+export const boardBudgets = sqliteTable(
+  'board_budgets',
+  {
+    board_id: text('board_id', { length: 36 })
+      .primaryKey()
+      .references(() => boards.board_id, { onDelete: 'cascade' }),
+
+    // Budget limits (null = no limit set)
+    daily_limit_usd: real('daily_limit_usd'),
+    monthly_limit_usd: real('monthly_limit_usd'),
+
+    // Alert threshold (percentage, e.g., 80 = alert at 80% of limit)
+    alert_threshold: integer('alert_threshold').default(80),
+
+    // Enforcement (Phase 2 - when true, block sessions when limit exceeded)
+    enforce: t.bool('enforce').notNull().default(false),
+
+    // Metadata
+    created_at: t.timestamp('created_at').notNull(),
+    updated_at: t.timestamp('updated_at'),
+    created_by: text('created_by', { length: 36 }),
+  },
+  (table) => ({
+    boardIdx: index('board_budgets_board_idx').on(table.board_id),
   })
 );
 
@@ -1049,6 +1081,8 @@ export type MessageRow = typeof messages.$inferSelect;
 export type MessageInsert = typeof messages.$inferInsert;
 export type BoardRow = typeof boards.$inferSelect;
 export type BoardInsert = typeof boards.$inferInsert;
+export type BoardBudgetRow = typeof boardBudgets.$inferSelect;
+export type BoardBudgetInsert = typeof boardBudgets.$inferInsert;
 export type RepoRow = typeof repos.$inferSelect;
 export type RepoInsert = typeof repos.$inferInsert;
 export type WorktreeRow = typeof worktrees.$inferSelect;
