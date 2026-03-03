@@ -12,6 +12,21 @@ echo "🔧 Fixing home directory permissions..."
 mkdir -p /home/agor/.agor /home/agor/.cache
 sudo -n chown -R agor:agor /home/agor 2>/dev/null || true
 
+# Copy host SSH keys into container and apply amended config (no direct mount of ~/.ssh)
+if [ -d /mnt/host-ssh ]; then
+  echo "🔑 Copying SSH keys and amending config..."
+  mkdir -p /home/agor/.ssh
+  cp -r /mnt/host-ssh/. /home/agor/.ssh/ 2>/dev/null || true
+  chmod 700 /home/agor/.ssh
+  chmod 600 /home/agor/.ssh/id_* 2>/dev/null || true
+  chmod 644 /home/agor/.ssh/*.pub 2>/dev/null || true
+  if [ -f /app/docker/ssh_config ]; then
+    cp /app/docker/ssh_config /home/agor/.ssh/config
+    chmod 600 /home/agor/.ssh/config
+  fi
+  echo "✅ SSH keys and config ready"
+fi
+
 # Setup agor_executor home (for Unix isolation when executor_unix_user is configured)
 sudo -n mkdir -p /home/agor_executor/.cache /home/agor_executor/.agor
 sudo -n chown -R agor_executor:agor_executor /home/agor_executor 2>/dev/null || true
