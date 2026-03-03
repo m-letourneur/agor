@@ -1,6 +1,55 @@
 #!/bin/sh
 set -e
 
+# ============================================================================
+# Docker Socket Access (for worktree environments)
+# ============================================================================
+# When docker.sock is mounted, ensure the 'agor' user can access it.
+# The socket is owned by the host's 'docker' group (typically GID 999 or similar).
+# We add the 'agor' user to a group matching the socket's GID.
+#
+# This enables worktrees to run docker compose commands for their environments.
+# Without this setup, Docker CLI commands would fail with "permission denied".
+
+if [ -S /var/run/docker.sock ]; then
+  echo "[entrypoint] Docker socket detected, configuring access..."
+
+  # Get the GID of the docker.sock
+  DOCKER_SOCK_GID=$(stat -c '%g' /var/run/docker.sock)
+  echo "[entrypoint] Docker socket GID: ${DOCKER_SOCK_GID}"
+
+  # Create a docker group with matching GID (if it doesn't exist)
+  if ! getent group ${DOCKER_SOCK_GID} > /dev/null 2>&1; then
+    sudo groupadd -g ${DOCKER_SOCK_GID} docker
+    echo "[entrypoint] Created docker group with GID ${DOCKER_SOCK_GID}"
+  else
+    GROUP_NAME=$(getent group ${DOCKER_SOCK_GID} | cut -d: -f1)
+    echo "[entrypoint] Group with GID ${DOCKER_SOCK_GID} already exists: ${GROUP_NAME}"
+  fi
+
+  # Add agor user to the docker group
+  sudo usermod -aG ${DOCKER_SOCK_GID} agor
+  echo "[entrypoint] Added 'agor' user to docker group (GID ${DOCKER_SOCK_GID})"
+
+  # Verify access (this command should NOT error)
+  # Note: We need to use 'sg' to activate the new group membership in this shell
+  if sg ${DOCKER_SOCK_GID} -c 'docker ps' > /dev/null 2>&1; then
+    echo "[entrypoint] ✓ Docker socket access verified"
+  else
+    echo "[entrypoint] ⚠ Warning: Docker socket access may not be working"
+    echo "[entrypoint] Debugging info:"
+    ls -la /var/run/docker.sock || echo "  Socket not found"
+    groups agor || echo "  Could not get groups for agor user"
+  fi
+else
+  echo "[entrypoint] No Docker socket mounted (worktree docker compose environments will not be available)"
+  echo "[entrypoint] To enable Docker-in-Docker, add to docker-compose.yml:"
+  echo "[entrypoint]   volumes:"
+  echo "[entrypoint]     - /var/run/docker.sock:/var/run/docker.sock"
+fi
+
+echo ""  # Blank line for readability
+
 echo "🚀 Starting Agor development environment..."
 
 # Dependencies are baked into the Docker image and preserved via anonymous volumes

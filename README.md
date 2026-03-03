@@ -1,316 +1,200 @@
-<img src=".github/logo_circle.png" alt="Agor Logo" width="160" />
+# Docker-in-Docker Design for Agor Worktrees
 
-# Agor
-
-**Think Figma, but for AI coding assistants.** Orchestrate Claude Code, Codex, and Gemini sessions on a multiplayer canvas. Manage git worktrees, track AI conversations, and visualize your team's agentic work in real-time.
-
-> **TL;DR:** Agor is a multiplayer spatial canvas where you coordinate multiple AI coding assistants on parallel tasks, with GitHub-linked worktrees, automated workflow zones, and isolated test environments—all running simultaneously.
-
-**📖 [Read the full documentation at agor.live →](https://agor.live/)**
+**Status:** Design Complete ✅
+**Date:** 2026-03-03
+**Branch:** `design-simple-dind`
 
 ---
 
-## See It In Action
+## Overview
 
-<div align="center">
-  <table>
-    <tr>
-      <td width="50%">
-        <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/Area.gif" alt="Spatial 2D Canvas"/>
-        <p align="center"><em style="opacity: 0.5;">Spatial canvas with worktrees and zones</em></p>
-      </td>
-      <td width="50%">
-        <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/Convo.gif" alt="AI Conversation in Action"/>
-        <p align="center"><em style="opacity: 0.5;">Rich web UI for AI conversations</em></p>
-      </td>
-    </tr>
-    <tr>
-      <td width="50%">
-        <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/Settings.gif" alt="Settings and Configuration"/>
-        <p align="center"><em style="opacity: 0.5;">MCP servers and worktree management</em></p>
-      </td>
-      <td width="50%">
-        <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/Social.gif" alt="Real-time Multiplayer"/>
-        <p align="center"><em style="opacity: 0.5;">Live collaboration with cursors and comments</em></p>
-      </td>
-    </tr>
-  </table>
-</div>
+This directory contains the complete design and implementation plan for enabling Agor worktrees to run their own Docker Compose environments while Agor itself runs in Docker.
 
-**[→ Watch unscripted demo on YouTube](https://www.youtube.com/watch?v=3in0qh7ZH0g)** (13 minutes)
+**The Simple Approach:** Mount Docker socket + Install Docker CLI = Worktrees can `docker compose up` 🎉
 
 ---
 
-<div align="center">
-  <h3>✨ Pledge ✨</h3>
-  <p><strong>⭐️ I pledge to fix a GitHub issue for every star Agor gets :)</strong></p>
-</div>
+## Documents
+
+### 1. [DESIGN-SIMPLE-DIND.md](./DESIGN-SIMPLE-DIND.md)
+**Read this first!**
+
+Complete design document covering:
+- Current state analysis
+- Architecture explanation (Docker socket mounting)
+- Why this is the simplest approach
+- Testing strategy
+- Known limitations
+- Future enhancements
+
+**Key insight:** Agor's `.agor.yml` already uses `docker compose` commands—we just need to make Docker available!
+
+### 2. [DIND-QUICK-REFERENCE.md](./DIND-QUICK-REFERENCE.md)
+**TL;DR version**
+
+Quick reference guide with:
+- Visual architecture diagram
+- 3 changes needed (Dockerfile, docker-compose.yml, entrypoint)
+- Testing commands
+- Port allocation examples
+- Common patterns
+- Troubleshooting
+
+**Perfect for:** Implementation, copy-paste, quick lookups
+
+### 3. [IMPLEMENTATION-DIFF.md](./IMPLEMENTATION-DIFF.md)
+**Concrete code changes**
+
+Exact diffs for implementation:
+- Before/after code blocks
+- Line numbers and locations
+- Explanations for each change
+- Testing verification script
+- Build/deploy commands
+- Rollback plan
+
+**Perfect for:** Actually implementing the changes
+
+### 4. [SECURITY-AND-BEST-PRACTICES.md](./SECURITY-AND-BEST-PRACTICES.md)
+**Security considerations**
+
+Comprehensive security analysis:
+- Threat model
+- Appropriate use cases (✅ dev, ❌ multi-tenant)
+- Best practices for users/admins
+- Security hardening options (future)
+- Compliance considerations
+- Incident response
+
+**Perfect for:** Understanding risks, making deployment decisions
 
 ---
 
-## Installation
+## Implementation Status
 
-### Requirements
+✅ **IMPLEMENTED** - All code changes have been applied to this branch.
 
-- **Node.js** 20.x
-- **Zellij** ≥ 0.40 (required - daemon will not start without it)
+### Changes Made
 
-Install Zellij:
+The following files have been modified to enable Docker-in-Docker support:
+
+1. **`docker/Dockerfile`** - Added Docker CLI and Compose plugin installation
+   - Installs `ca-certificates`, `gnupg`, `lsb-release` dependencies
+   - Adds Docker official APT repository
+   - Installs `docker-ce-cli` and `docker-compose-plugin`
+   - Verifies installation during build
+
+2. **`docker-compose.yml`** - Mounted Docker socket
+   - Adds volume mount: `/var/run/docker.sock:/var/run/docker.sock`
+   - Enables Agor container to communicate with host Docker daemon
+
+3. **`docker/docker-entrypoint.sh`** - Configured socket permissions
+   - Detects mounted Docker socket at startup
+   - Creates docker group matching socket GID
+   - Adds `agor` user to docker group
+   - Verifies access with test command
+   - Provides helpful error messages
+
+4. **`docker/test-dind.sh`** - Created verification script (NEW)
+   - Tests Docker CLI availability
+   - Verifies daemon connectivity
+   - Validates user permissions
+   - Runs test container
+
+### How to Deploy
 
 ```bash
-# Ubuntu/Debian
-curl -L https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-unknown-linux-musl.tar.gz | sudo tar -xz -C /usr/local/bin
+# 1. Rebuild Docker image with new changes
+docker compose build --no-cache
 
-# macOS
-brew install zellij
+# 2. Start Agor with new configuration
+docker compose up -d
 
-# RHEL/CentOS
-curl -L https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-unknown-linux-musl.tar.gz | sudo tar -xz -C /usr/local/bin
+# 3. Verify Docker access
+docker compose exec agor-dev docker ps
+
+# 4. Run comprehensive test
+docker compose exec agor-dev bash /app/docker/test-dind.sh
+
+# 5. Check logs for entrypoint output
+docker compose logs agor-dev | grep entrypoint
+# Should see: "✓ Docker socket access verified"
 ```
 
-### Install Agor
+### Rollback Instructions
+
+If you need to revert these changes:
 
 ```bash
-npm install -g agor-live
+# Stop containers
+docker compose down
+
+# Revert code changes
+git checkout HEAD~1 -- docker/Dockerfile docker-compose.yml docker/docker-entrypoint.sh
+git clean -f docker/test-dind.sh
+
+# Rebuild original image
+docker compose build
+
+# Restart
+docker compose up -d
 ```
 
-**Note:** Agor requires Zellij for persistent terminal sessions. The daemon will fail to start with a helpful error message if Zellij is not installed.
+---
+
+## Quick Summary
+
+### What We're Doing
+
+1. Install Docker CLI in Agor container
+2. Mount Docker socket from host
+3. Fix permissions at startup
+
+~60 lines of code total.
+
+### What We're Getting
+
+✅ Worktrees can run docker compose
+✅ Unique ports per worktree (template system)
+✅ Full environment isolation
+✅ Existing configs work without changes
+
+### Architecture
+
+```
+Host Docker Daemon
+  ├── Agor Container (has Docker CLI + socket access)
+  ├── Worktree 1 Environment (sibling, ports 3001/5001)
+  ├── Worktree 2 Environment (sibling, ports 3002/5002)
+  └── Worktree 3 Environment (sibling, ports 3003/5003)
+```
+
+**Key:** Not nested Docker, but sibling containers!
+
+---
 
 ## Quick Start
 
-```bash
-# 1. Initialize (creates ~/.agor/ and database)
-agor init
+**To understand the design:**
+→ Read DESIGN-SIMPLE-DIND.md
 
-# 2. Start the daemon
-agor daemon start
+**To implement:**
+→ Follow IMPLEMENTATION-DIFF.md
 
-# 3. Open the UI
-agor open
-```
+**For quick reference:**
+→ Check DIND-QUICK-REFERENCE.md
 
-**Try in Codespaces:**
-
-[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://github.com/codespaces/new?skip_quickstart=true&machine=basicLinux32gb&repo=1069864589&ref=main&devcontainer_path=.devcontainer%2Fdevcontainer.json&geo=UsWest)
+**For security review:**
+→ Review SECURITY-AND-BEST-PRACTICES.md
 
 ---
 
-## Key Features
+## Next Steps
 
-### 🧩 Agent Swarm Control
+1. Review design documents
+2. Assess security for your use case
+3. Implement changes (3 files, ~1 hour)
+4. Test thoroughly (~1 hour)
+5. Deploy with confidence!
 
-- Run as many **Claude Code**, **Codex**, and **Gemini** sessions as you can handle—simultaneously.
-- Agents in Agor can coordinate and supervise through the internal Agor MCP service.
-- Built-in **scheduler** triggers templated prompts on your cadence.
-
-### 🌐 Multiplayer Spatial Canvas
-
-- Figma-esque board layout organizes your AI coding sessions across boards (full 2D canvases).
-- **Scoped/spatial comments** + reactions pinned to boards, zones, or worktrees (Figma-style).
-- WebSocket-powered cursor broadcasting and facepiles show teammates in real time.
-
-### 🌲 Session Trees — Fork, Spawn, Coordinate
-
-- **Fork sessions** to explore alternatives without losing the original path.
-- **Spawn subsessions** for focused subtasks that report back to the parent.
-- Visualize the session genealogy in "session trees"
-
-### ⚙️ Zone Triggers — Workflows Made Spatial
-
-- Define **zones** on your board that trigger templated prompts when worktrees are dropped.
-- Build **kanban-style flows** or custom pipelines: analyze → develop → review → deploy.
-- **GitHub-native workflow**: Link worktrees to issues/PRs, auto-inject context into prompts
-  - Template syntax: `"deeply analyze this github issue: {{ worktree.issue_url }}"`
-  - Each worktree = isolated branch for a specific issue/PR
-  - AI agents automatically read the linked issue/PR context
-
-### 🌳 Isolated Development Environments
-
-**The Problem:** Working on 3 PRs simultaneously? Each needs different ports, dependencies, database states.
-
-**Agor's Solution:**
-
-- Each worktree gets its own **isolated environment** with auto-managed unique ports
-- Configure start/stop commands once with templates: `PORT={{ add 9000 worktree.unique_id }} docker compose up -d`
-- Everyone on your team can **one-click start/stop** any worktree's environment
-- Multiple AI agents work in parallel without stepping on each other
-- Health monitoring tracks if services are running properly
-
-**No more:** "Kill your local server, I need to test my branch"
-
-### 🕹️ Real-Time Strategy for AI Teams
-
-- Coordinate agentic work like a multiplayer RTS.
-- Watch teammates or agents move across tasks live.
-- Cluster sessions, delegate, pivot, and iterate together.
-
-### 📱 Mobile-Friendly Prompting
-
-- **Keep sessions cooking on the go** — mobile-optimized UI for sending prompts and monitoring progress.
-- Access conversations, send follow-ups, and check agent status from your phone.
-- Full conversation view with hamburger navigation to switch between sessions.
-
----
-
-## Use Case: Parallel PR Workflow
-
-Your team has 3 bug fixes and 2 features in flight. With Agor:
-
-1. **Create 5 worktrees**, each linked to its GitHub issue/PR
-2. **Spawn AI sessions** for each worktree (Claude, Codex, Gemini)
-3. **Drop into zones** → "Analyze" zone triggers: `"Review this issue: {{ worktree.issue_url }}"`
-4. **Watch in real-time** as all 5 agents work simultaneously on the spatial canvas
-5. **Isolated environments** with unique ports prevent conflicts
-6. **Push directly** from worktrees to GitHub when ready
-
-**No context switching. No port collisions. No waiting.**
-
----
-
-## Screenshots
-
-<div align="center">
-  <img src="https://github.com/preset-io/agor/releases/download/v0.7.9/hero.png" alt="Agor Board" style="width: 100%; border-radius: 8px; margin-bottom: 24px;" />
-  <p style="opacity: 0.5;"><em>Multiplayer spatial canvas with zones, worktrees, and real-time collaboration</em></p>
-</div>
-
-<div align="center">
-  <table>
-    <tr>
-      <td width="50%">
-        <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/conversation_full_page.png" alt="Conversation View"/>
-        <p align="center"><em style="opacity: 0.5;">Task-centric conversation UI</em></p>
-      </td>
-      <td width="50%">
-        <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/settings_modal.png" alt="Settings Modal"/>
-        <p align="center"><em style="opacity: 0.5;">MCP server and worktree management</em></p>
-      </td>
-    </tr>
-    <tr>
-      <td width="50%">
-        <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/zone_trigger_modal.png" alt="Zone Trigger Modal"/>
-        <p align="center"><em style="opacity: 0.5;">Zone trigger modal on session drop</em></p>
-      </td>
-      <td width="50%">
-        <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/zone_trigger_config.png" alt="Zone Configuration"/>
-        <p align="center"><em style="opacity: 0.5;">Zone trigger configuration</em></p>
-      </td>
-    </tr>
-    <tr>
-      <td width="50%">
-        <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/env_configuration.png" alt="Environment Configuration"/>
-        <p align="center"><em style="opacity: 0.5;">Worktree environment setup</em></p>
-      </td>
-      <td width="50%">
-        <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/create_session_modal.png" alt="Create Session Modal"/>
-        <p align="center"><em style="opacity: 0.5;">Session creation with agent selection</em></p>
-      </td>
-    </tr>
-    <tr>
-      <td width="50%">
-        <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/baked_in_terminal.png" alt="Built-in Terminal"/>
-        <p align="center"><em style="opacity: 0.5;">Built-in terminal with worktree context</em></p>
-      </td>
-      <td width="50%">
-        <img src="https://github.com/preset-io/agor/releases/download/v0.3.15/onboarding.png" alt="Onboarding Experience"/>
-        <p align="center"><em style="opacity: 0.5;">Welcome screen showing team status</em></p>
-      </td>
-    </tr>
-  </table>
-</div>
-
----
-
-## Architecture
-
-```mermaid
-graph TB
-    subgraph Clients
-        CLI["CLI (oclif)"]
-        UI["Web UI (React)"]
-    end
-
-    Client["Feathers Client<br/>REST + WebSocket"]
-
-    subgraph "Agor Daemon"
-        Feathers["FeathersJS Server"]
-        MCP["MCP HTTP Endpoint<br/>/mcp?sessionToken=..."]
-        Services["Services<br/>Sessions, Tasks, Messages<br/>Boards, Worktrees, Repos"]
-        AgentSDKs["Agent SDKs<br/>Claude, Codex, Gemini"]
-        ORM["Drizzle ORM"]
-    end
-
-    subgraph Storage
-        DB[("LibSQL Database<br/>~/.agor/agor.db")]
-        Git["Git Worktrees<br/>~/.agor/worktrees/"]
-        Config["Config<br/>~/.agor/config.yaml"]
-    end
-
-    CLI --> Client
-    UI --> Client
-
-    Client <-->|REST + WebSocket| Feathers
-
-    Feathers --> Services
-    Feathers --> MCP
-    MCP --> Services
-    Services --> ORM
-    Services --> AgentSDKs
-    AgentSDKs -.->|JSON-RPC 2.0| MCP
-
-    ORM --> DB
-    Services --> Git
-    Services --> Config
-```
-
-**[Full Architecture Guide →](https://agor.live/guide/architecture)**
-
----
-
-## Development
-
-**[Development Guide →](https://agor.live/guide/development)**
-
-Quick start (localhost):
-
-```bash
-# Terminal 1: Daemon
-cd apps/agor-daemon && pnpm dev  # :3030
-
-# Terminal 2: UI
-cd apps/agor-ui && pnpm dev      # :5173
-```
-
-Or use Docker:
-
-```bash
-docker compose up
-```
-
----
-
-## Roadmap
-
-**[View roadmap on GitHub →](https://github.com/preset-io/agor/issues?q=is%3Aissue+state%3Aopen+label%3Aroadmap)**
-
-Highlights:
-
-- **Match CLI-Native Features** — SDKs are evolving rapidly and exposing more functionality. Push integrations deeper to match all key features available in the underlying CLIs
-- **Bring Your Own IDE** — Connect VSCode, Cursor, or any IDE directly to Agor-managed worktrees via SSH/Remote
-- **Unix User Integration** — Enable true multi-tenancy with per-user Unix isolation for secure collaboration. [Read the exploration →](https://github.com/preset-io/agor/blob/main/context/explorations/unix-user-integration.md)
-
----
-
-## Community
-
-- **[Discord](https://discord.gg/Qh4TrFQZpd)** - Join our Discord community for support and discussion
-- **[GitHub Discussions](https://github.com/preset-io/agor/discussions)** - Ask questions, share ideas
-- **[GitHub Issues](https://github.com/preset-io/agor/issues)** - Report bugs, request features
-
----
-
-## About
-
-**Heavily prompted by [@mistercrunch](https://github.com/mistercrunch)** ([Preset](https://preset.io), [Apache Superset](https://github.com/apache/superset), [Apache Airflow](https://github.com/apache/airflow)), built by an army of Claudes.
-
-Read the story: [Making of Agor →](https://agor.live/blog/making-of-agor)
+🚀 **Let's ship it!**

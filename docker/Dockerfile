@@ -30,7 +30,24 @@ RUN apt-get update && apt-get install -y \
   tree \
   openssh-server \
   acl \
+  ca-certificates \
+  gnupg \
+  lsb-release \
   && rm -rf /var/lib/apt/lists/*
+
+# Install Docker CLI (for worktree environments that use docker compose)
+# This enables worktrees to run their own Docker Compose environments
+# by communicating with the host Docker daemon via mounted socket
+RUN install -m 0755 -d /etc/apt/keyrings && \
+  curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg && \
+  chmod a+r /etc/apt/keyrings/docker.gpg && \
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list && \
+  apt-get update && \
+  apt-get install -y docker-ce-cli docker-compose-plugin && \
+  rm -rf /var/lib/apt/lists/*
+
+# Verify Docker CLI installation
+RUN docker --version && docker compose version
 
 # Configure SSH server for multi-user testing (used in postgres profile)
 RUN mkdir -p /run/sshd && \

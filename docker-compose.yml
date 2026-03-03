@@ -153,6 +153,10 @@ services:
       - agor-home:/home/agor
       # Mount SSH keys for git authentication (dev only)
       - ~/.ssh:/home/agor/.ssh:ro
+      # Mount Docker socket for worktree environments
+      # Enables worktrees to run docker compose commands
+      # Note: This gives Agor container access to host Docker daemon
+      - /var/run/docker.sock:/var/run/docker.sock
     stdin_open: true
     tty: true
 
