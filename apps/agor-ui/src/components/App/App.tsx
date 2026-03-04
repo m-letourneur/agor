@@ -462,11 +462,20 @@ export const App: React.FC<AppProps> = ({
   // Update browser tab title based on current board
   useBoardTitle(currentBoard);
 
+  // Period selection for cost pill (default: 7 days)
+  const [selectedPeriodDays, setSelectedPeriodDays] = useState<number | null>(7);
+
   // Fetch board cost data for the header pill
   const { cost: boardCost, loading: boardCostLoading } = useBoardCost(
     client,
-    currentBoardId as import('@agor/core/types').BoardID | undefined
+    currentBoardId as import('@agor/core/types').BoardID | undefined,
+    selectedPeriodDays
   );
+
+  // Handle period selection change
+  const handlePeriodChange = useCallback((days: number | null) => {
+    setSelectedPeriodDays(days);
+  }, []);
 
   // Find worktree and repo for WorktreeModal
   const selectedWorktree = worktreeModalWorktreeId
@@ -639,6 +648,8 @@ export const App: React.FC<AppProps> = ({
             boardCostLoading={boardCostLoading}
             budgetDailyUsd={currentBoard?.budget_daily_usd}
             budgetTotalUsd={currentBoard?.budget_total_usd}
+            selectedPeriodDays={selectedPeriodDays}
+            onPeriodChange={handlePeriodChange}
             instanceLabel={instanceLabel}
             instanceDescription={instanceDescription}
           />

@@ -38,13 +38,13 @@ const POLL_INTERVAL_MS = 60_000;
  *
  * @param client - Agor client instance
  * @param boardId - Board ID to fetch cost for
- * @param periodDays - Number of days for the "recent" period (default: 7)
+ * @param periodDays - Number of days for the "recent" period (null = all time, default: 7)
  * @returns Cost data, loading state, error, and refetch function
  */
 export function useBoardCost(
   client: AgorClient | null,
   boardId: BoardID | null | undefined,
-  periodDays = 7
+  periodDays: number | null = 7
 ): UseBoardCostResult {
   const [cost, setCost] = useState<BoardCostData | null>(null);
   const [loading, setLoading] = useState(false);
@@ -60,6 +60,37 @@ export function useBoardCost(
     try {
       setLoading(true);
       setError(null);
+
+      // When periodDays is null (all time), make single call
+      if (periodDays === null) {
+        const totalResult = await client.service('leaderboard').find({
+          query: {
+            boardId,
+            groupBy: 'worktree',
+            limit: 1000,
+          },
+        });
+
+        // biome-ignore lint/suspicious/noExplicitAny: Leaderboard service returns untyped data
+        const totalData = (totalResult as any)?.data || totalResult || [];
+        // biome-ignore lint/suspicious/noExplicitAny: Leaderboard entries are untyped from generic service call
+        const totalCost = totalData.reduce((sum: number, entry: any) => sum + (entry.totalCost || 0), 0);
+        // biome-ignore lint/suspicious/noExplicitAny: Leaderboard entries are untyped from generic service call
+        const totalTaskCount = totalData.reduce(
+          // biome-ignore lint/suspicious/noExplicitAny: Leaderboard entries are untyped from generic service call
+          (sum: number, entry: any) => sum + (entry.taskCount || 0),
+          0
+        );
+
+        setCost({
+          totalCost,
+          periodCost: totalCost,
+          totalTaskCount,
+          periodTaskCount: totalTaskCount,
+          periodDays: 0, // 0 indicates all time
+        });
+        return;
+      }
 
       // Calculate period start date
       const periodStart = new Date();

@@ -5,10 +5,24 @@
  * Color-codes based on budget proximity when budget limits are set.
  */
 
-import { DollarOutlined } from '@ant-design/icons';
-import { Skeleton, Tag, Tooltip, theme } from 'antd';
+import { CheckOutlined, DollarOutlined, DownOutlined } from '@ant-design/icons';
+import { Dropdown, type MenuProps, Skeleton, Space, Tag, Tooltip, theme } from 'antd';
 import type React from 'react';
 import type { BoardCostData } from '../../hooks/useBoardCost';
+
+/** Period options for cost filtering */
+export interface PeriodOption {
+  label: string;
+  days: number | null; // null = all time
+  key: string;
+}
+
+export const PERIOD_OPTIONS: PeriodOption[] = [
+  { label: 'Today', days: 1, key: 'today' },
+  { label: 'Last 7 days', days: 7, key: '7d' },
+  { label: 'Last 30 days', days: 30, key: '30d' },
+  { label: 'All time', days: null, key: 'all' },
+];
 
 export interface BoardCostPillProps {
   /** Cost data from useBoardCost hook */
@@ -19,6 +33,10 @@ export interface BoardCostPillProps {
   budgetDailyUsd?: number | null;
   /** Total budget limit in USD (null = no limit) */
   budgetTotalUsd?: number | null;
+  /** Selected period in days (null = all time) */
+  selectedPeriodDays: number | null;
+  /** Callback when period selection changes */
+  onPeriodChange: (days: number | null) => void;
 }
 
 /**
@@ -32,6 +50,18 @@ function formatCost(cost: number): string {
     return `$${cost.toFixed(2)}`;
   }
   return `$${Math.round(cost)}`;
+}
+
+/**
+ * Format period label for display in pill
+ * - 1 day: "today"
+ * - 7+ days: "7d", "30d"
+ * - null (all time): "all"
+ */
+function getPeriodLabel(days: number | null): string {
+  if (days === null) return 'all';
+  if (days === 1) return 'today';
+  return `${days}d`;
 }
 
 /**
@@ -67,8 +97,18 @@ export const BoardCostPill: React.FC<BoardCostPillProps> = ({
   loading = false,
   budgetDailyUsd,
   budgetTotalUsd,
+  selectedPeriodDays,
+  onPeriodChange,
 }) => {
   const { token } = theme.useToken();
+
+  // Build dropdown menu items with checkmark on selected period
+  const periodMenuItems: MenuProps['items'] = PERIOD_OPTIONS.map((option) => ({
+    key: option.key,
+    label: option.label,
+    icon: selectedPeriodDays === option.days ? <CheckOutlined /> : null,
+    onClick: () => onPeriodChange(option.days),
+  }));
 
   if (loading && !cost) {
     return <Skeleton.Button active size="small" style={{ width: 60, height: 22 }} />;
@@ -85,47 +125,84 @@ export const BoardCostPill: React.FC<BoardCostPillProps> = ({
 
   const pillColor = getPillColor(displayCost, budgetDailyUsd, budgetTotalUsd);
 
+  // Determine if showing all-time data (no period filter)
+  const isAllTime = selectedPeriodDays === null;
+
   const tooltipContent = (
     <div style={{ minWidth: 180 }}>
       <div style={{ fontWeight: 600, marginBottom: 4 }}>Board Cost</div>
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          gap: 16,
-        }}
-      >
-        <span>Last {displayCost.periodDays}d:</span>
-        <span style={{ fontFamily: token.fontFamilyCode }}>
-          {formatCost(displayCost.periodCost)}
-        </span>
-      </div>
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          gap: 16,
-        }}
-      >
-        <span>Total:</span>
-        <span style={{ fontFamily: token.fontFamilyCode }}>
-          {formatCost(displayCost.totalCost)}
-        </span>
-      </div>
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          gap: 16,
-          color: token.colorTextDescription,
-          fontSize: token.fontSizeSM,
-        }}
-      >
-        <span>Tasks ({displayCost.periodDays}d / total):</span>
-        <span style={{ fontFamily: token.fontFamilyCode }}>
-          {displayCost.periodTaskCount} / {displayCost.totalTaskCount}
-        </span>
-      </div>
+      {!isAllTime && (
+        <>
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              gap: 16,
+            }}
+          >
+            <span>Last {displayCost.periodDays}d:</span>
+            <span style={{ fontFamily: token.fontFamilyCode }}>
+              {formatCost(displayCost.periodCost)}
+            </span>
+          </div>
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              gap: 16,
+            }}
+          >
+            <span>Total:</span>
+            <span style={{ fontFamily: token.fontFamilyCode }}>
+              {formatCost(displayCost.totalCost)}
+            </span>
+          </div>
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              gap: 16,
+              color: token.colorTextDescription,
+              fontSize: token.fontSizeSM,
+            }}
+          >
+            <span>Tasks ({displayCost.periodDays}d / total):</span>
+            <span style={{ fontFamily: token.fontFamilyCode }}>
+              {displayCost.periodTaskCount} / {displayCost.totalTaskCount}
+            </span>
+          </div>
+        </>
+      )}
+      {isAllTime && (
+        <>
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              gap: 16,
+            }}
+          >
+            <span>Total cost:</span>
+            <span style={{ fontFamily: token.fontFamilyCode }}>
+              {formatCost(displayCost.totalCost)}
+            </span>
+          </div>
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              gap: 16,
+              color: token.colorTextDescription,
+              fontSize: token.fontSizeSM,
+            }}
+          >
+            <span>Total tasks:</span>
+            <span style={{ fontFamily: token.fontFamilyCode }}>
+              {displayCost.totalTaskCount}
+            </span>
+          </div>
+        </>
+      )}
       {budgetDailyUsd != null && budgetDailyUsd > 0 && (
         <div
           style={{
@@ -161,16 +238,22 @@ export const BoardCostPill: React.FC<BoardCostPillProps> = ({
   );
 
   return (
-    <Tooltip title={tooltipContent} placement="bottom">
-      <Tag
-        icon={<DollarOutlined style={{ fontSize: 12 }} />}
-        color={pillColor}
-        style={{ cursor: 'default' }}
-      >
-        <span style={{ fontFamily: token.fontFamilyCode, lineHeight: 1 }}>
-          {formatCost(displayCost.periodCost)} / {displayCost.periodDays}d
-        </span>
-      </Tag>
-    </Tooltip>
+    <Dropdown menu={{ items: periodMenuItems }} trigger={['click']} placement="bottomLeft">
+      <Tooltip title={tooltipContent} placement="bottom">
+        <Tag
+          icon={<DollarOutlined style={{ fontSize: 12 }} />}
+          color={pillColor}
+          style={{ cursor: 'pointer' }}
+        >
+          <Space size={4}>
+            <span style={{ fontFamily: token.fontFamilyCode, lineHeight: 1 }}>
+              {formatCost(isAllTime ? displayCost.totalCost : displayCost.periodCost)} /{' '}
+              {getPeriodLabel(selectedPeriodDays)}
+            </span>
+            <DownOutlined style={{ fontSize: 10, opacity: 0.6 }} />
+          </Space>
+        </Tag>
+      </Tooltip>
+    </Dropdown>
   );
 };
