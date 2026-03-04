@@ -7,6 +7,7 @@
 
 import { CheckOutlined, DollarOutlined, DownOutlined } from '@ant-design/icons';
 import { Dropdown, type MenuProps, Skeleton, Space, Tag, Tooltip, theme } from 'antd';
+import { useState } from 'react';
 import type React from 'react';
 import type { BoardCostData } from '../../hooks/useBoardCost';
 
@@ -101,7 +102,7 @@ export const BoardCostPill: React.FC<BoardCostPillProps> = ({
   onPeriodChange,
 }) => {
   const { token } = theme.useToken();
-  const [dropdownOpen, setDropdownOpen] = React.useState(false);
+  const [dropdownOpen, setDropdownOpen] = useState(false);
 
   // Build dropdown menu items with checkmark on selected period
   const periodMenuItems: MenuProps['items'] = PERIOD_OPTIONS.map((option) => ({
