@@ -237,12 +237,17 @@ export const BoardCostPill: React.FC<BoardCostPillProps> = ({
   );
 
   return (
-    <Tooltip title={tooltipContent} placement="bottom" open={dropdownOpen ? false : undefined}>
-      <Dropdown
-        menu={{ items: periodMenuItems }}
-        trigger={['click']}
-        placement="bottomLeft"
-        onOpenChange={setDropdownOpen}
+    <Dropdown
+      menu={{ items: periodMenuItems }}
+      trigger={['click']}
+      placement="bottomLeft"
+      onOpenChange={setDropdownOpen}
+      open={dropdownOpen}
+    >
+      <Tooltip
+        title={tooltipContent}
+        placement="bottom"
+        open={dropdownOpen ? false : undefined}
       >
         <Tag
           icon={<DollarOutlined style={{ fontSize: 12 }} />}
@@ -257,7 +262,7 @@ export const BoardCostPill: React.FC<BoardCostPillProps> = ({
             <DownOutlined style={{ fontSize: 10, opacity: 0.6 }} />
           </Space>
         </Tag>
-      </Dropdown>
-    </Tooltip>
+      </Tooltip>
+    </Dropdown>
   );
 };
