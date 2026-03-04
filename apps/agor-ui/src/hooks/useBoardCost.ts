@@ -88,11 +88,6 @@ export function useBoardCost(
         }),
       ]);
 
-      // DEBUG: trace response shape (remove after debugging)
-      console.log('[useBoardCost] boardId:', boardId);
-      console.log('[useBoardCost] totalResult:', JSON.stringify(totalResult).slice(0, 500));
-      console.log('[useBoardCost] periodResult:', JSON.stringify(periodResult).slice(0, 500));
-
       // biome-ignore lint/suspicious/noExplicitAny: Leaderboard service returns untyped data
       const totalData = (totalResult as any)?.data || totalResult || [];
       // biome-ignore lint/suspicious/noExplicitAny: Leaderboard service returns untyped data
@@ -124,8 +119,6 @@ export function useBoardCost(
         periodDays,
       });
     } catch (err) {
-      // DEBUG: trace errors (remove after debugging)
-      console.error('[useBoardCost] error:', err);
       setError(err instanceof Error ? err.message : 'Failed to fetch board cost');
     } finally {
       setLoading(false);

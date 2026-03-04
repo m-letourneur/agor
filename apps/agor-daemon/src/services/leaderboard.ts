@@ -109,9 +109,6 @@ export class LeaderboardService {
       offset = 0,
     } = query;
 
-    // DEBUG: trace board cost queries (remove after debugging)
-    console.log('[leaderboard] query:', { boardId, startDate, endDate, groupBy, userId, worktreeId, repoId });
-
     // Parse groupBy dimensions
     const dimensions = groupBy.split(',').map((d) => d.trim());
     const includeUser = dimensions.includes('user');
@@ -281,9 +278,6 @@ export class LeaderboardService {
         taskCount: r.taskCount || 0,
       };
     });
-
-    // DEBUG: trace board cost results (remove after debugging)
-    console.log('[leaderboard] results:', { total, rowCount: data.length, sumCost: data.reduce((s, d) => s + d.totalCost, 0) });
 
     return {
       data,
