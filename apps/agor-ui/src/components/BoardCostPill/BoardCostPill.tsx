@@ -101,6 +101,7 @@ export const BoardCostPill: React.FC<BoardCostPillProps> = ({
   onPeriodChange,
 }) => {
   const { token } = theme.useToken();
+  const [dropdownOpen, setDropdownOpen] = React.useState(false);
 
   // Build dropdown menu items with checkmark on selected period
   const periodMenuItems: MenuProps['items'] = PERIOD_OPTIONS.map((option) => ({
@@ -197,9 +198,7 @@ export const BoardCostPill: React.FC<BoardCostPillProps> = ({
             }}
           >
             <span>Total tasks:</span>
-            <span style={{ fontFamily: token.fontFamilyCode }}>
-              {displayCost.totalTaskCount}
-            </span>
+            <span style={{ fontFamily: token.fontFamilyCode }}>{displayCost.totalTaskCount}</span>
           </div>
         </>
       )}
@@ -215,9 +214,7 @@ export const BoardCostPill: React.FC<BoardCostPillProps> = ({
           }}
         >
           <span>Daily budget:</span>
-          <span style={{ fontFamily: token.fontFamilyCode }}>
-            {formatCost(budgetDailyUsd)}
-          </span>
+          <span style={{ fontFamily: token.fontFamilyCode }}>{formatCost(budgetDailyUsd)}</span>
         </div>
       )}
       {budgetTotalUsd != null && budgetTotalUsd > 0 && (
@@ -230,7 +227,8 @@ export const BoardCostPill: React.FC<BoardCostPillProps> = ({
         >
           <span>Total budget:</span>
           <span style={{ fontFamily: token.fontFamilyCode }}>
-            {formatCost(budgetTotalUsd)} ({Math.round((displayCost.totalCost / budgetTotalUsd) * 100)}%)
+            {formatCost(budgetTotalUsd)} (
+            {Math.round((displayCost.totalCost / budgetTotalUsd) * 100)}%)
           </span>
         </div>
       )}
@@ -238,8 +236,13 @@ export const BoardCostPill: React.FC<BoardCostPillProps> = ({
   );
 
   return (
-    <Dropdown menu={{ items: periodMenuItems }} trigger={['click']} placement="bottomLeft">
-      <Tooltip title={tooltipContent} placement="bottom">
+    <Tooltip title={tooltipContent} placement="bottom" open={dropdownOpen ? false : undefined}>
+      <Dropdown
+        menu={{ items: periodMenuItems }}
+        trigger={['click']}
+        placement="bottomLeft"
+        onOpenChange={setDropdownOpen}
+      >
         <Tag
           icon={<DollarOutlined style={{ fontSize: 12 }} />}
           color={pillColor}
@@ -253,7 +256,7 @@ export const BoardCostPill: React.FC<BoardCostPillProps> = ({
             <DownOutlined style={{ fontSize: 10, opacity: 0.6 }} />
           </Space>
         </Tag>
-      </Tooltip>
-    </Dropdown>
+      </Dropdown>
+    </Tooltip>
   );
 };

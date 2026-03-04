@@ -74,7 +74,10 @@ export function useBoardCost(
         // biome-ignore lint/suspicious/noExplicitAny: Leaderboard service returns untyped data
         const totalData = (totalResult as any)?.data || totalResult || [];
         // biome-ignore lint/suspicious/noExplicitAny: Leaderboard entries are untyped from generic service call
-        const totalCost = totalData.reduce((sum: number, entry: any) => sum + (entry.totalCost || 0), 0);
+        const totalCost = totalData.reduce(
+          (sum: number, entry: any) => sum + (entry.totalCost || 0),
+          0
+        );
         // biome-ignore lint/suspicious/noExplicitAny: Leaderboard entries are untyped from generic service call
         const totalTaskCount = totalData.reduce(
           // biome-ignore lint/suspicious/noExplicitAny: Leaderboard entries are untyped from generic service call
@@ -126,7 +129,10 @@ export function useBoardCost(
 
       // Sum across all worktrees
       // biome-ignore lint/suspicious/noExplicitAny: Leaderboard entries are untyped from generic service call
-      const totalCost = totalData.reduce((sum: number, entry: any) => sum + (entry.totalCost || 0), 0);
+      const totalCost = totalData.reduce(
+        (sum: number, entry: any) => sum + (entry.totalCost || 0),
+        0
+      );
       // biome-ignore lint/suspicious/noExplicitAny: Leaderboard entries are untyped from generic service call
       const totalTaskCount = totalData.reduce(
         // biome-ignore lint/suspicious/noExplicitAny: Leaderboard entries are untyped from generic service call
@@ -134,7 +140,10 @@ export function useBoardCost(
         0
       );
       // biome-ignore lint/suspicious/noExplicitAny: Leaderboard entries are untyped from generic service call
-      const periodCost = periodData.reduce((sum: number, entry: any) => sum + (entry.totalCost || 0), 0);
+      const periodCost = periodData.reduce(
+        (sum: number, entry: any) => sum + (entry.totalCost || 0),
+        0
+      );
       // biome-ignore lint/suspicious/noExplicitAny: Leaderboard entries are untyped from generic service call
       const periodTaskCount = periodData.reduce(
         // biome-ignore lint/suspicious/noExplicitAny: Leaderboard entries are untyped from generic service call
