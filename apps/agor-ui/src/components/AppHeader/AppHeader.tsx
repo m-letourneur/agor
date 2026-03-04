@@ -23,6 +23,8 @@ import {
   theme,
 } from 'antd';
 import { useState } from 'react';
+import type { BoardCostData } from '../../hooks/useBoardCost';
+import { BoardCostPill } from '../BoardCostPill';
 import { BoardSwitcher } from '../BoardSwitcher';
 import { BrandLogo } from '../BrandLogo';
 import { ConnectionStatus } from '../ConnectionStatus';
@@ -61,6 +63,14 @@ export interface AppHeaderProps {
     boardId?: BoardID,
     cursorPosition?: { x: number; y: number }
   ) => void; // Navigate to user's board
+  /** Board cost data from useBoardCost hook */
+  boardCost?: BoardCostData | null;
+  /** Whether board cost is loading */
+  boardCostLoading?: boolean;
+  /** Daily budget limit for current board */
+  budgetDailyUsd?: number | null;
+  /** Total budget limit for current board */
+  budgetTotalUsd?: number | null;
   /** Instance label for deployment identification (displayed as a Tag) */
   instanceLabel?: string;
   /** Instance description (markdown) shown in popover around the instance label */
@@ -92,6 +102,10 @@ export const AppHeader: React.FC<AppHeaderProps> = ({
   worktreeById = new Map(),
   boardById,
   onUserClick,
+  boardCost,
+  boardCostLoading,
+  budgetDailyUsd,
+  budgetTotalUsd,
   instanceLabel,
   instanceDescription,
 }) => {
@@ -202,6 +216,14 @@ export const AppHeader: React.FC<AppHeaderProps> = ({
               worktreeById={worktreeById}
             />
           </div>
+        )}
+        {currentBoardId && (
+          <BoardCostPill
+            cost={boardCost ?? null}
+            loading={boardCostLoading}
+            budgetDailyUsd={budgetDailyUsd}
+            budgetTotalUsd={budgetTotalUsd}
+          />
         )}
         {currentBoardName && (
           <Tooltip title="Toggle session drawer" placement="bottom">

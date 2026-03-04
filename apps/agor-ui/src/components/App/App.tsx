@@ -27,6 +27,7 @@ import {
 import { mapToArray } from '@/utils/mapHelpers';
 import { AppActionsProvider } from '../../contexts/AppActionsContext';
 import { AppDataProvider } from '../../contexts/AppDataContext';
+import { useBoardCost } from '../../hooks/useBoardCost';
 import { useBoardTitle } from '../../hooks/useBoardTitle';
 import { useEventStream } from '../../hooks/useEventStream';
 import { useFaviconStatus } from '../../hooks/useFaviconStatus';
@@ -461,6 +462,12 @@ export const App: React.FC<AppProps> = ({
   // Update browser tab title based on current board
   useBoardTitle(currentBoard);
 
+  // Fetch board cost data for the header pill
+  const { cost: boardCost, loading: boardCostLoading } = useBoardCost(
+    client,
+    currentBoardId as import('@agor/core/types').BoardID | undefined
+  );
+
   // Find worktree and repo for WorktreeModal
   const selectedWorktree = worktreeModalWorktreeId
     ? worktreeById.get(worktreeModalWorktreeId)
@@ -628,6 +635,10 @@ export const App: React.FC<AppProps> = ({
                 // This would require exposing a method on SessionCanvasRef
               }
             }}
+            boardCost={boardCost}
+            boardCostLoading={boardCostLoading}
+            budgetDailyUsd={currentBoard?.budget_daily_usd}
+            budgetTotalUsd={currentBoard?.budget_total_usd}
             instanceLabel={instanceLabel}
             instanceDescription={instanceDescription}
           />
