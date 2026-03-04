@@ -314,6 +314,8 @@ export const boards = sqliteTable(
         background_color?: string; // Background color for the board canvas
         objects?: Record<string, import('@agor/core/types').BoardObject>; // Board objects (text, zone)
         custom_context?: Record<string, unknown>; // Custom context for Handlebars templates
+        budget_daily_usd?: number | null; // Daily budget limit in USD
+        budget_total_usd?: number | null; // Total cumulative budget limit in USD
       }>()
       .notNull(),
   },

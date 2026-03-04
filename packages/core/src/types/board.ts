@@ -178,6 +178,20 @@ export interface Board {
   custom_context?: Record<string, unknown>;
 
   /**
+   * Daily budget limit in USD (null/undefined = no limit)
+   * When set, the UI displays warnings when cost approaches or exceeds this limit.
+   * Future: enforcement will pause/block new tasks when exceeded.
+   */
+  budget_daily_usd?: number | null;
+
+  /**
+   * Total cumulative budget limit in USD (null/undefined = no limit)
+   * Applies to the entire lifetime cost of this board.
+   * Future: enforcement will pause/block new tasks when exceeded.
+   */
+  budget_total_usd?: number | null;
+
+  /**
    * External/user-facing URL for viewing this board in the UI
    *
    * Computed property added by API hooks.

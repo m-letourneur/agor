@@ -29,6 +29,7 @@ export interface LeaderboardQuery {
   userId?: string;
   worktreeId?: string;
   repoId?: string;
+  boardId?: string;
 
   // Time period (optional - ISO timestamps)
   startDate?: string;
@@ -98,6 +99,7 @@ export class LeaderboardService {
       userId,
       worktreeId,
       repoId,
+      boardId,
       startDate,
       endDate,
       groupBy = 'user,worktree,repo',
@@ -128,18 +130,22 @@ export class LeaderboardService {
       conditions.push(eq(worktrees.repo_id, repoId));
     }
 
+    if (boardId) {
+      conditions.push(eq(worktrees.board_id, boardId));
+    }
+
     if (startDate) {
-      // Use Date object for Postgres compatibility (timestamp with time zone)
-      // For SQLite (stored as integer ms), Drizzle will auto-convert Date to ms
-      const startDateObj = new Date(startDate);
-      conditions.push(sql`${tasks.created_at} >= ${startDateObj}`);
+      // Pass ISO string directly — PostgreSQL casts to timestamptz natively,
+      // SQLite stores as text/integer and compares lexicographically with ISO strings.
+      // Avoid passing Date objects in sql`` templates as postgres.js serializes them
+      // via .toString() which produces a format PostgreSQL cannot parse.
+      const isoStart = new Date(startDate).toISOString();
+      conditions.push(sql`${tasks.created_at} >= ${isoStart}`);
     }
 
     if (endDate) {
-      // Use Date object for Postgres compatibility (timestamp with time zone)
-      // For SQLite (stored as integer ms), Drizzle will auto-convert Date to ms
-      const endDateObj = new Date(endDate);
-      conditions.push(sql`${tasks.created_at} <= ${endDateObj}`);
+      const isoEnd = new Date(endDate).toISOString();
+      conditions.push(sql`${tasks.created_at} <= ${isoEnd}`);
     }
 
     const whereClause = conditions.length > 0 ? and(...conditions) : undefined;

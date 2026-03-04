@@ -41,6 +41,8 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
       background_color?: string;
       objects?: Record<string, BoardObject>;
       custom_context?: Record<string, unknown>;
+      budget_daily_usd?: number | null;
+      budget_total_usd?: number | null;
     };
 
     const boardId = row.board_id as UUID;
@@ -82,6 +84,8 @@ export class BoardRepository implements BaseRepository<Board, Partial<Board>> {
         background_color: board.background_color,
         objects: board.objects,
         custom_context: board.custom_context,
+        budget_daily_usd: board.budget_daily_usd,
+        budget_total_usd: board.budget_total_usd,
       },
     };
   }
