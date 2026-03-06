@@ -248,6 +248,10 @@ export class WhatsAppConnector implements GatewayConnector {
       syncFullHistory: false,
       connectTimeoutMs: 60_000,
       defaultQueryTimeoutMs: 60_000,
+      // Workaround for error 405: Specify explicit WA version
+      // See: https://github.com/WhiskeySockets/Baileys/issues/2370
+      // @ts-expect-error - version not in type definition but supported by Baileys
+      version: [2, 3000, 1033893291],
       getMessage: async () => undefined,
     });
 
