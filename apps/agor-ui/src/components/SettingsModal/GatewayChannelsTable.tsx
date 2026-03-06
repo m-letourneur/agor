@@ -1,4 +1,5 @@
 import type { AgorClient } from '@agor/core/api';
+import type { WhatsAppConnectionEvent } from '@agor/core/gateway';
 import type {
   AgenticToolName,
   ChannelType,
@@ -42,6 +43,7 @@ import {
   theme,
 } from 'antd';
 import { useEffect, useState } from 'react';
+import { QRCodeSVG } from 'qrcode.react';
 import { mapToArray } from '@/utils/mapHelpers';
 import { useThemedMessage } from '@/utils/message';
 import { AgenticToolConfigForm } from '../AgenticToolConfigForm';
@@ -217,17 +219,134 @@ const ChannelFormFields: React.FC<{
         <Switch />
       </Form.Item>
 
-      {channelType !== 'slack' && (
+      {channelType !== 'slack' && channelType !== 'whatsapp' && (
         <Alert
           message={`${channelType.charAt(0).toUpperCase() + channelType.slice(1)} support coming soon`}
-          description="This platform integration is not yet available. Slack is currently the only supported platform."
+          description="This platform integration is not yet available. Slack and WhatsApp are currently supported."
           type="info"
           showIcon
           style={{ marginBottom: 16 }}
         />
       )}
 
-      {/* ── Collapsible sections (Slack only) ── */}
+      {/* ── Collapsible sections (WhatsApp) ── */}
+      {channelType === 'whatsapp' && (
+        <Collapse
+          ghost
+          defaultActiveKey={mode === 'create' ? ['access-policy'] : []}
+          style={{ marginLeft: -16, marginRight: -16 }}
+          items={[
+            // ── Access Policy ──
+            {
+              key: 'access-policy',
+              label: (
+                <SectionLabel
+                  icon={<TeamOutlined />}
+                  title="Access Policy"
+                  subtitle="who can message"
+                />
+              ),
+              children: (
+                <>
+                  <Typography.Text
+                    type="secondary"
+                    style={{ fontSize: 12, display: 'block', marginBottom: 16 }}
+                  >
+                    Control who can send messages to Agor through WhatsApp.
+                  </Typography.Text>
+
+                  <Form.Item
+                    label="DM Policy"
+                    name="dm_policy"
+                    initialValue="open"
+                    tooltip="Who can start conversations via direct message"
+                  >
+                    <Select>
+                      <Select.Option value="open">Open — anyone can message</Select.Option>
+                      <Select.Option value="allowlist">
+                        Allowlist — only approved numbers
+                      </Select.Option>
+                      <Select.Option value="disabled">Disabled — ignore all DMs</Select.Option>
+                    </Select>
+                  </Form.Item>
+
+                  <Form.Item
+                    label="Group Policy"
+                    name="group_policy"
+                    initialValue="disabled"
+                    tooltip="Whether the bot responds in WhatsApp group chats"
+                  >
+                    <Select>
+                      <Select.Option value="open">Open — respond in all groups</Select.Option>
+                      <Select.Option value="allowlist">
+                        Allowlist — only approved senders
+                      </Select.Option>
+                      <Select.Option value="disabled">Disabled — ignore group messages</Select.Option>
+                    </Select>
+                  </Form.Item>
+
+                  <Form.Item
+                    name="allowlist"
+                    label="Allowed Phone Numbers"
+                    tooltip="E.164 format phone numbers without + (e.g., 15551234567). Only used when policy is set to 'allowlist'."
+                  >
+                    <Select
+                      mode="tags"
+                      placeholder="Add phone numbers... (e.g., 15551234567)"
+                      style={{ width: '100%' }}
+                      tokenSeparators={[',', ' ']}
+                    />
+                  </Form.Item>
+
+                  <Form.Item
+                    label="Send Read Receipts"
+                    name="read_receipts"
+                    valuePropName="checked"
+                    initialValue={true}
+                    tooltip="Show blue checkmarks when messages are processed"
+                  >
+                    <Switch />
+                  </Form.Item>
+                </>
+              ),
+            },
+
+            // ── Agentic Tool Configuration ──
+            {
+              key: 'agentic-tool-config',
+              label: (
+                <SectionLabel
+                  icon={<ThunderboltOutlined />}
+                  title="Agent Configuration"
+                  subtitle={selectedAgent}
+                />
+              ),
+              children: (
+                <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    Configure which agent and settings to use for sessions created from this channel.
+                  </Typography.Text>
+                  <AgentSelectionGrid
+                    agents={AVAILABLE_AGENTS}
+                    selectedAgentId={selectedAgent}
+                    onSelect={onAgentChange}
+                    columns={2}
+                    showHelperText={false}
+                    showComparisonLink={false}
+                  />
+                  <AgenticToolConfigForm
+                    agenticTool={selectedAgent as AgenticToolName}
+                    mcpServerById={mcpServerById}
+                    showHelpText={false}
+                  />
+                </Space>
+              ),
+            },
+          ]}
+        />
+      )}
+
+      {/* ── Collapsible sections (Slack) ── */}
       {channelType === 'slack' && (
         <Collapse
           ghost
@@ -552,6 +671,12 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
   const [createForm] = Form.useForm();
   const [editForm] = Form.useForm();
 
+  // WhatsApp connection state tracking
+  const [whatsappQR, setWhatsappQR] = useState<{ channelId: string; qr: string } | null>(null);
+  const [whatsappStatus, setWhatsappStatus] = useState<
+    Map<string, { status: 'connecting' | 'connected' | 'disconnected'; phoneNumber?: string }>
+  >(new Map());
+
   // Pre-populate agentic config form with user defaults when agent changes
   useEffect(() => {
     const agentDefaults = currentUser?.default_agentic_config?.[selectedAgent as AgenticToolName];
@@ -568,6 +693,60 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
     }
   }, [selectedAgent, currentUser, createForm, editForm, editModalOpen]);
 
+  // Subscribe to WhatsApp connection events
+  useEffect(() => {
+    if (!client) return;
+
+    const gatewayService = client.service('gateway-channels');
+
+    const handleQR = (event: WhatsAppConnectionEvent & { type: 'qr' }) => {
+      console.log('[whatsapp-ui] QR code received for channel', event.channelId.substring(0, 8));
+      setWhatsappQR({ channelId: event.channelId, qr: event.qr });
+      setWhatsappStatus((prev) => {
+        const next = new Map(prev);
+        next.set(event.channelId, { status: 'connecting' });
+        return next;
+      });
+    };
+
+    const handleConnected = (event: WhatsAppConnectionEvent & { type: 'connected' }) => {
+      console.log(
+        '[whatsapp-ui] Connected for channel',
+        event.channelId.substring(0, 8),
+        event.phoneNumber ? `as ${event.phoneNumber}` : ''
+      );
+      setWhatsappQR((prev) => (prev?.channelId === event.channelId ? null : prev));
+      setWhatsappStatus((prev) => {
+        const next = new Map(prev);
+        next.set(event.channelId, { status: 'connected', phoneNumber: event.phoneNumber });
+        return next;
+      });
+    };
+
+    const handleDisconnected = (event: WhatsAppConnectionEvent & { type: 'disconnected' }) => {
+      console.log(
+        '[whatsapp-ui] Disconnected for channel',
+        event.channelId.substring(0, 8),
+        event.reason
+      );
+      setWhatsappStatus((prev) => {
+        const next = new Map(prev);
+        next.set(event.channelId, { status: 'disconnected' });
+        return next;
+      });
+    };
+
+    gatewayService.on('whatsapp:qr', handleQR);
+    gatewayService.on('whatsapp:connected', handleConnected);
+    gatewayService.on('whatsapp:disconnected', handleDisconnected);
+
+    return () => {
+      gatewayService.removeListener('whatsapp:qr', handleQR);
+      gatewayService.removeListener('whatsapp:connected', handleConnected);
+      gatewayService.removeListener('whatsapp:disconnected', handleDisconnected);
+    };
+  }, [client]);
+
   const extractFormData = (
     values: Record<string, unknown>,
     existingConfig?: Record<string, unknown>,
@@ -583,7 +762,14 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       delete sanitizedExisting[field];
     }
     const config: Record<string, unknown> = { ...sanitizedExisting };
-    if (values.channel_type === 'slack') {
+    if (values.channel_type === 'whatsapp') {
+      config.dm_policy = values.dm_policy ?? 'open';
+      config.group_policy = values.group_policy ?? 'disabled';
+      config.read_receipts = values.read_receipts ?? true;
+      if (values.allowlist && Array.isArray(values.allowlist)) {
+        config.allowlist = values.allowlist;
+      }
+    } else if (values.channel_type === 'slack') {
       if (values.bot_token) config.bot_token = values.bot_token;
       if (values.app_token) config.app_token = values.app_token;
       if (values.connection_mode) config.connection_mode = values.connection_mode;
@@ -687,13 +873,18 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       agor_user_id: channel.agor_user_id,
       enabled: channel.enabled,
       connection_mode: config?.connection_mode || 'socket',
-      // Message source configuration
+      // Slack message source configuration
       enable_channels: config?.enable_channels ?? false,
       enable_groups: config?.enable_groups ?? false,
       enable_mpim: config?.enable_mpim ?? false,
       require_mention: config?.require_mention ?? true,
       align_slack_users: config?.align_slack_users ?? false,
       allowed_channel_ids: (config?.allowed_channel_ids as string[]) ?? [],
+      // WhatsApp configuration
+      dm_policy: config?.dm_policy ?? 'open',
+      group_policy: config?.group_policy ?? 'disabled',
+      read_receipts: config?.read_receipts ?? true,
+      allowlist: (config?.allowlist as string[]) ?? [],
       // Agentic config fields
       permissionMode: channel.agentic_config?.permissionMode,
       modelConfig: channel.agentic_config?.modelConfig,
@@ -751,12 +942,28 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       title: '',
       key: 'status',
       width: 40,
-      render: (_: unknown, channel: GatewayChannel) => (
-        <Badge
-          status={channel.enabled ? 'success' : 'default'}
-          title={channel.enabled ? 'Enabled' : 'Disabled'}
-        />
-      ),
+      render: (_: unknown, channel: GatewayChannel) => {
+        const waStatus = whatsappStatus.get(channel.id);
+        let status: 'success' | 'processing' | 'error' | 'default' = channel.enabled
+          ? 'success'
+          : 'default';
+        let title = channel.enabled ? 'Enabled' : 'Disabled';
+
+        if (channel.channel_type === 'whatsapp' && channel.enabled && waStatus) {
+          if (waStatus.status === 'connecting') {
+            status = 'processing';
+            title = 'Connecting...';
+          } else if (waStatus.status === 'connected') {
+            status = 'success';
+            title = `Connected${waStatus.phoneNumber ? ` (${waStatus.phoneNumber})` : ''}`;
+          } else if (waStatus.status === 'disconnected') {
+            status = 'error';
+            title = 'Disconnected';
+          }
+        }
+
+        return <Badge status={status} title={title} />;
+      },
     },
     {
       title: 'Name',
@@ -1018,6 +1225,31 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
               showIcon
               style={{ marginBottom: 16 }}
             />
+            {createdChannelType === 'whatsapp' && (
+              <Alert
+                message="WhatsApp Setup — QR Code Pairing"
+                description={
+                  <ol style={{ margin: 0, paddingLeft: 20, fontSize: 12 }}>
+                    <li>The daemon will begin the pairing process automatically</li>
+                    <li>
+                      A QR code will appear in a popup — scan it with WhatsApp on your phone
+                      (Settings → Linked Devices → Link a Device)
+                    </li>
+                    <li>
+                      After pairing, the connection persists across daemon restarts (credentials
+                      stored locally)
+                    </li>
+                    <li>
+                      <strong>Tip:</strong> Use a secondary phone number for the linked WhatsApp
+                      account
+                    </li>
+                  </ol>
+                }
+                type="info"
+                showIcon
+                style={{ marginBottom: 12 }}
+              />
+            )}
             {createdChannelType === 'slack' && (
               <Alert
                 message="Slack Setup"
@@ -1049,6 +1281,55 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
               type="info"
               showIcon
             />
+          </div>
+        )}
+      </Modal>
+
+      {/* WhatsApp QR Code Modal */}
+      <Modal
+        title="WhatsApp Setup — Scan QR Code"
+        open={whatsappQR !== null}
+        onCancel={() => setWhatsappQR(null)}
+        footer={[
+          <Button key="close" onClick={() => setWhatsappQR(null)}>
+            Close
+          </Button>,
+        ]}
+        width={480}
+      >
+        {whatsappQR && (
+          <div style={{ textAlign: 'center', padding: '24px 0' }}>
+            <Alert
+              message="Link your WhatsApp account"
+              description={
+                <ol style={{ margin: '8px 0 0 0', paddingLeft: 20, fontSize: 12, textAlign: 'left' }}>
+                  <li>Open WhatsApp on your phone</li>
+                  <li>Go to Settings → Linked Devices</li>
+                  <li>Tap "Link a Device"</li>
+                  <li>Scan this QR code</li>
+                </ol>
+              }
+              type="info"
+              showIcon
+              style={{ marginBottom: 24, textAlign: 'left' }}
+            />
+            <div
+              style={{
+                display: 'inline-block',
+                padding: 16,
+                background: 'white',
+                borderRadius: 8,
+                border: '1px solid #d9d9d9',
+              }}
+            >
+              <QRCodeSVG value={whatsappQR.qr} size={256} level="M" />
+            </div>
+            <Typography.Text
+              type="secondary"
+              style={{ display: 'block', marginTop: 16, fontSize: 12 }}
+            >
+              Channel ID: {whatsappQR.channelId.substring(0, 8)}
+            </Typography.Text>
           </div>
         )}
       </Modal>
