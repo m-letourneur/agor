@@ -89,6 +89,7 @@ declare module '@whiskeysockets/baileys' {
     browser?: [string, string, string];
     // biome-ignore lint/suspicious/noExplicitAny: Third-party library logger interface
     logger?: any;
+    printQRInTerminal?: boolean;
     markOnlineOnConnect?: boolean;
     syncFullHistory?: boolean;
     // biome-ignore lint/suspicious/noExplicitAny: Third-party library getMessage signature uses any for key and return type
