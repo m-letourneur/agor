@@ -24,7 +24,9 @@
  */
 
 import makeWASocket, {
+  type ConnectionUpdate,
   DisconnectReason,
+  type MessagesUpsert,
   useMultiFileAuthState,
   type WAMessage,
   type WASocket,
@@ -236,7 +238,7 @@ export class WhatsAppConnector implements GatewayConnector {
     });
 
     // Connection state changes (QR code, connected, disconnected)
-    this.socket.ev.on('connection.update', (update) => {
+    this.socket.ev.on('connection.update', (update: ConnectionUpdate) => {
       this.handleConnectionUpdate(update);
     });
 
@@ -248,7 +250,7 @@ export class WhatsAppConnector implements GatewayConnector {
     });
 
     // Inbound messages
-    this.socket.ev.on('messages.upsert', ({ messages, type }) => {
+    this.socket.ev.on('messages.upsert', ({ messages, type }: MessagesUpsert) => {
       if (type !== 'notify') return; // Only process real-time messages
 
       for (const msg of messages) {
@@ -257,14 +259,7 @@ export class WhatsAppConnector implements GatewayConnector {
     });
   }
 
-  private handleConnectionUpdate(
-    update: Partial<{
-      connection: 'open' | 'connecting' | 'close';
-      lastDisconnect?: { error: Error | undefined; date: Date };
-      qr?: string;
-      isNewLogin?: boolean;
-    }>
-  ): void {
+  private handleConnectionUpdate(update: ConnectionUpdate): void {
     const { connection, lastDisconnect, qr } = update;
 
     // QR code for pairing
@@ -402,8 +397,8 @@ export class WhatsAppConnector implements GatewayConnector {
     // Send read receipt if configured
     if (this.config.read_receipts !== false && this.socket && msg.key.id) {
       this.socket
-        .readMessages([msg.key as any])
-        .catch((err) => console.warn('[whatsapp] Failed to send read receipt:', err));
+        .readMessages([msg.key])
+        .catch((err: Error) => console.warn('[whatsapp] Failed to send read receipt:', err));
     }
 
     this.inboundCallback?.({
