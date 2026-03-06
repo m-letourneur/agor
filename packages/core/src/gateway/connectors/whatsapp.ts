@@ -23,6 +23,9 @@
  *   e.g. "wa:15551234567", "wa:g:120363XXXX@g.us"
  */
 
+import { mkdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import makeWASocket, {
   type ConnectionUpdate,
   DisconnectReason,
@@ -31,9 +34,6 @@ import makeWASocket, {
   type WAMessage,
   type WASocket,
 } from '@whiskeysockets/baileys';
-import { mkdirSync } from 'fs';
-import { homedir } from 'os';
-import { join } from 'path';
 
 import type { ChannelType } from '../../types/gateway';
 import type { GatewayConnector, InboundMessage } from '../connector';
@@ -122,9 +122,7 @@ export class WhatsAppConnector implements GatewayConnector {
    * Event emitter for surfacing connection events (QR codes, status changes)
    * to the gateway service, which forwards them to the UI via WebSocket.
    */
-  private connectionEventCallback:
-    | ((event: WhatsAppConnectionEvent) => void)
-    | null = null;
+  private connectionEventCallback: ((event: WhatsAppConnectionEvent) => void) | null = null;
 
   constructor(config: Record<string, unknown>) {
     this.config = config as unknown as WhatsAppConfig;
@@ -179,6 +177,7 @@ export class WhatsAppConnector implements GatewayConnector {
     const credsDir = getCredsDir(this.channelId);
     mkdirSync(credsDir, { recursive: true });
 
+    // biome-ignore lint/correctness/useHookAtTopLevel: useMultiFileAuthState is from Baileys library, not a React hook
     const { state, saveCreds } = await useMultiFileAuthState(credsDir);
     this.saveCreds = saveCreds;
 
@@ -215,23 +214,34 @@ export class WhatsAppConnector implements GatewayConnector {
 
   // ─── Private ───────────────────────────────────────────────────────
 
+  /**
+   * Create a logger compatible with Baileys.
+   * The child() method must return a logger with the same interface.
+   */
+  private createBaileysLogger() {
+    const logger = {
+      level: 'silent' as const,
+      trace: () => {},
+      debug: () => {},
+      info: () => {},
+      warn: (...args: unknown[]) => console.warn('[whatsapp:baileys]', ...args),
+      error: (...args: unknown[]) => console.error('[whatsapp:baileys]', ...args),
+      fatal: (...args: unknown[]) => console.error('[whatsapp:baileys:fatal]', ...args),
+      child: () => logger,
+    };
+    return logger;
+  }
+
   private async connectSocket(
     authState: Awaited<ReturnType<typeof useMultiFileAuthState>>['state']
   ): Promise<void> {
     this.socket = makeWASocket({
       auth: authState,
       browser: ['Agor', 'Desktop', '1.0.0'],
-      // Suppress Baileys' verbose logging — use our own
-      logger: {
-        level: 'silent',
-        child: () => this.socket?.logger ?? ({ level: 'silent' } as any),
-        trace: () => {},
-        debug: () => {},
-        info: () => {},
-        warn: (...args: unknown[]) => console.warn('[whatsapp:baileys]', ...args),
-        error: (...args: unknown[]) => console.error('[whatsapp:baileys]', ...args),
-        fatal: (...args: unknown[]) => console.error('[whatsapp:baileys:fatal]', ...args),
-      } as any,
+      // Suppress Baileys' verbose logging — use custom logger
+      // Note: child() must return a logger with same interface to avoid "trace is not a function" errors
+      // biome-ignore lint/suspicious/noExplicitAny: Baileys logger type is incompatible, requires type assertion
+      logger: this.createBaileysLogger() as any,
       markOnlineOnConnect: false,
       syncFullHistory: false,
       getMessage: async () => undefined,
@@ -273,9 +283,7 @@ export class WhatsAppConnector implements GatewayConnector {
     }
 
     if (connection === 'open') {
-      const phoneNumber = this.socket?.user?.id
-        ? jidToPhone(this.socket.user.id)
-        : undefined;
+      const phoneNumber = this.socket?.user?.id ? jidToPhone(this.socket.user.id) : undefined;
       console.log(
         `[whatsapp] Connected${phoneNumber ? ` as ${phoneNumber}` : ''} (channel ${this.channelId.substring(0, 8)})`
       );
@@ -287,7 +295,9 @@ export class WhatsAppConnector implements GatewayConnector {
     }
 
     if (connection === 'close') {
-      const error = lastDisconnect?.error as (Error & { output?: { statusCode?: number } }) | undefined;
+      const error = lastDisconnect?.error as
+        | (Error & { output?: { statusCode?: number } })
+        | undefined;
       const statusCode = error?.output?.statusCode;
       const reason = statusCode ?? 'unknown';
 
@@ -329,6 +339,7 @@ export class WhatsAppConnector implements GatewayConnector {
       this.reconnectTimer = null;
       try {
         const credsDir = getCredsDir(this.channelId);
+        // biome-ignore lint/correctness/useHookAtTopLevel: useMultiFileAuthState is from Baileys library, not a React hook
         const { state, saveCreds } = await useMultiFileAuthState(credsDir);
         this.saveCreds = saveCreds;
         await this.connectSocket(state);
@@ -364,10 +375,7 @@ export class WhatsAppConnector implements GatewayConnector {
     const senderPhone = jidToPhone(senderJid);
 
     // Allowlist check
-    if (
-      (!isGroup && dmPolicy === 'allowlist') ||
-      (isGroup && groupPolicy === 'allowlist')
-    ) {
+    if ((!isGroup && dmPolicy === 'allowlist') || (isGroup && groupPolicy === 'allowlist')) {
       const allowlist = this.config.allowlist ?? [];
       if (!allowlist.includes(senderPhone)) {
         return; // Not in allowlist
@@ -408,9 +416,7 @@ export class WhatsAppConnector implements GatewayConnector {
       timestamp,
       metadata: {
         is_group: isGroup,
-        ...(isGroup && msg.key.participant
-          ? { group_participant: msg.key.participant }
-          : {}),
+        ...(isGroup && msg.key.participant ? { group_participant: msg.key.participant } : {}),
       },
     });
   }
