@@ -92,6 +92,8 @@ declare module '@whiskeysockets/baileys' {
     printQRInTerminal?: boolean;
     markOnlineOnConnect?: boolean;
     syncFullHistory?: boolean;
+    connectTimeoutMs?: number;
+    defaultQueryTimeoutMs?: number;
     // biome-ignore lint/suspicious/noExplicitAny: Third-party library getMessage signature uses any for key and return type
     getMessage?: (key: any) => Promise<any>;
   }): WASocket;

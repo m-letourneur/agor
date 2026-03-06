@@ -246,6 +246,8 @@ export class WhatsAppConnector implements GatewayConnector {
       logger: this.createBaileysLogger() as any,
       markOnlineOnConnect: false,
       syncFullHistory: false,
+      connectTimeoutMs: 60_000,
+      defaultQueryTimeoutMs: 60_000,
       getMessage: async () => undefined,
     });
 
