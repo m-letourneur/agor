@@ -217,17 +217,134 @@ const ChannelFormFields: React.FC<{
         <Switch />
       </Form.Item>
 
-      {channelType !== 'slack' && (
+      {channelType !== 'slack' && channelType !== 'whatsapp' && (
         <Alert
           message={`${channelType.charAt(0).toUpperCase() + channelType.slice(1)} support coming soon`}
-          description="This platform integration is not yet available. Slack is currently the only supported platform."
+          description="This platform integration is not yet available. Slack and WhatsApp are currently supported."
           type="info"
           showIcon
           style={{ marginBottom: 16 }}
         />
       )}
 
-      {/* ── Collapsible sections (Slack only) ── */}
+      {/* ── Collapsible sections (WhatsApp) ── */}
+      {channelType === 'whatsapp' && (
+        <Collapse
+          ghost
+          defaultActiveKey={mode === 'create' ? ['access-policy'] : []}
+          style={{ marginLeft: -16, marginRight: -16 }}
+          items={[
+            // ── Access Policy ──
+            {
+              key: 'access-policy',
+              label: (
+                <SectionLabel
+                  icon={<TeamOutlined />}
+                  title="Access Policy"
+                  subtitle="who can message"
+                />
+              ),
+              children: (
+                <>
+                  <Typography.Text
+                    type="secondary"
+                    style={{ fontSize: 12, display: 'block', marginBottom: 16 }}
+                  >
+                    Control who can send messages to Agor through WhatsApp.
+                  </Typography.Text>
+
+                  <Form.Item
+                    label="DM Policy"
+                    name="dm_policy"
+                    initialValue="open"
+                    tooltip="Who can start conversations via direct message"
+                  >
+                    <Select>
+                      <Select.Option value="open">Open — anyone can message</Select.Option>
+                      <Select.Option value="allowlist">
+                        Allowlist — only approved numbers
+                      </Select.Option>
+                      <Select.Option value="disabled">Disabled — ignore all DMs</Select.Option>
+                    </Select>
+                  </Form.Item>
+
+                  <Form.Item
+                    label="Group Policy"
+                    name="group_policy"
+                    initialValue="disabled"
+                    tooltip="Whether the bot responds in WhatsApp group chats"
+                  >
+                    <Select>
+                      <Select.Option value="open">Open — respond in all groups</Select.Option>
+                      <Select.Option value="allowlist">
+                        Allowlist — only approved senders
+                      </Select.Option>
+                      <Select.Option value="disabled">Disabled — ignore group messages</Select.Option>
+                    </Select>
+                  </Form.Item>
+
+                  <Form.Item
+                    name="allowlist"
+                    label="Allowed Phone Numbers"
+                    tooltip="E.164 format phone numbers without + (e.g., 15551234567). Only used when policy is set to 'allowlist'."
+                  >
+                    <Select
+                      mode="tags"
+                      placeholder="Add phone numbers... (e.g., 15551234567)"
+                      style={{ width: '100%' }}
+                      tokenSeparators={[',', ' ']}
+                    />
+                  </Form.Item>
+
+                  <Form.Item
+                    label="Send Read Receipts"
+                    name="read_receipts"
+                    valuePropName="checked"
+                    initialValue={true}
+                    tooltip="Show blue checkmarks when messages are processed"
+                  >
+                    <Switch />
+                  </Form.Item>
+                </>
+              ),
+            },
+
+            // ── Agentic Tool Configuration ──
+            {
+              key: 'agentic-tool-config',
+              label: (
+                <SectionLabel
+                  icon={<ThunderboltOutlined />}
+                  title="Agent Configuration"
+                  subtitle={selectedAgent}
+                />
+              ),
+              children: (
+                <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    Configure which agent and settings to use for sessions created from this channel.
+                  </Typography.Text>
+                  <AgentSelectionGrid
+                    agents={AVAILABLE_AGENTS}
+                    selectedAgentId={selectedAgent}
+                    onSelect={onAgentChange}
+                    columns={2}
+                    showHelperText={false}
+                    showComparisonLink={false}
+                  />
+                  <AgenticToolConfigForm
+                    agenticTool={selectedAgent as AgenticToolName}
+                    mcpServerById={mcpServerById}
+                    showHelpText={false}
+                  />
+                </Space>
+              ),
+            },
+          ]}
+        />
+      )}
+
+      {/* ── Collapsible sections (Slack) ── */}
       {channelType === 'slack' && (
         <Collapse
           ghost
@@ -583,7 +700,14 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       delete sanitizedExisting[field];
     }
     const config: Record<string, unknown> = { ...sanitizedExisting };
-    if (values.channel_type === 'slack') {
+    if (values.channel_type === 'whatsapp') {
+      config.dm_policy = values.dm_policy ?? 'open';
+      config.group_policy = values.group_policy ?? 'disabled';
+      config.read_receipts = values.read_receipts ?? true;
+      if (values.allowlist && Array.isArray(values.allowlist)) {
+        config.allowlist = values.allowlist;
+      }
+    } else if (values.channel_type === 'slack') {
       if (values.bot_token) config.bot_token = values.bot_token;
       if (values.app_token) config.app_token = values.app_token;
       if (values.connection_mode) config.connection_mode = values.connection_mode;
@@ -687,13 +811,18 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       agor_user_id: channel.agor_user_id,
       enabled: channel.enabled,
       connection_mode: config?.connection_mode || 'socket',
-      // Message source configuration
+      // Slack message source configuration
       enable_channels: config?.enable_channels ?? false,
       enable_groups: config?.enable_groups ?? false,
       enable_mpim: config?.enable_mpim ?? false,
       require_mention: config?.require_mention ?? true,
       align_slack_users: config?.align_slack_users ?? false,
       allowed_channel_ids: (config?.allowed_channel_ids as string[]) ?? [],
+      // WhatsApp configuration
+      dm_policy: config?.dm_policy ?? 'open',
+      group_policy: config?.group_policy ?? 'disabled',
+      read_receipts: config?.read_receipts ?? true,
+      allowlist: (config?.allowlist as string[]) ?? [],
       // Agentic config fields
       permissionMode: channel.agentic_config?.permissionMode,
       modelConfig: channel.agentic_config?.modelConfig,
@@ -1018,6 +1147,34 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
               showIcon
               style={{ marginBottom: 16 }}
             />
+            {createdChannelType === 'whatsapp' && (
+              <Alert
+                message="WhatsApp Setup — QR Code Pairing"
+                description={
+                  <ol style={{ margin: 0, paddingLeft: 20, fontSize: 12 }}>
+                    <li>
+                      The daemon will begin the pairing process automatically when the channel is
+                      enabled
+                    </li>
+                    <li>
+                      Watch the daemon logs for a QR code — scan it with WhatsApp on your phone
+                      (Settings → Linked Devices → Link a Device)
+                    </li>
+                    <li>
+                      After pairing, the connection persists across daemon restarts (credentials
+                      stored locally)
+                    </li>
+                    <li>
+                      <strong>Tip:</strong> Use a secondary phone number for the linked WhatsApp
+                      account
+                    </li>
+                  </ol>
+                }
+                type="info"
+                showIcon
+                style={{ marginBottom: 12 }}
+              />
+            )}
             {createdChannelType === 'slack' && (
               <Alert
                 message="Slack Setup"

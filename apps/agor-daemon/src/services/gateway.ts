@@ -13,8 +13,8 @@ import {
   UsersRepository,
 } from '@agor/core/db';
 import type { Application } from '@agor/core/feathers';
-import type { GatewayConnector, InboundMessage } from '@agor/core/gateway';
-import { getConnector, hasConnector } from '@agor/core/gateway';
+import type { GatewayConnector, InboundMessage, WhatsAppConnectionEvent } from '@agor/core/gateway';
+import { getConnector, hasConnector, WhatsAppConnector } from '@agor/core/gateway';
 import type {
   AgenticToolName,
   ChannelType,
@@ -480,18 +480,22 @@ export class GatewayService {
   }
 
   /**
-   * Start Socket Mode listeners for all enabled channels that support it.
+   * Start listeners for all enabled channels that support real-time inbound messages.
    * Called once at daemon startup. Inbound messages are routed through
    * the gateway's create() method (same path as webhook POST).
+   *
+   * Supports:
+   * - Slack: Socket Mode (requires app_token)
+   * - WhatsApp: Baileys WebSocket (always eligible — creds on disk)
    */
   async startListeners(): Promise<void> {
     const channels = await this.channelRepo.findAll();
     const eligible = channels.filter(
-      (ch) => ch.enabled && hasConnector(ch.channel_type as ChannelType) && ch.config.app_token
+      (ch) => ch.enabled && hasConnector(ch.channel_type as ChannelType) && canListen(ch)
     );
 
     if (eligible.length === 0) {
-      console.log('[gateway] No channels with Socket Mode configured');
+      console.log('[gateway] No channels with real-time listening configured');
       return;
     }
 
@@ -501,7 +505,7 @@ export class GatewayService {
   }
 
   /**
-   * Start or stop a Socket Mode listener for a single channel based on its enabled state
+   * Start or stop a listener for a single channel based on its enabled state
    * (public wrapper for hook usage)
    */
   async startListenerForChannel(channelId: string): Promise<void> {
@@ -518,14 +522,16 @@ export class GatewayService {
       return;
     }
 
-    // If no connector or no app_token, stop any existing listener
+    // If no connector or channel can't listen, stop any existing listener
     if (!hasConnector(channel.channel_type as ChannelType)) {
       console.warn(`[gateway] No connector for channel type: ${channel.channel_type}`);
       await this.stopChannelListener(channelId);
       return;
     }
-    if (!channel.config.app_token) {
-      console.log(`[gateway] Skipping listener for channel ${channel.name} (no app_token)`);
+    if (!canListen(channel)) {
+      console.log(
+        `[gateway] Skipping listener for channel ${channel.name} (missing required config)`
+      );
       await this.stopChannelListener(channelId);
       return;
     }
@@ -555,7 +561,7 @@ export class GatewayService {
   }
 
   /**
-   * Start a Socket Mode listener for a single channel
+   * Start a real-time listener for a single channel
    */
   private async startChannelListener(channel: GatewayChannel): Promise<void> {
     if (this.activeListeners.has(channel.id)) {
@@ -563,10 +569,19 @@ export class GatewayService {
     }
 
     try {
-      const connector = getConnector(channel.channel_type as ChannelType, channel.config);
+      // Pass _channelId so connectors can use it for credential storage paths
+      const connectorConfig = { ...channel.config, _channelId: channel.id };
+      const connector = getConnector(channel.channel_type as ChannelType, connectorConfig);
 
       if (!connector.startListening) {
         return; // Connector doesn't support listening
+      }
+
+      // Wire up WhatsApp connection events → WebSocket broadcast
+      if (connector instanceof WhatsAppConnector) {
+        connector.onConnectionEvent((event: WhatsAppConnectionEvent) => {
+          this.app.service('gateway-channels').emit(`whatsapp:${event.type}`, event);
+        });
       }
 
       const callback = (msg: InboundMessage) => {
@@ -586,7 +601,7 @@ export class GatewayService {
 
       await connector.startListening(callback);
       this.activeListeners.set(channel.id, connector);
-      console.log(`[gateway] Socket Mode listener started for channel "${channel.name}"`);
+      console.log(`[gateway] Listener started for ${channel.channel_type} channel "${channel.name}"`);
     } catch (error) {
       console.error(`[gateway] Failed to start listener for channel "${channel.name}":`, error);
     }
@@ -607,6 +622,22 @@ export class GatewayService {
       }
     }
     this.activeListeners.clear();
+  }
+}
+
+/**
+ * Check if a channel has the required config to support real-time listening.
+ * - Slack: needs app_token for Socket Mode
+ * - WhatsApp: always eligible (Baileys creds stored on disk after QR pairing)
+ */
+function canListen(channel: GatewayChannel): boolean {
+  switch (channel.channel_type) {
+    case 'slack':
+      return !!(channel.config as Record<string, unknown>).app_token;
+    case 'whatsapp':
+      return true; // Baileys manages its own auth state on disk
+    default:
+      return false;
   }
 }
 

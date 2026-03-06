@@ -8,3 +8,5 @@
 export type { GatewayConnector, InboundMessage } from './connector';
 export { getConnector, hasConnector, registerConnector } from './connector-registry';
 export { SlackConnector } from './connectors/slack';
+export { WhatsAppConnector } from './connectors/whatsapp';
+export type { WhatsAppConnectionEvent } from './connectors/whatsapp';

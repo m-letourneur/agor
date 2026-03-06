@@ -9,6 +9,7 @@
 import type { ChannelType } from '../types/gateway';
 import type { GatewayConnector } from './connector';
 import { SlackConnector } from './connectors/slack';
+import { WhatsAppConnector } from './connectors/whatsapp';
 
 type ConnectorFactory = (config: Record<string, unknown>) => GatewayConnector;
 
@@ -16,6 +17,7 @@ const connectors = new Map<ChannelType, ConnectorFactory>();
 
 // Register built-in connectors
 connectors.set('slack', (config) => new SlackConnector(config));
+connectors.set('whatsapp', (config) => new WhatsAppConnector(config));
 
 /**
  * Get a connector instance for the given channel type
