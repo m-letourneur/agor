@@ -1,4 +1,5 @@
 import type { AgorClient } from '@agor/core/api';
+import type { WhatsAppConnectionEvent } from '@agor/core/gateway';
 import type {
   AgenticToolName,
   ChannelType,
@@ -42,6 +43,7 @@ import {
   theme,
 } from 'antd';
 import { useEffect, useState } from 'react';
+import { QRCodeSVG } from 'qrcode.react';
 import { mapToArray } from '@/utils/mapHelpers';
 import { useThemedMessage } from '@/utils/message';
 import { AgenticToolConfigForm } from '../AgenticToolConfigForm';
@@ -669,6 +671,12 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
   const [createForm] = Form.useForm();
   const [editForm] = Form.useForm();
 
+  // WhatsApp connection state tracking
+  const [whatsappQR, setWhatsappQR] = useState<{ channelId: string; qr: string } | null>(null);
+  const [whatsappStatus, setWhatsappStatus] = useState<
+    Map<string, { status: 'connecting' | 'connected' | 'disconnected'; phoneNumber?: string }>
+  >(new Map());
+
   // Pre-populate agentic config form with user defaults when agent changes
   useEffect(() => {
     const agentDefaults = currentUser?.default_agentic_config?.[selectedAgent as AgenticToolName];
@@ -684,6 +692,60 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       });
     }
   }, [selectedAgent, currentUser, createForm, editForm, editModalOpen]);
+
+  // Subscribe to WhatsApp connection events
+  useEffect(() => {
+    if (!client) return;
+
+    const gatewayService = client.service('gateway-channels');
+
+    const handleQR = (event: WhatsAppConnectionEvent & { type: 'qr' }) => {
+      console.log('[whatsapp-ui] QR code received for channel', event.channelId.substring(0, 8));
+      setWhatsappQR({ channelId: event.channelId, qr: event.qr });
+      setWhatsappStatus((prev) => {
+        const next = new Map(prev);
+        next.set(event.channelId, { status: 'connecting' });
+        return next;
+      });
+    };
+
+    const handleConnected = (event: WhatsAppConnectionEvent & { type: 'connected' }) => {
+      console.log(
+        '[whatsapp-ui] Connected for channel',
+        event.channelId.substring(0, 8),
+        event.phoneNumber ? `as ${event.phoneNumber}` : ''
+      );
+      setWhatsappQR((prev) => (prev?.channelId === event.channelId ? null : prev));
+      setWhatsappStatus((prev) => {
+        const next = new Map(prev);
+        next.set(event.channelId, { status: 'connected', phoneNumber: event.phoneNumber });
+        return next;
+      });
+    };
+
+    const handleDisconnected = (event: WhatsAppConnectionEvent & { type: 'disconnected' }) => {
+      console.log(
+        '[whatsapp-ui] Disconnected for channel',
+        event.channelId.substring(0, 8),
+        event.reason
+      );
+      setWhatsappStatus((prev) => {
+        const next = new Map(prev);
+        next.set(event.channelId, { status: 'disconnected' });
+        return next;
+      });
+    };
+
+    gatewayService.on('whatsapp:qr', handleQR);
+    gatewayService.on('whatsapp:connected', handleConnected);
+    gatewayService.on('whatsapp:disconnected', handleDisconnected);
+
+    return () => {
+      gatewayService.removeListener('whatsapp:qr', handleQR);
+      gatewayService.removeListener('whatsapp:connected', handleConnected);
+      gatewayService.removeListener('whatsapp:disconnected', handleDisconnected);
+    };
+  }, [client]);
 
   const extractFormData = (
     values: Record<string, unknown>,
@@ -880,12 +942,28 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
       title: '',
       key: 'status',
       width: 40,
-      render: (_: unknown, channel: GatewayChannel) => (
-        <Badge
-          status={channel.enabled ? 'success' : 'default'}
-          title={channel.enabled ? 'Enabled' : 'Disabled'}
-        />
-      ),
+      render: (_: unknown, channel: GatewayChannel) => {
+        const waStatus = whatsappStatus.get(channel.id);
+        let status: 'success' | 'processing' | 'error' | 'default' = channel.enabled
+          ? 'success'
+          : 'default';
+        let title = channel.enabled ? 'Enabled' : 'Disabled';
+
+        if (channel.channel_type === 'whatsapp' && channel.enabled && waStatus) {
+          if (waStatus.status === 'connecting') {
+            status = 'processing';
+            title = 'Connecting...';
+          } else if (waStatus.status === 'connected') {
+            status = 'success';
+            title = `Connected${waStatus.phoneNumber ? ` (${waStatus.phoneNumber})` : ''}`;
+          } else if (waStatus.status === 'disconnected') {
+            status = 'error';
+            title = 'Disconnected';
+          }
+        }
+
+        return <Badge status={status} title={title} />;
+      },
     },
     {
       title: 'Name',
@@ -1152,12 +1230,9 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
                 message="WhatsApp Setup — QR Code Pairing"
                 description={
                   <ol style={{ margin: 0, paddingLeft: 20, fontSize: 12 }}>
+                    <li>The daemon will begin the pairing process automatically</li>
                     <li>
-                      The daemon will begin the pairing process automatically when the channel is
-                      enabled
-                    </li>
-                    <li>
-                      Watch the daemon logs for a QR code — scan it with WhatsApp on your phone
+                      A QR code will appear in a popup — scan it with WhatsApp on your phone
                       (Settings → Linked Devices → Link a Device)
                     </li>
                     <li>
@@ -1206,6 +1281,55 @@ export const GatewayChannelsTable: React.FC<GatewayChannelsTableProps> = ({
               type="info"
               showIcon
             />
+          </div>
+        )}
+      </Modal>
+
+      {/* WhatsApp QR Code Modal */}
+      <Modal
+        title="WhatsApp Setup — Scan QR Code"
+        open={whatsappQR !== null}
+        onCancel={() => setWhatsappQR(null)}
+        footer={[
+          <Button key="close" onClick={() => setWhatsappQR(null)}>
+            Close
+          </Button>,
+        ]}
+        width={480}
+      >
+        {whatsappQR && (
+          <div style={{ textAlign: 'center', padding: '24px 0' }}>
+            <Alert
+              message="Link your WhatsApp account"
+              description={
+                <ol style={{ margin: '8px 0 0 0', paddingLeft: 20, fontSize: 12, textAlign: 'left' }}>
+                  <li>Open WhatsApp on your phone</li>
+                  <li>Go to Settings → Linked Devices</li>
+                  <li>Tap "Link a Device"</li>
+                  <li>Scan this QR code</li>
+                </ol>
+              }
+              type="info"
+              showIcon
+              style={{ marginBottom: 24, textAlign: 'left' }}
+            />
+            <div
+              style={{
+                display: 'inline-block',
+                padding: 16,
+                background: 'white',
+                borderRadius: 8,
+                border: '1px solid #d9d9d9',
+              }}
+            >
+              <QRCodeSVG value={whatsappQR.qr} size={256} level="M" />
+            </div>
+            <Typography.Text
+              type="secondary"
+              style={{ display: 'block', marginTop: 16, fontSize: 12 }}
+            >
+              Channel ID: {whatsappQR.channelId.substring(0, 8)}
+            </Typography.Text>
           </div>
         )}
       </Modal>
