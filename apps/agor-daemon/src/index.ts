@@ -2319,7 +2319,9 @@ async function main() {
   });
 
   // Register gateway services
-  app.use('/gateway-channels', createGatewayChannelsService(db));
+  app.use('/gateway-channels', createGatewayChannelsService(db), {
+    events: ['whatsapp:qr', 'whatsapp:connected', 'whatsapp:disconnected'],
+  });
   app.use('/thread-session-map', createThreadSessionMapService(db));
   app.use('/gateway', createGatewayService(db, app), {
     methods: ['create', 'routeMessage'],
