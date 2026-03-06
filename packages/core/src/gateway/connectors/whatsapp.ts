@@ -377,7 +377,7 @@ export class WhatsAppConnector implements GatewayConnector {
 
   private handleInboundMessage(msg: WAMessage): void {
     // Skip our own messages
-    if (msg.key.fromMe) return;
+    // if (msg.key.fromMe) return;
 
     const jid = msg.key.remoteJid;
     if (!jid) return;
