@@ -42,6 +42,11 @@ export const gatewayRouteHook = async (context: HookContext) => {
   let shouldRoute = false;
   let messageText = extractText(message.content);
 
+  // Debug logging
+  console.log(
+    `[gateway-route] Message ${message.message_id.substring(0, 8)}: role=${message.role}, source=${message.metadata?.source || 'none'}`
+  );
+
   if (message.role === 'assistant') {
     // Always route assistant messages
     shouldRoute = true;
@@ -77,12 +82,22 @@ export const gatewayRouteHook = async (context: HookContext) => {
   }
 
   if (!shouldRoute) {
+    console.log(
+      `[gateway-route] NOT routing message ${message.message_id.substring(0, 8)} (role=${message.role}, source=${message.metadata?.source || 'none'})`
+    );
     return context;
   }
 
   if (!messageText) {
+    console.log(
+      `[gateway-route] NOT routing message ${message.message_id.substring(0, 8)} (no text content)`
+    );
     return context; // No text to route (tool-only messages, etc.)
   }
+
+  console.log(
+    `[gateway-route] Routing message ${message.message_id.substring(0, 8)} to gateway (session ${message.session_id.substring(0, 8)})`
+  );
 
   // Fire-and-forget: route message through gateway
   try {

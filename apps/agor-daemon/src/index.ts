@@ -5080,6 +5080,10 @@ async function main() {
     // Extract message source from queued message metadata for gateway routing
     const messageSource = nextMessage.metadata?.source as 'gateway' | 'agor' | undefined;
 
+    console.log(
+      `📬 [Queue] Processing with messageSource: ${messageSource || 'undefined'} (from metadata: ${JSON.stringify(nextMessage.metadata)})`
+    );
+
     await promptService.create(
       {
         prompt,
