@@ -237,7 +237,9 @@ export class WhatsAppConnector implements GatewayConnector {
   ): Promise<void> {
     this.socket = makeWASocket({
       auth: authState,
-      browser: ['Agor', 'Desktop', '1.0.0'],
+      // Use Chrome browser identifier for better compatibility
+      browser: ['Chrome (Linux)', 'Chrome', '122.0.0'],
+      printQRInTerminal: false, // We handle QR code via WebSocket
       // Suppress Baileys' verbose logging — use custom logger
       // Note: child() must return a logger with same interface to avoid "trace is not a function" errors
       // biome-ignore lint/suspicious/noExplicitAny: Baileys logger type is incompatible, requires type assertion
@@ -272,6 +274,14 @@ export class WhatsAppConnector implements GatewayConnector {
   private handleConnectionUpdate(update: ConnectionUpdate): void {
     const { connection, lastDisconnect, qr } = update;
 
+    // Log all connection updates for debugging
+    console.log(`[whatsapp] Connection update:`, {
+      connection,
+      qr: qr ? 'present' : 'none',
+      hasError: !!lastDisconnect?.error,
+      channelId: this.channelId.substring(0, 8),
+    });
+
     // QR code for pairing
     if (qr) {
       console.log(`[whatsapp] QR code generated for channel ${this.channelId.substring(0, 8)}`);
@@ -304,6 +314,15 @@ export class WhatsAppConnector implements GatewayConnector {
       console.log(
         `[whatsapp] Connection closed: reason=${reason} (channel ${this.channelId.substring(0, 8)})`
       );
+
+      // Log full error details for debugging
+      if (error) {
+        console.error(`[whatsapp] Close error details:`, {
+          message: error.message,
+          statusCode,
+          stack: error.stack,
+        });
+      }
 
       if (statusCode === DisconnectReason.loggedOut) {
         // User logged out — don't reconnect, surface to UI
