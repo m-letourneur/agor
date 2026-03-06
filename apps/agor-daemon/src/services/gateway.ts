@@ -580,7 +580,12 @@ export class GatewayService {
       // Wire up WhatsApp connection events → WebSocket broadcast
       if (connector instanceof WhatsAppConnector) {
         connector.onConnectionEvent((event: WhatsAppConnectionEvent) => {
+          console.log(
+            `[gateway] Broadcasting whatsapp:${event.type} event for channel ${event.channelId.substring(0, 8)}`
+          );
+          // Emit to local service listeners AND broadcast to all WebSocket clients
           this.app.service('gateway-channels').emit(`whatsapp:${event.type}`, event);
+          this.app.io?.emit(`whatsapp:${event.type}`, event);
         });
       }
 
