@@ -4879,6 +4879,7 @@ async function main() {
         const messageRepo = new MessagesRepository(db);
         const queuedMessage = await messageRepo.createQueued(sessionId as SessionID, data.prompt, {
           queued_by_user_id: params.user?.user_id,
+          source: 'agor', // Mark as Agor UI message for gateway routing
         });
 
         console.log(
@@ -5070,13 +5071,20 @@ async function main() {
     // IMPORTANT: Use messageParams (reconstructed from queued message metadata)
     // to preserve the original user's authentication context
     const promptService = app.service('/sessions/:id/prompt') as {
-      create: (data: { prompt: string; stream?: boolean }, params: RouteParams) => Promise<unknown>;
+      create: (
+        data: { prompt: string; stream?: boolean; messageSource?: 'gateway' | 'agor' },
+        params: RouteParams
+      ) => Promise<unknown>;
     };
+
+    // Extract message source from queued message metadata for gateway routing
+    const messageSource = nextMessage.metadata?.source as 'gateway' | 'agor' | undefined;
 
     await promptService.create(
       {
         prompt,
         stream: true,
+        messageSource, // Pass through source for gateway routing
       },
       {
         ...messageParams,
