@@ -388,6 +388,21 @@ export function setupMCPRoutes(app: Application, db: Database): void {
                 required: ['path'],
               },
             },
+            {
+              name: 'agor_repos_import_config',
+              description:
+                'Import environment configuration from .agor.yml file in repository root. Updates the repository with environment commands (up/down/nuke/logs), health check URLs, and app URLs.',
+              inputSchema: {
+                type: 'object',
+                properties: {
+                  repoId: {
+                    type: 'string',
+                    description: 'Repository ID (UUIDv7 or short ID)',
+                  },
+                },
+                required: ['repoId'],
+              },
+            },
 
             // Worktree tools
             {
@@ -1735,6 +1750,30 @@ export function setupMCPRoutes(app: Application, db: Database): void {
               {
                 type: 'text',
                 text: JSON.stringify(repo, null, 2),
+              },
+            ],
+          };
+        } else if (name === 'agor_repos_import_config') {
+          const repoId = coerceString(args?.repoId);
+          if (!repoId) {
+            return res.status(400).json({
+              jsonrpc: '2.0',
+              id: mcpRequest.id,
+              error: {
+                code: -32602,
+                message: 'Invalid params: repoId is required',
+              },
+            });
+          }
+
+          const reposService = app.service('repos') as unknown as ReposServiceImpl;
+          const updatedRepo = await reposService.importFromAgorYml(repoId, {}, baseServiceParams);
+
+          mcpResponse = {
+            content: [
+              {
+                type: 'text',
+                text: JSON.stringify(updatedRepo, null, 2),
               },
             ],
           };
