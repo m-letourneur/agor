@@ -4,7 +4,7 @@
 // databases, and APIs. Agor federates MCP configurations to enable users
 // to leverage existing MCP investments while adding orchestration value.
 //
-// See: context/explorations/mcp-integration.md for full design
+// See: apps/agor-docs/pages/guide/internal-mcp.mdx for the user-facing reference
 
 import type { SessionID, UserID, UUID } from './id';
 
@@ -42,6 +42,7 @@ export interface MCPAuth {
   api_token?: string;
   api_secret?: string;
   // OAuth 2.0 config
+  oauth_authorization_url?: string; // Override auto-discovered authorization endpoint
   oauth_token_url?: string;
   oauth_client_id?: string;
   oauth_client_secret?: string;
@@ -264,3 +265,17 @@ export type MCPServersConfig = Record<
     env?: Record<string, string>;
   }
 >;
+
+// ============================================================================
+// MCP Session Tokens (daemon ↔ MCP server channel)
+// ============================================================================
+
+/**
+ * JWT `aud` claim for MCP session tokens. Enforced by `jsonwebtoken.verify`.
+ */
+export const MCP_TOKEN_AUDIENCE = 'agor:mcp:internal';
+
+/**
+ * JWT `iss` claim for MCP session tokens (post-rollout tokens only).
+ */
+export const MCP_TOKEN_ISSUER = 'agor';

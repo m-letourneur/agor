@@ -1,14 +1,15 @@
 import { PaperClipOutlined, UploadOutlined } from '@ant-design/icons';
-import { App, Button, Checkbox, Input, Modal, Radio, Space, Typography, Upload } from 'antd';
+import { Button, Checkbox, Input, Modal, Radio, Space, Typography, Upload } from 'antd';
 import type { RcFile, UploadFile } from 'antd/es/upload/interface';
 import type React from 'react';
-import { useEffect, useState } from 'react';
+import { forwardRef, useEffect, useState } from 'react';
+import { useThemedMessage } from '../../utils/message';
 import { ACCESS_TOKEN_KEY } from '../../utils/tokenRefresh';
 
 const { TextArea } = Input;
 const { Text } = Typography;
 
-export type UploadDestination = 'worktree' | 'temp' | 'global';
+export type UploadDestination = 'branch' | 'temp' | 'global';
 
 export interface UploadedFile {
   filename: string;
@@ -36,10 +37,10 @@ export const FileUpload: React.FC<FileUploadProps> = ({
   onInsertMention,
   initialFiles,
 }) => {
-  const { message: antMessage } = App.useApp();
+  const { showSuccess, showWarning, showError } = useThemedMessage();
   const [fileList, setFileList] = useState<UploadFile[]>([]);
-  const [destination, setDestination] = useState<UploadDestination>('worktree');
-  const [notifyAgent, setNotifyAgent] = useState(false);
+  const [destination, setDestination] = useState<UploadDestination>('branch');
+  const [notifyAgent, setNotifyAgent] = useState(true);
   const [agentMessage, setAgentMessage] = useState('Please review this file: {filepath}');
   const [uploading, setUploading] = useState(false);
 
@@ -58,7 +59,7 @@ export const FileUpload: React.FC<FileUploadProps> = ({
 
   const handleUpload = async () => {
     if (fileList.length === 0) {
-      antMessage.warning('Please select at least one file');
+      showWarning('Please select at least one file');
       return;
     }
 
@@ -113,9 +114,9 @@ export const FileUpload: React.FC<FileUploadProps> = ({
 
       // Show success message with final filename(s) so user knows what to reference
       if (result.files.length === 1) {
-        antMessage.success(`Uploaded as: ${result.files[0].filename}`);
+        showSuccess(`Uploaded as: ${result.files[0].filename}`);
       } else {
-        antMessage.success(`Uploaded ${result.files.length} files successfully`);
+        showSuccess(`Uploaded ${result.files.length} files successfully`);
       }
 
       // Call completion callback
@@ -139,7 +140,7 @@ export const FileUpload: React.FC<FileUploadProps> = ({
       onClose();
     } catch (error) {
       console.error('Upload error:', error);
-      antMessage.error(error instanceof Error ? error.message : 'Failed to upload files');
+      showError(error instanceof Error ? error.message : 'Failed to upload files');
     } finally {
       setUploading(false);
     }
@@ -163,7 +164,7 @@ export const FileUpload: React.FC<FileUploadProps> = ({
       cancelText="Cancel"
       width={600}
     >
-      <Space direction="vertical" style={{ width: '100%' }} size="large">
+      <Space orientation="vertical" style={{ width: '100%' }} size="large">
         {/* File selector */}
         <Upload
           multiple
@@ -194,17 +195,17 @@ export const FileUpload: React.FC<FileUploadProps> = ({
             onChange={(e) => setDestination(e.target.value)}
             style={{ marginTop: 8, display: 'block' }}
           >
-            <Space direction="vertical">
-              <Radio value="worktree">
-                <Space direction="vertical" size={0}>
-                  <Text>Worktree (.agor/uploads/)</Text>
+            <Space orientation="vertical">
+              <Radio value="branch">
+                <Space orientation="vertical" size={0}>
+                  <Text>Branch (.agor/uploads/)</Text>
                   <Text type="secondary" style={{ fontSize: '12px' }}>
                     Default - Agent-accessible, can be committed
                   </Text>
                 </Space>
               </Radio>
               <Radio value="temp">
-                <Space direction="vertical" size={0}>
+                <Space orientation="vertical" size={0}>
                   <Text>Temp folder</Text>
                   <Text type="secondary" style={{ fontSize: '12px' }}>
                     Ephemeral, auto-cleanup
@@ -212,7 +213,7 @@ export const FileUpload: React.FC<FileUploadProps> = ({
                 </Space>
               </Radio>
               <Radio value="global">
-                <Space direction="vertical" size={0}>
+                <Space orientation="vertical" size={0}>
                   <Text>Global (~/.agor/uploads/)</Text>
                   <Text type="secondary" style={{ fontSize: '12px' }}>
                     Shared across sessions
@@ -257,19 +258,17 @@ export interface FileUploadButtonProps {
   size?: 'small' | 'middle' | 'large';
 }
 
-export const FileUploadButton: React.FC<FileUploadButtonProps> = ({
-  onClick,
-  disabled,
-  size = 'middle',
-}) => {
-  return (
-    <Button
-      icon={<PaperClipOutlined />}
-      onClick={onClick}
-      disabled={disabled}
-      size={size}
-      type="text"
-      title="Upload files"
-    />
-  );
-};
+export const FileUploadButton = forwardRef<HTMLButtonElement, FileUploadButtonProps>(
+  ({ onClick, disabled, size = 'middle' }, ref) => {
+    return (
+      <Button
+        ref={ref}
+        icon={<PaperClipOutlined />}
+        onClick={onClick}
+        disabled={disabled}
+        size={size}
+        title="Upload files"
+      />
+    );
+  }
+);

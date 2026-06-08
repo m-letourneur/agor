@@ -4,7 +4,7 @@
  * Only listens when enabled, captures all events from the socket
  */
 
-import type { AgorClient } from '@agor/core/api';
+import type { AgorClient } from '@agor-live/client';
 import { useCallback, useEffect, useState } from 'react';
 
 export interface SocketEvent {
@@ -66,7 +66,8 @@ export function useEventStream(options: UseEventStreamOptions): UseEventStreamRe
         eventName === 'cursor-move' ||
         eventName === 'cursor-leave' ||
         eventName === 'cursor-moved' ||
-        eventName === 'cursor-left'
+        eventName === 'cursor-left' ||
+        eventName === 'presence-updated'
       ) {
         type = 'cursor';
       } else if (eventName.includes('message') || eventName === 'thinking:chunk') {

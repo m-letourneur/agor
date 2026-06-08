@@ -2,18 +2,25 @@ import { useCallback, useMemo } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 
 /**
- * Valid settings sections that can be routed to
+ * Valid settings sections that can be routed to.
+ * Single source of truth — the type is derived from this array.
  */
-export type SettingsSection =
-  | 'boards'
-  | 'repos'
-  | 'worktrees'
-  | 'agents'
-  | 'mcp'
-  | 'agentic-tools'
-  | 'gateway'
-  | 'users'
-  | 'about';
+export const SETTINGS_SECTIONS = [
+  'boards',
+  'repos',
+  'branches',
+  'assistants',
+  'cards',
+  'artifacts',
+  'mcp',
+  'agentic-tools',
+  'gateway',
+  'groups',
+  'users',
+  'about',
+] as const;
+
+export type SettingsSection = (typeof SETTINGS_SECTIONS)[number];
 
 /**
  * Settings route state parsed from URL
@@ -62,19 +69,9 @@ export function useSettingsRoute() {
     const [, section, itemId] = settingsMatch;
 
     // Validate and normalize section
-    const validSections: SettingsSection[] = [
-      'boards',
-      'repos',
-      'worktrees',
-      'agents',
-      'mcp',
-      'agentic-tools',
-      'gateway',
-      'users',
-      'about',
-    ];
-
-    const normalizedSection: SettingsSection = validSections.includes(section as SettingsSection)
+    const normalizedSection: SettingsSection = SETTINGS_SECTIONS.includes(
+      section as SettingsSection
+    )
       ? (section as SettingsSection)
       : 'boards';
 

@@ -12,18 +12,18 @@ import {
   loadClaudeSession,
   transcriptsToMessages,
 } from '@agor/core/claude';
-import { generateId } from '@agor/core/db';
+import { generateId, shortId } from '@agor/core/db';
 import type {
+  Branch,
+  BranchID,
   MessageID,
   Repo,
   Session,
   SessionID,
   TaskID,
   UUID,
-  Worktree,
-  WorktreeID,
-} from '@agor/core/types';
-import { TaskStatus } from '@agor/core/types';
+} from '@agor-live/client';
+import { TaskStatus } from '@agor-live/client';
 import { Args, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import { BaseCommand } from '../../base-command';
@@ -80,7 +80,7 @@ export default class SessionLoadClaude extends BaseCommand {
         : 'Imported Claude Code session';
 
       // Create or find repo for the project directory
-      this.log(`${chalk.blue('●')} Setting up worktree for imported session...`);
+      this.log(`${chalk.blue('●')} Setting up branch for imported session...`);
       const reposService = client.service('repos');
       const absoluteProjectDir = path.resolve(projectDir);
       const projectName = path.basename(absoluteProjectDir);
@@ -88,8 +88,7 @@ export default class SessionLoadClaude extends BaseCommand {
       // Try to find existing repo by path
       let repo: { repo_id: UUID; slug: string } | null = null;
       try {
-        const allRepos = await reposService.find({ query: { $limit: 1000 } });
-        const reposList = Array.isArray(allRepos) ? allRepos : allRepos.data;
+        const reposList = await reposService.findAll({ query: { $limit: 1000 } });
         repo = reposList.find((r: Repo) => r.local_path === absoluteProjectDir) || null;
       } catch {
         // Ignore errors
@@ -107,23 +106,23 @@ export default class SessionLoadClaude extends BaseCommand {
         this.log(`${chalk.green('✓')} Found existing repo: ${chalk.cyan(repo.slug)}`);
       }
 
-      // Create worktree for this imported session
-      const worktreesService = client.service('worktrees');
-      const worktreeName = `imported-${sessionId.substring(0, 8)}`;
-      const worktree = (await worktreesService.create({
-        worktree_id: generateId() as WorktreeID,
+      // Create branch for this imported session
+      const branchesService = client.service('branches');
+      const branchName = `imported-${shortId(sessionId)}`;
+      const branch = (await branchesService.create({
+        branch_id: generateId() as BranchID,
         repo_id: repo.repo_id,
-        name: worktreeName,
+        name: branchName,
         ref: 'unknown', // Claude sessions don't track git state
-        worktree_unique_id: 0, // Will be auto-assigned by service hook
+        branch_unique_id: 0, // Will be auto-assigned by service hook
         path: absoluteProjectDir,
         new_branch: false,
         last_used: new Date().toISOString(),
         created_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
         created_by: 'cli-import' as UUID,
-      })) as Worktree;
-      this.log(`${chalk.green('✓')} Created worktree: ${chalk.cyan(worktreeName)}`);
+      })) as Branch;
+      this.log(`${chalk.green('✓')} Created branch: ${chalk.cyan(branchName)}`);
 
       // Create Agor session
       const agorSession: Partial<Session> & { session_id: SessionID; created_by: string } = {
@@ -134,7 +133,7 @@ export default class SessionLoadClaude extends BaseCommand {
         created_at: new Date().toISOString(),
         last_updated: new Date().toISOString(),
         created_by: 'cli-import',
-        worktree_id: worktree.worktree_id,
+        branch_id: branch.branch_id,
         git_state: {
           ref: 'unknown',
           base_sha: '',
@@ -144,7 +143,6 @@ export default class SessionLoadClaude extends BaseCommand {
           children: [],
         },
         tasks: [],
-        message_count: conversation.length,
       };
 
       // Create session in daemon

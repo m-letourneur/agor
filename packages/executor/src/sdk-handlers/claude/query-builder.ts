@@ -7,30 +7,33 @@
 
 import { execSync } from 'node:child_process';
 import * as fs from 'node:fs/promises';
-import { validateDirectory } from '@agor/core';
+import { shortId, validateDirectory } from '@agor/core';
 import { Claude } from '@agor/core/sdk';
 import { renderAgorSystemPrompt } from '@agor/core/templates/session-context';
 import { resolveMCPAuthHeaders } from '@agor/core/tools/mcp/jwt-auth';
 
 const { query } = Claude;
 type PermissionMode = Claude.PermissionMode;
+type Options = Claude.Options;
 
 import { getDaemonUrl, resolveUserEnvironment } from '../../config.js';
 import type {
+  BranchRepository,
   MCPServerRepository,
   MessagesRepository,
   RepoRepository,
   SessionMCPServerRepository,
   SessionRepository,
-  WorktreeRepository,
+  UsersRepository,
 } from '../../db/feathers-repositories.js';
 import type { PermissionService } from '../../permissions/permission-service.js';
 import type { MCPServersConfig, SessionID, TaskID, UserID } from '../../types.js';
+import type { MessagesService, SessionsPatchClient, TasksService } from '../base/index.js';
 import { getMcpServersForSession } from '../base/mcp-scoping.js';
-import type { MessagesService, SessionsService, TasksService } from './claude-tool.js';
+import { CLAUDE_CODE_DISALLOWED_TOOLS } from './constants.js';
+import { parseModelWithBetas } from './model-utils.js';
 import { DEFAULT_CLAUDE_MODEL } from './models.js';
 import { createCanUseToolCallback } from './permissions/permission-hooks.js';
-import { detectThinkingLevel, resolveThinkingBudget } from './thinking-detector.js';
 
 /**
  * Summarize MCP config for logging without exposing sensitive env values.
@@ -90,7 +93,7 @@ function logPromptStart(
   _cwd: string,
   agentSessionId?: string
 ) {
-  console.log(`🤖 Prompting Claude for session ${sessionId.substring(0, 8)}...`);
+  console.log(`🤖 Prompting Claude for session ${shortId(sessionId)}...`);
   if (agentSessionId) {
     console.log(`   Resuming session: ${agentSessionId}`);
   }
@@ -105,9 +108,10 @@ export interface QuerySetupDeps {
   mcpServerRepo?: MCPServerRepository;
   permissionService?: PermissionService;
   tasksService?: TasksService;
-  sessionsService?: SessionsService;
+  sessionsService?: SessionsPatchClient;
   messagesService?: MessagesService;
-  worktreesRepo?: WorktreeRepository;
+  branchesRepo?: BranchRepository;
+  usersRepo?: UsersRepository;
   permissionLocks: Map<SessionID, Promise<void>>;
   mcpEnabled?: boolean;
 }
@@ -124,6 +128,13 @@ export interface QuerySetupDeps {
  */
 export interface InterruptibleQuery {
   interrupt(): Promise<void>;
+  getContextUsage(): Promise<import('@agor/core/sdk').SDKControlGetContextUsageResponse>;
+  /**
+   * Signal that post-result control requests (like getContextUsage) are done.
+   * This releases the held AsyncIterable, allowing the SDK to close stdin.
+   * Must be called after the result event is fully processed.
+   */
+  releaseInput(): void;
   // biome-ignore lint/suspicious/noExplicitAny: SDK returns complex union of message types
   [Symbol.asyncIterator](): AsyncIterator<any>;
 }
@@ -142,13 +153,8 @@ export async function setupQuery(
   query: InterruptibleQuery;
   resolvedModel: string;
   getStderr: () => string;
-  /** OAuth MCP servers that need authentication before they can be used */
-  oauthServersNeedingAuth: Array<{ name: string; serverId: string; url: string }>;
 }> {
   const { taskId, permissionMode, resume = true, abortController } = options;
-
-  // Track OAuth MCP servers that need authentication
-  const oauthServersNeedingAuth: Array<{ name: string; serverId: string; url: string }> = [];
 
   const session = await deps.sessionsRepo.findById(sessionId);
   if (!session) {
@@ -176,28 +182,30 @@ export async function setupQuery(
   console.log(`[Query Builder] Final contextUserId: ${contextUserId || 'NOT SET'}`);
 
   // Determine model to use (session config or default)
+  // Models may include [1m] suffix for extended context — strip it for SDK and add beta flag
   const modelConfig = session.model_config;
-  const model = modelConfig?.model || DEFAULT_CLAUDE_MODEL;
+  const rawModel = modelConfig?.model || DEFAULT_CLAUDE_MODEL;
+  const { model, betas } = parseModelWithBetas(rawModel);
 
-  // Determine CWD from worktree (if session has one)
+  // Determine CWD from branch (if session has one)
   let cwd = process.cwd();
-  if (session.worktree_id && deps.worktreesRepo) {
+  if (session.branch_id && deps.branchesRepo) {
     try {
-      const worktree = await deps.worktreesRepo.findById(session.worktree_id);
-      if (worktree) {
-        cwd = worktree.path;
-        console.log(`✅ Using worktree path as cwd: ${cwd}`);
+      const branch = await deps.branchesRepo.findById(session.branch_id);
+      if (branch) {
+        cwd = branch.path;
+        console.log(`✅ Using branch path as cwd: ${cwd}`);
       } else {
         console.warn(
-          `⚠️  Session ${sessionId} references non-existent worktree ${session.worktree_id}, using process.cwd(): ${cwd}`
+          `⚠️  Session ${sessionId} references non-existent branch ${session.branch_id}, using process.cwd(): ${cwd}`
         );
       }
     } catch (error) {
-      console.error(`❌ Failed to fetch worktree ${session.worktree_id}:`, error);
+      console.error(`❌ Failed to fetch branch ${session.branch_id}:`, error);
       console.warn(`   Falling back to process.cwd(): ${cwd}`);
     }
   } else {
-    console.warn(`⚠️  Session ${sessionId} has no worktree_id, using process.cwd(): ${cwd}`);
+    console.warn(`⚠️  Session ${sessionId} has no branch_id, using process.cwd(): ${cwd}`);
   }
 
   logPromptStart(sessionId, prompt, cwd, resume ? session.sdk_session_id : undefined);
@@ -216,9 +224,9 @@ export async function setupQuery(
         `✅ Working directory validated: ${cwd} (${fileCount} files/dirs${hasGit ? ', has .git' : ', NO .git!'}${hasClaude ? ', has .claude/' : ''}${hasCLAUDEmd ? ', has CLAUDE.md' : ''})`
       );
       if (fileCount === 0) {
-        console.warn(`⚠️  Working directory is EMPTY - worktree may be from bare repo!`);
+        console.warn(`⚠️  Working directory is EMPTY - branch may be from bare repo!`);
       } else if (!hasGit) {
-        console.warn(`⚠️  Working directory has no .git - not a valid worktree!`);
+        console.warn(`⚠️  Working directory has no .git - not a valid branch!`);
       }
       if (!hasCLAUDEmd && !hasClaude) {
         console.warn(`⚠️  No CLAUDE.md or .claude/ directory found - SDK may not load properly`);
@@ -231,8 +239,8 @@ export async function setupQuery(
     console.error(`❌ Working directory validation failed: ${errorMessage}`);
     throw new Error(
       `${errorMessage}${
-        session.worktree_id
-          ? ` Session references worktree ${session.worktree_id} which may not be initialized.`
+        session.branch_id
+          ? ` Session references branch ${session.branch_id} which may not be initialized.`
           : ''
       }`
     );
@@ -244,11 +252,12 @@ export async function setupQuery(
   // Buffer to capture stderr for better error messages
   let stderrBuffer = '';
 
-  // Render Agor system prompt with full session/worktree/repo context
+  // Render Agor system prompt with full session/branch/repo context
   const agorSystemPrompt = await renderAgorSystemPrompt(sessionId, {
     sessions: deps.sessionsRepo,
-    worktrees: deps.worktreesRepo,
+    branches: deps.branchesRepo,
     repos: deps.reposRepo,
+    users: deps.usersRepo,
   });
 
   const queryOptions: Record<string, unknown> = {
@@ -256,9 +265,11 @@ export async function setupQuery(
     systemPrompt: {
       type: 'preset',
       preset: 'claude_code',
-      append: agorSystemPrompt, // Append rich Agor context (session, worktree, repo)
+      append: agorSystemPrompt, // Append rich Agor context (session, branch, repo)
     },
     settingSources: ['user', 'project', 'local'], // Load user + project + local permissions, auto-loads CLAUDE.md
+    // Defensive copy — the const is readonly but the SDK option is typed `string[]`.
+    disallowedTools: [...CLAUDE_CODE_DISALLOWED_TOOLS],
     model, // Use configured model or default
     pathToClaudeCodeExecutable: claudeCodePath,
     // Allow access to common directories outside CWD (e.g., /tmp)
@@ -296,45 +307,39 @@ export async function setupQuery(
     );
   }
 
-  // Configure thinking budget based on mode and prompt keywords
-  // Matches Claude Code CLI behavior: auto-detect keywords or use manual setting
-  const thinkingBudget = resolveThinkingBudget(prompt, {
-    thinkingMode: session.model_config?.thinkingMode,
-    manualThinkingTokens: session.model_config?.manualThinkingTokens,
-  });
-
-  if (thinkingBudget !== null && thinkingBudget > 0) {
-    queryOptions.maxThinkingTokens = thinkingBudget;
-    console.log(`🧠 Thinking budget: ${thinkingBudget.toLocaleString()} tokens`);
-
-    // Log detected keywords in auto mode
-    if (session.model_config?.thinkingMode === 'auto' || !session.model_config?.thinkingMode) {
-      const detected = detectThinkingLevel(prompt);
-      if (detected.level !== 'none') {
-        console.log(
-          `   Auto-detected level: ${detected.level} (phrases: ${detected.detectedPhrases.join(', ')})`
-        );
-      }
-    }
+  // Configure effort level — controls reasoning depth via SDK's effort parameter
+  // Matches Claude Code CLI's --effort flag (low/medium/high/max)
+  const effort = session.model_config?.effort;
+  if (effort) {
+    queryOptions.effort = effort;
+    console.log(`🧠 Effort level: ${effort}`);
   } else {
-    console.log(`🧠 Thinking disabled (mode: ${session.model_config?.thinkingMode || 'auto'})`);
+    console.log(`🧠 Effort level: high (default)`);
   }
 
-  // Add canUseTool callback if permission service is available and taskId provided
-  // This enables Agor's custom permission UI (WebSocket-based) when SDK would show a prompt
-  // Fires AFTER SDK checks settings.json - respects user's existing Claude CLI permissions!
-  // IMPORTANT: Only skip for bypassPermissions (which never asks for permissions)
+  // Add beta flags (e.g., 1M context window for [1m] model variants)
+  if (betas.length > 0) {
+    queryOptions.betas = betas;
+    console.log(`🔬 Beta flags: ${betas.join(', ')}`);
+  }
+
+  // Add canUseTool callback if permission service is available and taskId provided.
+  // This enables Agor's custom permission UI (WebSocket-based) when the SDK would
+  // show a prompt. Fires AFTER the SDK checks settings.json — respects user's
+  // existing Claude CLI permissions.
+  //
+  // Skip in bypassPermissions mode: the SDK skips canUseTool there anyway, and
+  // we no longer need a workaround to intercept AskUserQuestion (now disallowed).
   if (
     deps.permissionService &&
     taskId &&
-    effectivePermissionMode !== 'bypassPermissions' &&
     deps.sessionMCPRepo &&
-    deps.mcpServerRepo
+    deps.mcpServerRepo &&
+    effectivePermissionMode !== 'bypassPermissions'
   ) {
     queryOptions.canUseTool = createCanUseToolCallback(sessionId, taskId, {
       permissionService: deps.permissionService,
       tasksService: deps.tasksService!,
-      sessionsRepo: deps.sessionsRepo,
       messagesRepo: deps.messagesRepo!,
       messagesService: deps.messagesService,
       sessionsService: deps.sessionsService,
@@ -343,8 +348,6 @@ export async function setupQuery(
       sessionMCPRepo: deps.sessionMCPRepo,
     });
     console.log(`✅ canUseTool callback added (permission mode: ${effectivePermissionMode})`);
-    console.log(`   SDK will check settings.json first, then call Agor UI if needed`);
-    console.log(`   Using SDK's built-in permission persistence (updatedPermissions)`);
   }
 
   // Add optional apiKey if provided
@@ -369,9 +372,7 @@ export async function setupQuery(
       userEnvCount = totalVarCount - systemVarCount;
 
       if (userEnvCount > 0) {
-        console.log(
-          `🔐 Using ${userEnvCount} environment vars for user ${contextUserId.substring(0, 8)}`
-        );
+        console.log(`🔐 Using ${userEnvCount} environment vars for user ${shortId(contextUserId)}`);
       }
     } catch (err) {
       console.error(`⚠️  Failed to resolve user environment:`, err);
@@ -396,13 +397,11 @@ export async function setupQuery(
       if (parentSession?.sdk_session_id) {
         queryOptions.resume = parentSession.sdk_session_id;
         queryOptions.forkSession = true; // SDK will create new session ID from parent's history
-        console.log(
-          `🍴 Forking from parent session: ${parentSession.sdk_session_id.substring(0, 8)}`
-        );
+        console.log(`🍴 Forking from parent session: ${shortId(parentSession.sdk_session_id)}`);
         console.log(`   SDK will return new session ID for this fork`);
       } else {
         console.warn(
-          `⚠️  Parent session ${forkedFromSessionId.substring(0, 8)} has no sdk_session_id - starting fresh`
+          `⚠️  Parent session ${shortId(forkedFromSessionId)} has no sdk_session_id - starting fresh`
         );
       }
     }
@@ -410,7 +409,7 @@ export async function setupQuery(
     else if (parentSessionId && !forkedFromSessionId && !session.sdk_session_id) {
       // This is a SPAWN - start FRESH, do NOT resume from parent
       console.log(
-        `🌱 Spawning fresh session (parent: ${parentSessionId.substring(0, 8)}) - NOT forking SDK session`
+        `🌱 Spawning fresh session (parent: ${shortId(parentSessionId)}) - NOT forking SDK session`
       );
       console.log(`   Child will start with clean context (spawns don't inherit parent history)`);
       // Don't set queryOptions.resume - let it start completely fresh
@@ -456,7 +455,7 @@ export async function setupQuery(
         );
         console.warn(`   🔧 SOLUTION: Clearing sdk_session_id to force fresh session start`);
         console.warn(
-          `   Previous SDK session: ${session.sdk_session_id.substring(0, 8)} (will be discarded)`
+          `   Previous SDK session: ${shortId(session.sdk_session_id)} (will be discarded)`
         );
 
         // Clear SDK session ID to force fresh start with new MCP config
@@ -474,11 +473,11 @@ export async function setupQuery(
 
         const isLikelyStale =
           hoursSinceUpdate > 24 || // Session older than 24 hours
-          !session.worktree_id; // No worktree = can't resume properly
+          !session.branch_id; // No branch = can't resume properly
 
         if (isLikelyStale) {
           console.warn(
-            `⚠️  Resume session ${session.sdk_session_id.substring(0, 8)} appears stale (${Math.round(hoursSinceUpdate)}h old) - starting fresh`
+            `⚠️  Resume session ${shortId(session.sdk_session_id)} appears stale (${Math.round(hoursSinceUpdate)}h old) - starting fresh`
           );
 
           // Clear stale session ID to prevent exit code 1
@@ -488,7 +487,7 @@ export async function setupQuery(
           // Don't set queryOptions.resume - start fresh
         } else {
           queryOptions.resume = session.sdk_session_id;
-          console.log(`   Resuming SDK session: ${session.sdk_session_id.substring(0, 8)}`);
+          console.log(`   Resuming SDK session: ${shortId(session.sdk_session_id)}`);
         }
       }
     }
@@ -501,20 +500,23 @@ export async function setupQuery(
     const mcpToken = session.mcp_token;
 
     if (mcpToken) {
-      // Get daemon URL from config (supports Codespaces auto-detection)
+      // Get daemon URL from config
       const daemonUrl = await getDaemonUrl();
 
       console.log(`🔌 Configuring Agor MCP server at ${daemonUrl}/mcp`);
       const mcpConfig = {
         agor: {
           type: 'http' as const,
-          url: `${daemonUrl}/mcp?sessionToken=${mcpToken}`,
+          url: `${daemonUrl}/mcp`,
+          headers: {
+            Authorization: `Bearer ${mcpToken}`,
+          },
         },
       };
       queryOptions.mcpServers = mcpConfig;
     } else {
       console.warn(
-        `⚠️  No MCP token found for session ${sessionId.substring(0, 8)} - MCP tools unavailable`
+        `⚠️  No MCP token found for session ${shortId(sessionId)} - MCP tools unavailable`
       );
     }
   }
@@ -568,12 +570,6 @@ export async function setupQuery(
               console.warn(
                 `      💡 Go to Settings → MCP Servers → ${server.name} → Start OAuth Flow to authenticate`
               );
-              // Add to list for UI notification
-              oauthServersNeedingAuth.push({
-                name: server.name,
-                serverId: server.mcp_server_id,
-                url: server.url || '',
-              });
             }
           } catch (error) {
             console.warn(
@@ -622,12 +618,39 @@ export async function setupQuery(
     queryOptions.mcpServers ? JSON.stringify(summarizeMcpConfig(queryOptions.mcpServers)) : 'none'
   );
 
+  // Wrap the string prompt in an AsyncIterable so the SDK treats this as a
+  // streaming-input query.  When a plain string is passed, the SDK sets
+  // `isSingleUserTurn = true` and closes stdin right after the first result
+  // event.  Even with an iterable, the SDK calls `transport.endInput()` once
+  // the iterable is fully consumed (after streamInput finishes).  So we must
+  // keep the iterable alive until AFTER post-result control requests like
+  // `getContextUsage()` complete.
+  //
+  // The iterable yields the user message, then blocks on a Promise that is
+  // resolved by calling `releaseInput()`.  This keeps stdin open until we
+  // explicitly signal that we're done with control requests.
+  let releaseInputResolve: (() => void) | undefined;
+  const inputHeldPromise = new Promise<void>((resolve) => {
+    releaseInputResolve = resolve;
+  });
+
+  async function* asUserMessageIterable(text: string) {
+    yield {
+      type: 'user' as const,
+      message: { role: 'user' as const, content: [{ type: 'text' as const, text }] },
+      parent_tool_use_id: null,
+    };
+    // Hold the iterable open until releaseInput() is called, keeping stdin alive
+    await inputHeldPromise;
+  }
+
   let result: AsyncGenerator<unknown>;
   try {
     result = query({
-      prompt,
-      // biome-ignore lint/suspicious/noExplicitAny: SDK Options type doesn't include all available fields
-      options: queryOptions as any,
+      prompt: asUserMessageIterable(prompt),
+      // queryOptions uses Record<string,unknown> to accommodate undocumented fields (debug, apiKey)
+      // that are valid at runtime but not in the public Options type
+      options: queryOptions as unknown as Options,
     });
     console.log(`✅ query() returned AsyncGenerator successfully`);
   } catch (syncError) {
@@ -643,12 +666,16 @@ export async function setupQuery(
   // Store stderr buffer getter for error reporting
   const getStderr = () => stderrBuffer;
 
-  // Cast to InterruptibleQuery - the SDK's query() returns an AsyncGenerator with interrupt() method
-  // This is safe because the SDK guarantees interrupt() exists at runtime
+  // Attach releaseInput() so callers can signal when post-result control requests are done.
+  // The SDK's query() returns an AsyncGenerator with interrupt()/getContextUsage() methods.
+  const queryObj = result as unknown as InterruptibleQuery;
+  queryObj.releaseInput = () => {
+    releaseInputResolve?.();
+  };
+
   return {
-    query: result as unknown as InterruptibleQuery,
+    query: queryObj,
     resolvedModel: model,
     getStderr,
-    oauthServersNeedingAuth,
   };
 }

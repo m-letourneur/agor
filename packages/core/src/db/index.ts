@@ -2,7 +2,20 @@
 
 // Drizzle ORM re-exports (so daemon doesn't import drizzle-orm directly)
 // Commonly used operators and utilities
-export { and, asc, desc, eq, inArray, like, or, type SQL, sql } from 'drizzle-orm';
+export {
+  and,
+  asc,
+  desc,
+  eq,
+  gt,
+  gte,
+  inArray,
+  like,
+  lte,
+  or,
+  type SQL,
+  sql,
+} from 'drizzle-orm';
 
 // bcryptjs re-export (for password hashing in daemon)
 // bcryptjs is a CommonJS module, so we import the default and re-export specific functions
@@ -11,7 +24,7 @@ export const compare = bcryptjs.compare;
 export const hash = bcryptjs.hash;
 
 // ID utilities (re-exported from lib for convenience)
-export { formatShortId, generateId, IdResolutionError, resolveShortId } from '../lib/ids';
+export { generateId, IdResolutionError, resolveShortId, shortId } from '../lib/ids';
 
 // Slug utilities
 export { generateSlug, generateUniqueSlug, identifyUrlParam, isShortId } from '../lib/slugs';
@@ -23,9 +36,13 @@ export * from './database-wrapper';
 
 // Encryption utilities
 export * from './encryption';
-
+// First-run admin bootstrap (creates default admin if no users exist; also
+// re-attributes legacy 'anonymous' created_by rows from removed anonymous mode)
+export * from './first-run-bootstrap';
 // Migrations
 export * from './migrate';
+// Pending-migrations presentation (shared by CLI and daemon)
+export * from './pending-migrations';
 // Repositories
 export * from './repositories';
 export * from './schema';

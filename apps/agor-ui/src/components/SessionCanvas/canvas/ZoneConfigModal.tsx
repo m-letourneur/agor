@@ -2,10 +2,12 @@
  * Modal for configuring zone settings (name, triggers, etc.)
  */
 
-import type { AgenticToolName, BoardObject, ZoneTriggerBehavior } from '@agor/core/types';
-import { Alert, Form, Input, Modal, Select } from 'antd';
+import type { AgenticToolName, BoardObject, ZoneTriggerBehavior } from '@agor-live/client';
+import { Form, Input, Modal, Select } from 'antd';
 import { useEffect, useRef, useState } from 'react';
+import { useMutationGate } from '../../../contexts/ConnectionContext';
 import { AgentSelectionGrid, AVAILABLE_AGENTS } from '../../AgentSelectionGrid';
+import { ExpandableAlert } from '../../ExpandableAlert';
 
 interface ZoneConfigModalProps {
   open: boolean;
@@ -22,6 +24,14 @@ interface ZoneFormValues {
   triggerTemplate: string;
 }
 
+// Sensible default so that a freshly-created zone always has a behavior
+// selected — previously the field came up blank, the Select allowed clearing,
+// and any template the user typed got silently discarded on save unless they
+// also remembered to pick a behavior. With a default of 'show_picker', the
+// template is preserved by default and users only need to opt OUT (by leaving
+// the template empty) for an organizational-only zone.
+const DEFAULT_TRIGGER_BEHAVIOR: ZoneTriggerBehavior = 'show_picker';
+
 export const ZoneConfigModal = ({
   open,
   onCancel,
@@ -33,9 +43,9 @@ export const ZoneConfigModal = ({
   const [form] = Form.useForm<ZoneFormValues>();
   const [triggerAgent, setTriggerAgent] = useState<AgenticToolName>('claude-code');
   const isInitializingRef = useRef(false);
+  const mutationGate = useMutationGate();
 
   const triggerBehavior = Form.useWatch('triggerBehavior', form);
-  const triggerTemplate = Form.useWatch('triggerTemplate', form);
 
   // Reset form when modal opens (prevent WebSocket updates from erasing user input)
   useEffect(() => {
@@ -51,7 +61,7 @@ export const ZoneConfigModal = ({
       } else {
         form.setFieldsValue({
           name: zoneName,
-          triggerBehavior: 'show_picker',
+          triggerBehavior: DEFAULT_TRIGGER_BEHAVIOR,
           triggerTemplate: '',
         });
         setTriggerAgent('claude-code');
@@ -62,27 +72,30 @@ export const ZoneConfigModal = ({
   }, [open, zoneName, zoneData, form]);
 
   const handleSave = async () => {
+    if (!mutationGate.canMutate) return;
     try {
       const values = await form.validateFields();
 
       if (zoneData.type === 'zone') {
+        const template = values.triggerTemplate?.trim() || '';
         const hasChanges =
           values.name !== zoneName ||
-          values.triggerTemplate.trim() !== (zoneData.trigger?.template || '') ||
-          values.triggerBehavior !== (zoneData.trigger?.behavior || 'show_picker') ||
+          template !== (zoneData.trigger?.template || '') ||
+          values.triggerBehavior !== (zoneData.trigger?.behavior || undefined) ||
           triggerAgent !== (zoneData.trigger?.agent || 'claude-code');
 
         if (hasChanges) {
           onUpdate(objectId, {
             ...zoneData,
             label: values.name,
-            trigger: values.triggerTemplate.trim()
-              ? {
-                  behavior: values.triggerBehavior,
-                  template: values.triggerTemplate.trim(),
-                  agent: triggerAgent,
-                }
-              : undefined,
+            trigger:
+              template && values.triggerBehavior
+                ? {
+                    behavior: values.triggerBehavior,
+                    template,
+                    agent: triggerAgent,
+                  }
+                : undefined,
           });
         }
       }
@@ -99,7 +112,9 @@ export const ZoneConfigModal = ({
       onCancel={onCancel}
       onOk={handleSave}
       okText="Save"
-      okButtonProps={{ disabled: !triggerTemplate?.trim() }}
+      okButtonProps={{
+        disabled: !mutationGate.canMutate,
+      }}
       cancelText="Cancel"
       width={600}
     >
@@ -109,6 +124,10 @@ export const ZoneConfigModal = ({
         </Form.Item>
 
         <Form.Item name="triggerBehavior" label="Trigger Behavior">
+          {/* No allowClear / no placeholder: the field always has a value
+              (DEFAULT_TRIGGER_BEHAVIOR for new zones), so there is no
+              "unset" state to represent. To make a zone organizational
+              only, leave the template empty. */}
           <Select
             style={{ width: '100%' }}
             options={[
@@ -140,36 +159,28 @@ export const ZoneConfigModal = ({
         <Form.Item
           name="triggerTemplate"
           label="Trigger Template"
-          rules={[
-            {
-              required: true,
-              whitespace: true,
-              message: 'Please enter a prompt template for the zone trigger',
-            },
-          ]}
-        >
-          <Input.TextArea
-            placeholder="Enter the prompt template that will be triggered when a worktree is dropped here..."
-            rows={6}
-          />
-        </Form.Item>
-
-        <Alert
-          message="Handlebars Template Support"
-          description={
-            <div>
+          help="Leave empty for an organizational-only zone (no trigger fires on drop)."
+          extra={
+            <ExpandableAlert
+              // Re-mount when the modal opens or the zone changes so the
+              // details collapse back to default; otherwise the AntD Modal
+              // keeps children mounted and stale `expanded` state persists.
+              key={`${objectId}:${open}`}
+              title="Handlebars template support"
+              summary="Reference branch, session, and board data with {{ ... }} syntax."
+            >
               <p style={{ marginBottom: 8 }}>
                 Use Handlebars syntax to reference session and board data in your trigger:
               </p>
               <ul style={{ marginLeft: 16, marginBottom: 8 }}>
                 <li>
-                  <code>{'{{ worktree.issue_url }}'}</code> - GitHub issue URL
+                  <code>{'{{ branch.issue_url }}'}</code> - GitHub issue URL
                 </li>
                 <li>
-                  <code>{'{{ worktree.pull_request_url }}'}</code> - Pull request URL
+                  <code>{'{{ branch.pull_request_url }}'}</code> - Pull request URL
                 </li>
                 <li>
-                  <code>{'{{ worktree.notes }}'}</code> - Worktree notes
+                  <code>{'{{ branch.notes }}'}</code> - Branch notes
                 </li>
                 <li>
                   <code>{'{{ session.description }}'}</code> - Session description
@@ -191,16 +202,18 @@ export const ZoneConfigModal = ({
                 Example:{' '}
                 <code>
                   {
-                    'Review {{ worktree.issue_url }} for {{ board.context.team }} sprint {{ board.context.sprint }}'
+                    'Review {{ branch.issue_url }} for {{ board.context.team }} sprint {{ board.context.sprint }}'
                   }
                 </code>
               </p>
-            </div>
+            </ExpandableAlert>
           }
-          type="info"
-          showIcon
-          style={{ marginTop: 0 }}
-        />
+        >
+          <Input.TextArea
+            placeholder="Enter the prompt template that will be triggered when a branch is dropped here..."
+            rows={6}
+          />
+        </Form.Item>
       </Form>
     </Modal>
   );

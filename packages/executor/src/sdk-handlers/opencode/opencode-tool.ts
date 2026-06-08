@@ -10,13 +10,14 @@
  * - ✅ Get session metadata and messages
  * - ✅ Real-time streaming support via SSE
  * - ✅ Agor MCP tools (via client.mcp.add())
- * - ✅ Worktree directory isolation (via x-opencode-directory header)
+ * - ✅ Branch directory isolation (via x-opencode-directory header)
  * - ⏳ Session import (future: when OpenCode provides export API)
  */
 
-import { generateId } from '@agor/core';
+import { generateId, shortId } from '@agor/core';
 import type { Message, MessageID, SessionID, TaskID } from '@agor/core/types';
 import { MessageRole } from '@agor/core/types';
+import type { Part as OpenCodePart } from '@opencode-ai/sdk';
 import { createOpencodeClient } from '@opencode-ai/sdk';
 import { getDaemonUrl } from '../../config.js';
 import type {
@@ -24,8 +25,10 @@ import type {
   SessionMCPServerRepository,
 } from '../../db/feathers-repositories.js';
 import type { NormalizedSdkResponse, RawSdkResponse } from '../../types/sdk-response.js';
+import { enrichContentBlocks } from '../base/diff-enrichment.js';
 import type {
   CreateSessionConfig,
+  MessagesService,
   SessionHandle,
   SessionMetadata,
   StreamingCallbacks,
@@ -47,24 +50,10 @@ interface SessionContext {
   opencodeSessionId: string;
   model?: string;
   provider?: string;
-  /** Worktree directory path for project-scoped operations */
-  worktreePath?: string;
+  /** Branch directory path for project-scoped operations */
+  branchPath?: string;
   /** MCP token for Agor MCP server injection */
   mcpToken?: string;
-}
-
-/**
- * Service interface for creating messages via FeathersJS
- */
-export interface MessagesService {
-  create(data: Partial<Message>): Promise<Message>;
-}
-
-/**
- * Service interface for updating tasks via FeathersJS
- */
-export interface TasksService {
-  patch(id: string, data: Partial<{ status: string }>): Promise<unknown>;
 }
 
 export class OpenCodeTool implements ITool {
@@ -73,7 +62,7 @@ export class OpenCodeTool implements ITool {
 
   /** Default client (no directory override) */
   private client: ReturnType<typeof createOpencodeClient> | null = null;
-  /** Directory-scoped clients keyed by worktree path */
+  /** Directory-scoped clients keyed by branch path */
   private directoryClients: Map<string, ReturnType<typeof createOpencodeClient>> = new Map();
   private config: OpenCodeConfig;
   private messagesService?: MessagesService;
@@ -83,6 +72,28 @@ export class OpenCodeTool implements ITool {
   /** MCP repository dependencies for resolving user-defined MCP servers */
   private sessionMCPRepo?: SessionMCPServerRepository;
   private mcpServerRepo?: MCPServerRepository;
+
+  /**
+   * Extract user-facing response text from OpenCode parts.
+   * Prefers explicit text parts and falls back to reasoning text when no text parts exist.
+   */
+  private extractDisplayTextFromParts(parts: Array<{ type: string; text?: string }>): string {
+    const textParts = parts
+      .filter((part) => part.type === 'text' && typeof part.text === 'string' && part.text.trim())
+      .map((part) => part.text as string);
+
+    if (textParts.length > 0) {
+      return textParts.join('\n');
+    }
+
+    const reasoningParts = parts
+      .filter(
+        (part) => part.type === 'reasoning' && typeof part.text === 'string' && part.text.trim()
+      )
+      .map((part) => part.text as string);
+
+    return reasoningParts.join('\n');
+  }
 
   constructor(
     config: OpenCodeConfig,
@@ -97,14 +108,14 @@ export class OpenCodeTool implements ITool {
   }
 
   /**
-   * Set session context (OpenCode session ID, model, provider, worktree path, and MCP token) for an Agor session
+   * Set session context (OpenCode session ID, model, provider, branch path, and MCP token) for an Agor session
    * Must be called before executeTask
    *
    * @param agorSessionId - Agor session ID
    * @param opencodeSessionId - OpenCode session ID
-   * @param model - Model identifier (e.g., 'gpt-4o', 'claude-sonnet-4-5')
+   * @param model - Model identifier (e.g., 'gpt-4o', 'claude-sonnet-4-6')
    * @param provider - Provider ID (e.g., 'openai', 'opencode'). If omitted, uses legacy mapping.
-   * @param worktreePath - Worktree directory path for project-scoped operations
+   * @param branchPath - Branch directory path for project-scoped operations
    * @param mcpToken - MCP token for Agor MCP server injection
    */
   setSessionContext(
@@ -112,14 +123,14 @@ export class OpenCodeTool implements ITool {
     opencodeSessionId: string,
     model?: string,
     provider?: string,
-    worktreePath?: string,
+    branchPath?: string,
     mcpToken?: string
   ): void {
     this.sessionContexts.set(agorSessionId, {
       opencodeSessionId,
       model,
       provider,
-      worktreePath,
+      branchPath,
       mcpToken,
     });
   }
@@ -170,42 +181,57 @@ export class OpenCodeTool implements ITool {
   }
 
   /**
-   * Inject MCP servers into OpenCode for the given session if not already injected.
-   * Uses a hash to avoid re-injection when nothing has changed.
+   * Inject MCP servers into OpenCode for the given session.
+   *
+   * Strategy: Use a session-specific MCP name (`agor_<shortId>`) to avoid conflicts with
+   * stale entries that may be cached in OpenCode's memory from previous sessions.
+   * The handler clears the `mcp` section in opencode.json to prevent stale entries from
+   * being loaded at server startup, and we inject fresh entries via mcp.add() each time.
+   *
+   * For user-defined MCP servers: uses a hash to avoid redundant re-injection.
    */
   private async ensureMcpServers(
     sessionId: string,
     client: ReturnType<typeof createOpencodeClient>,
-    mcpToken?: string
+    mcpToken?: string,
+    branchPath?: string
   ): Promise<void> {
-    // Build a config hash to detect changes
-    const configHash = `${mcpToken ?? ''}:${sessionId}`;
-    if (this.injectedMcpHash.get(sessionId) === configHash) {
-      // Already injected with same config
-      return;
-    }
-
-    // Inject the Agor MCP server if we have a token
     if (mcpToken) {
+      // Use session-specific MCP name to avoid conflicts with stale entries
+      const sessionShort = shortId(sessionId);
+      const mcpName = `agor_${sessionShort}`;
+
       try {
         const daemonUrl = await getDaemonUrl();
-        await client.mcp.add({
+        const mcpUrl = `${daemonUrl}/mcp`;
+
+        const mcpResult = await client.mcp.add({
           body: {
-            name: 'agor',
+            name: mcpName,
             config: {
               type: 'remote' as const,
-              url: `${daemonUrl}/mcp?sessionToken=${encodeURIComponent(mcpToken)}`,
+              url: mcpUrl,
               enabled: true,
+              headers: { Authorization: `Bearer ${mcpToken}` },
             },
           },
+          query: branchPath ? { directory: branchPath } : undefined,
         });
-        console.log('[OpenCodeTool] Injected Agor MCP server');
+        console.log(
+          `[OpenCodeTool] Injected Agor MCP as "${mcpName}" for session ${shortId}`,
+          mcpResult.data ? `status: ${JSON.stringify(mcpResult.data)}` : ''
+        );
       } catch (error) {
-        console.warn('[OpenCodeTool] Failed to inject Agor MCP server:', error);
+        console.warn(`[OpenCodeTool] Failed to inject Agor MCP server "${mcpName}":`, error);
       }
     }
 
-    // Inject user-defined MCP servers if repos are available
+    // Inject user-defined MCP servers (use hash to avoid redundant re-injection)
+    const configHash = `${mcpToken ?? ''}:${sessionId}`;
+    if (this.injectedMcpHash.get(sessionId) === configHash) {
+      return;
+    }
+
     if (this.sessionMCPRepo && this.mcpServerRepo) {
       try {
         const servers = await getMcpServersForSession(sessionId as SessionID, {
@@ -214,7 +240,6 @@ export class OpenCodeTool implements ITool {
         });
 
         for (const { server } of servers) {
-          // Sanitize server name: lowercase, replace non-alphanumeric with underscore
           const sanitizedName = server.name.toLowerCase().replace(/[^a-z0-9]+/g, '_');
 
           try {
@@ -229,6 +254,7 @@ export class OpenCodeTool implements ITool {
                     enabled: true,
                   },
                 },
+                query: branchPath ? { directory: branchPath } : undefined,
               });
             } else if (server.transport === 'http' || server.transport === 'sse') {
               const headers: Record<string, string> = {};
@@ -245,6 +271,7 @@ export class OpenCodeTool implements ITool {
                     headers: Object.keys(headers).length > 0 ? headers : undefined,
                   },
                 },
+                query: branchPath ? { directory: branchPath } : undefined,
               });
             }
             console.log(`[OpenCodeTool] Injected MCP server: ${sanitizedName}`);
@@ -257,8 +284,82 @@ export class OpenCodeTool implements ITool {
       }
     }
 
-    // Store the hash to avoid re-injection
     this.injectedMcpHash.set(sessionId, configHash);
+  }
+
+  /**
+   * Build canonical Agor message content blocks from OpenCode parts.
+   *
+   * Behavior:
+   * - If OpenCode emitted regular text parts, keep reasoning as `thinking`.
+   * - If OpenCode emitted only reasoning text (no text parts), treat reasoning as user-visible `text`
+   *   to avoid rendering a "thought-only" assistant response.
+   */
+  private buildContentBlocksFromParts(
+    parts: Array<{
+      type: string;
+      text?: string;
+      tool?: string;
+      callID?: string;
+      id?: string;
+      state?: { input?: Record<string, unknown>; status?: string; output?: unknown };
+    }>
+  ): {
+    contentBlocks: Array<{
+      type: 'text' | 'thinking' | 'tool_use' | 'tool_result';
+      [key: string]: unknown;
+    }>;
+    toolUses: Array<{ id: string; name: string; input: Record<string, unknown> }>;
+  } {
+    const contentBlocks: Array<{
+      type: 'text' | 'thinking' | 'tool_use' | 'tool_result';
+      [key: string]: unknown;
+    }> = [];
+    const toolUses: Array<{ id: string; name: string; input: Record<string, unknown> }> = [];
+    const hasRenderableText = parts.some(
+      (part) => part.type === 'text' && typeof part.text === 'string' && part.text.trim()
+    );
+
+    for (const part of parts) {
+      if (part.type === 'reasoning' && part.text) {
+        contentBlocks.push({
+          type: hasRenderableText ? 'thinking' : 'text',
+          text: part.text,
+        });
+      } else if (part.type === 'text' && part.text) {
+        contentBlocks.push({
+          type: 'text',
+          text: part.text,
+        });
+      } else if (part.type === 'tool') {
+        const toolName = part.tool || 'unknown';
+        const toolInput = part.state?.input || {};
+        const toolCallId = part.callID || part.id || generateId();
+
+        contentBlocks.push({
+          type: 'tool_use',
+          id: toolCallId,
+          name: toolName,
+          input: toolInput,
+        });
+
+        toolUses.push({
+          id: toolCallId,
+          name: toolName,
+          input: toolInput,
+        });
+
+        if (part.state?.status === 'completed' && part.state.output) {
+          contentBlocks.push({
+            type: 'tool_result',
+            tool_use_id: toolCallId,
+            content: part.state.output,
+          });
+        }
+      }
+    }
+
+    return { contentBlocks, toolUses };
   }
 
   /**
@@ -294,7 +395,7 @@ export class OpenCodeTool implements ITool {
    * Create a new OpenCode session
    */
   async createSession?(config: CreateSessionConfig): Promise<SessionHandle> {
-    // Use directory-scoped client if workingDirectory is provided (worktree path)
+    // Use directory-scoped client if workingDirectory is provided (branch path)
     const client = this.getClientForDirectory(config.workingDirectory);
 
     try {
@@ -304,6 +405,9 @@ export class OpenCodeTool implements ITool {
         body: {
           title: String(config.title || 'Agor Session'),
         },
+        // Explicitly pass directory as query param (in addition to SDK header)
+        // to ensure the session is created in the correct branch directory
+        query: config.workingDirectory ? { directory: config.workingDirectory } : undefined,
       });
 
       if (response.error) {
@@ -354,7 +458,7 @@ export class OpenCodeTool implements ITool {
         promptLength: prompt.length,
         model: context?.model,
         provider: context?.provider,
-        worktreePath: context?.worktreePath,
+        branchPath: context?.branchPath,
         streaming: !!streamingCallbacks,
       });
 
@@ -373,11 +477,11 @@ export class OpenCodeTool implements ITool {
       }
 
       // Get the directory-scoped client
-      const worktreePath = context.worktreePath;
-      const client = this.getClientForDirectory(worktreePath);
+      const branchPath = context.branchPath;
+      const client = this.getClientForDirectory(branchPath);
 
-      // Inject MCP servers if not already done
-      await this.ensureMcpServers(sessionId, client, context.mcpToken);
+      // Inject MCP servers (uses session-specific name to avoid stale entry conflicts)
+      await this.ensureMcpServers(sessionId, client, context.mcpToken, branchPath);
 
       // Prepare prompt options
       const promptOptions: {
@@ -386,11 +490,14 @@ export class OpenCodeTool implements ITool {
           parts: Array<{ type: 'text'; text: string }>;
           model?: { providerID: string; modelID: string };
         };
+        query?: { directory?: string };
       } = {
         path: { id: context.opencodeSessionId },
         body: {
           parts: [{ type: 'text', text: prompt }],
         },
+        // Explicitly pass directory as query param to ensure correct branch scoping
+        query: branchPath ? { directory: branchPath } : undefined,
       };
 
       // Include model if provided
@@ -428,7 +535,10 @@ export class OpenCodeTool implements ITool {
       // IMPORTANT: Subscribe to event stream BEFORE sending prompt
       // Events are emitted in real-time as prompt executes
       console.log('[OpenCodeTool] Subscribing to event stream...');
-      const eventStream = await client.event.subscribe();
+      const eventStream = await client.event.subscribe({
+        // Pass directory to scope event stream to correct branch
+        query: branchPath ? { directory: branchPath } : undefined,
+      });
       console.log('[OpenCodeTool] Event stream ready, sending prompt...');
 
       // Start prompt in background (don't await yet)
@@ -454,14 +564,46 @@ export class OpenCodeTool implements ITool {
         console.log('[OpenCodeTool] Listening for events...');
 
         for await (const event of eventStream.stream) {
-          // Log EVERY event for debugging
-          console.log('[OpenCodeTool] ========== RAW EVENT ==========');
-          console.log('[OpenCodeTool] Event type:', event.type);
-          console.log('[OpenCodeTool] Event data:', JSON.stringify(event, null, 2));
-          console.log('[OpenCodeTool] ================================');
+          // Log event type (skip noisy heartbeats)
+          const eventType = event.type as string;
+          if (eventType !== 'server.heartbeat') {
+            console.log('[OpenCodeTool] Event:', eventType);
+          }
 
           // Check if this event is for our session
           if ('properties' in event) {
+            // Handle permission.asked / permission.updated events BEFORE processing messages.
+            // When OpenCode needs permission (e.g., external_directory access), it emits this
+            // event and waits for a response. Without auto-granting, the session hangs forever.
+            if (
+              (eventType === 'permission.asked' || eventType === 'permission.updated') &&
+              'id' in event.properties &&
+              'sessionID' in event.properties &&
+              event.properties.sessionID === context.opencodeSessionId
+            ) {
+              const permId = event.properties.id as string;
+              const permType = (
+                'type' in event.properties ? event.properties.type : 'unknown'
+              ) as string;
+              console.log(
+                `[OpenCodeTool] Auto-granting permission: id=${permId}, type=${permType}`
+              );
+              try {
+                await client.postSessionIdPermissionsPermissionId({
+                  path: {
+                    id: context.opencodeSessionId,
+                    permissionID: permId,
+                  },
+                  body: { response: 'always' },
+                  query: branchPath ? { directory: branchPath } : undefined,
+                });
+                console.log(`[OpenCodeTool] Permission auto-granted (always): id=${permId}`);
+              } catch (permErr) {
+                console.error('[OpenCodeTool] Failed to auto-grant permission:', permErr);
+              }
+              continue;
+            }
+
             // First, identify the assistant message when it's created
             if (
               event.type === 'message.updated' &&
@@ -506,10 +648,9 @@ export class OpenCodeTool implements ITool {
               // OpenCode sends full text each time, not deltas
               // We need to calculate the delta ourselves
               const newText =
-                // biome-ignore lint/suspicious/noExplicitAny: Part types vary, text field is runtime checked
-                'text' in part && typeof (part as any).text === 'string'
-                  ? // biome-ignore lint/suspicious/noExplicitAny: Part types vary, text field is runtime checked
-                    (part as any).text
+                'text' in part &&
+                typeof (part as OpenCodePart & { text?: string }).text === 'string'
+                  ? (part as OpenCodePart & { text: string }).text
                   : undefined;
 
               if (newText) {
@@ -577,12 +718,7 @@ export class OpenCodeTool implements ITool {
             }
 
             // Check for session idle status - indicates response is complete
-            if (
-              // biome-ignore lint/suspicious/noExplicitAny: Event types incomplete, runtime check needed
-              (event as any).type === 'session.status' &&
-              // biome-ignore lint/suspicious/noExplicitAny: Event types incomplete, runtime check needed
-              (event as any).properties?.status?.type === 'idle'
-            ) {
+            if (event.type === 'session.status' && event.properties.status.type === 'idle') {
               console.log('[OpenCodeTool] Session became idle, response complete');
               _responseCompleted = true;
               break; // Exit event loop
@@ -610,10 +746,13 @@ export class OpenCodeTool implements ITool {
       // Check for error in response
       let hasError = false;
       let errorMessage = '';
-      // biome-ignore lint/suspicious/noExplicitAny: Response structure varies, runtime check needed
-      if (response.data.info && (response.data.info as any).error) {
-        // biome-ignore lint/suspicious/noExplicitAny: Error structure varies
-        const errorInfo = (response.data.info as any).error;
+      const responseInfo = response.data.info as
+        | (typeof response.data.info & {
+            error?: { data?: { message?: string }; message?: string };
+          })
+        | undefined;
+      if (responseInfo?.error) {
+        const errorInfo = responseInfo.error;
         errorMessage =
           errorInfo.data?.message || errorInfo.message || 'Unknown error from OpenCode';
         console.error('[OpenCodeTool] OpenCode returned error:', errorMessage);
@@ -645,23 +784,13 @@ export class OpenCodeTool implements ITool {
 
       // Extract final text from parts (or use error message if error occurred)
       let responseText = '';
-      const textParts: string[] = [];
 
       if (hasError) {
         // Use the error message as the response text
         responseText = `❌ **OpenCode Error**\n\n${errorMessage}`;
       } else {
-        // Only extract text from parts if no error occurred
+        // Extract metadata from parts
         for (const part of response.data.parts || []) {
-          // Collect text from reasoning and text parts
-          if (part.type === 'reasoning' || part.type === 'text') {
-            // biome-ignore lint/suspicious/noExplicitAny: Part types vary, check for text field at runtime
-            if ('text' in part && typeof (part as any).text === 'string') {
-              // biome-ignore lint/suspicious/noExplicitAny: Checked above
-              textParts.push((part as any).text);
-            }
-          }
-
           // Extract metadata from step-finish part
           if (part.type === 'step-finish') {
             metadata.cost = part.cost;
@@ -677,7 +806,9 @@ export class OpenCodeTool implements ITool {
           }
         }
 
-        responseText = textParts.join('\n');
+        responseText = this.extractDisplayTextFromParts(
+          (response.data.parts || []) as Array<{ type: string; text?: string }>
+        );
         console.log('[OpenCodeTool] Final text length:', responseText.length);
 
         // Fallback: if no text found, return message
@@ -695,13 +826,6 @@ export class OpenCodeTool implements ITool {
       // Handler should create user message first with index N, then pass N+1 here
       const assistantIndex = messageIndex ?? 0;
 
-      // Build content blocks from all parts
-      const contentBlocks: Array<{
-        type: 'text' | 'thinking' | 'tool_use' | 'tool_result';
-        [key: string]: unknown;
-      }> = [];
-      const toolUses: Array<{ id: string; name: string; input: Record<string, unknown> }> = [];
-
       // Process parts from final response (not from streaming cache)
       // The final response contains ALL parts, including ones that weren't streamed
       const finalParts = response.data.parts || [];
@@ -710,62 +834,17 @@ export class OpenCodeTool implements ITool {
         finalParts.length,
         'parts in final response'
       );
-      // biome-ignore lint/suspicious/noExplicitAny: Part types vary at runtime
-      console.log('[OpenCodeTool] Part types:', finalParts.map((p: any) => p.type).join(', '));
-      for (const part of finalParts) {
-        // biome-ignore lint/suspicious/noExplicitAny: Part types vary, runtime check needed
-        const partData = part as any;
-        console.log('[OpenCodeTool] Processing part type:', partData.type);
-
-        if (partData.type === 'reasoning' && partData.text) {
-          console.log('[OpenCodeTool] Adding reasoning block, text length:', partData.text.length);
-          contentBlocks.push({
-            type: 'thinking',
-            text: partData.text,
-          });
-        } else if (partData.type === 'reasoning') {
-          console.log('[OpenCodeTool] Skipping reasoning part - no text field or empty text');
-        }
-
-        if (partData.type === 'text' && partData.text) {
-          contentBlocks.push({
-            type: 'text',
-            text: partData.text,
-          });
-        } else if (partData.type === 'tool') {
-          // Tool use block - extract tool info
-          // OpenCode structure: { tool: string, callID: string, state: { input: {...}, output: "..." } }
-          console.log('[OpenCodeTool] Processing tool part:', JSON.stringify(partData, null, 2));
-
-          const toolName = partData.tool || 'unknown';
-          const toolInput = partData.state?.input || {};
-          const toolCallId = partData.callID || partData.id;
-
-          // Add tool_use block
-          contentBlocks.push({
-            type: 'tool_use',
-            id: toolCallId,
-            name: toolName,
-            input: toolInput,
-          });
-
-          // Add to tool_uses array
-          toolUses.push({
-            id: toolCallId,
-            name: toolName,
-            input: toolInput,
-          });
-
-          // If tool has completed with output, add tool_result block
-          if (partData.state?.status === 'completed' && partData.state?.output) {
-            contentBlocks.push({
-              type: 'tool_result',
-              tool_use_id: toolCallId,
-              content: partData.state.output,
-            });
-          }
-        }
-      }
+      console.log('[OpenCodeTool] Part types:', finalParts.map((p) => p.type).join(', '));
+      const { contentBlocks, toolUses } = this.buildContentBlocksFromParts(
+        finalParts as Array<{
+          type: string;
+          text?: string;
+          tool?: string;
+          callID?: string;
+          id?: string;
+          state?: { input?: Record<string, unknown>; status?: string; output?: unknown };
+        }>
+      );
 
       // If no content blocks were created (error case), add the error text
       if (contentBlocks.length === 0 && responseText) {
@@ -782,6 +861,9 @@ export class OpenCodeTool implements ITool {
         toolUses.length,
         'tool uses'
       );
+
+      // Best-effort diff enrichment for Edit/Write tool results
+      enrichContentBlocks(contentBlocks);
 
       const message = await this.messagesService.create({
         message_id: (currentTextMessageId || generateId()) as MessageID,
@@ -837,6 +919,7 @@ export class OpenCodeTool implements ITool {
         parts: Array<{ type: 'text'; text: string }>;
         model?: { providerID: string; modelID: string };
       };
+      query?: { directory?: string };
     },
     opencodeSessionId: string,
     messageIndex?: number
@@ -879,17 +962,10 @@ export class OpenCodeTool implements ITool {
 
     // Extract text and token/cost metadata from 'parts' array
     if (response.data.parts && Array.isArray(response.data.parts)) {
-      // Extract text from all parts that have text content (text, reasoning, etc.)
-      const textParts: string[] = [];
-      for (const part of response.data.parts) {
-        // biome-ignore lint/suspicious/noExplicitAny: Part types vary, check for text field at runtime
-        if ('text' in part && typeof (part as any).text === 'string') {
-          // biome-ignore lint/suspicious/noExplicitAny: Checked above
-          textParts.push((part as any).text);
-        }
-      }
-      responseText = textParts.join('\n');
-      console.log('[OpenCodeTool] Extracted', textParts.length, 'text parts');
+      responseText = this.extractDisplayTextFromParts(
+        response.data.parts as Array<{ type: string; text?: string }>
+      );
+      console.log('[OpenCodeTool] Extracted display text length:', responseText.length);
 
       // Extract metadata from step-finish part
       const stepFinish = response.data.parts.find((part) => part.type === 'step-finish');

@@ -10,6 +10,7 @@ import { resolve } from 'node:path';
 import { createClient } from '@libsql/client';
 import { and, count, eq, gte, isNull, lte } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/libsql';
+import { shortId } from '../../lib/ids';
 import { messages, tasks } from '../schema';
 
 const AGOR_DB_PATH = process.env.AGOR_DB_PATH || resolve(homedir(), '.agor/agor.db');
@@ -22,8 +23,7 @@ async function main() {
   const db = drizzle(client);
 
   // Find all tasks
-  // biome-ignore lint/suspicious/noExplicitAny: SQLite-specific .all() method not available in unified Database type
-  const allTasks = await (db as any).select().from(tasks).all();
+  const allTasks = await db.select().from(tasks).all();
   console.log(`Found ${allTasks.length} tasks total\n`);
 
   let fixedSessions = 0;
@@ -50,7 +50,7 @@ async function main() {
       continue;
     }
 
-    console.log(`Session ${sessionId.substring(0, 8)}: ${sessionTasks.length} tasks`);
+    console.log(`Session ${shortId(sessionId)}: ${sessionTasks.length} tasks`);
     let linkedInSession = 0;
 
     // Link messages to tasks based on message_range
@@ -68,7 +68,7 @@ async function main() {
         messageRange.start_index === undefined ||
         messageRange.end_index === undefined
       ) {
-        console.log(`  ⚠️  Task ${task.task_id.substring(0, 8)}: missing message_range`);
+        console.log(`  ⚠️  Task ${shortId(task.task_id)}: missing message_range`);
         continue;
       }
 

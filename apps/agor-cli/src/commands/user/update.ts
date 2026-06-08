@@ -2,7 +2,8 @@
  * `agor user update` - Update a user
  */
 
-import type { User } from '@agor/core/types';
+import type { User } from '@agor-live/client';
+import { shortId } from '@agor-live/client';
 import { Args, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import inquirer from 'inquirer';
@@ -38,7 +39,7 @@ export default class UserUpdate extends BaseCommand {
     }),
     role: Flags.string({
       description: 'New role',
-      options: ['owner', 'admin', 'member', 'viewer'],
+      options: ['superadmin', 'admin', 'member', 'viewer'],
     }),
     'unix-username': Flags.string({
       description: 'New Unix username for shell access',
@@ -56,8 +57,7 @@ export default class UserUpdate extends BaseCommand {
     try {
       // Find user by email or ID
       const usersService = client.service('users');
-      const result = await usersService.find();
-      const users = (Array.isArray(result) ? result : result.data) as User[];
+      const users = await usersService.findAll();
 
       const user = users.find(
         (u) => u.email === args.user || u.user_id === args.user || u.user_id.startsWith(args.user)
@@ -139,7 +139,7 @@ export default class UserUpdate extends BaseCommand {
             name: 'role',
             message: 'New role:',
             when: fields.includes('role'),
-            choices: ['owner', 'admin', 'member', 'viewer'],
+            choices: ['superadmin', 'admin', 'member', 'viewer'],
             default: user.role,
           },
           {
@@ -177,7 +177,7 @@ export default class UserUpdate extends BaseCommand {
       if (flags.email) updates.email = flags.email;
       if (flags.name) updates.name = flags.name;
       if (flags.password) updates.password = flags.password;
-      if (flags.role) updates.role = flags.role as 'owner' | 'admin' | 'member' | 'viewer';
+      if (flags.role) updates.role = flags.role as 'superadmin' | 'admin' | 'member' | 'viewer';
       if (flags['unix-username']) updates.unix_username = flags['unix-username'];
       if (flags['force-password-change'] !== undefined) {
         updates.must_change_password = flags['force-password-change'];
@@ -200,7 +200,7 @@ export default class UserUpdate extends BaseCommand {
       this.log(`  Name:          ${chalk.cyan(updatedUser.name || '(not set)')}`);
       this.log(`  Role:          ${chalk.cyan(updatedUser.role)}`);
       this.log(`  Unix Username: ${chalk.cyan(updatedUser.unix_username || '(not set)')}`);
-      this.log(`  ID:            ${chalk.gray(updatedUser.user_id.substring(0, 8))}`);
+      this.log(`  ID:            ${chalk.gray(shortId(updatedUser.user_id))}`);
       if (updatedUser.must_change_password) {
         this.log(`  ${chalk.yellow('⚠')} User must change password on next login`);
       }

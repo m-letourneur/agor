@@ -33,4 +33,25 @@ export const AVAILABLE_AGENTS: AgenticToolOption[] = [
     description: 'Open-source terminal AI with 75+ LLM providers',
     beta: true,
   },
+  {
+    id: 'cursor',
+    name: 'Cursor SDK',
+    icon: '⌘',
+    description: 'Cursor agentic runtime via the Cursor SDK',
+    beta: true,
+  },
+  {
+    id: 'copilot',
+    name: 'GitHub Copilot',
+    icon: '✈️',
+    description: 'GitHub Copilot agentic runtime',
+    beta: true,
+  },
+  {
+    id: 'claude-code-cli',
+    name: 'Claude Code CLI',
+    icon: '🤖',
+    description: 'Anthropic Claude CLI, billed to your Pro/Max subscription',
+    beta: true,
+  },
 ];

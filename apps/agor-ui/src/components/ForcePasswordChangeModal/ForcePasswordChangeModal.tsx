@@ -5,7 +5,7 @@
  * User must change their password before continuing.
  */
 
-import type { User } from '@agor/core/types';
+import type { User } from '@agor-live/client';
 import { LockOutlined, WarningOutlined } from '@ant-design/icons';
 import { Alert, Form, Input, Modal, Typography } from 'antd';
 import { useState } from 'react';
@@ -67,13 +67,13 @@ export function ForcePasswordChangeModal({
       onCancel={onLogout}
       confirmLoading={loading}
       closable={false}
-      maskClosable={false}
+      mask={{ closable: false }}
       keyboard={false}
       width={400}
     >
       <Alert
         type="warning"
-        message="Your administrator requires you to change your password before continuing."
+        title="Your administrator requires you to change your password before continuing."
         style={{ marginBottom: 24 }}
         showIcon
       />
@@ -81,7 +81,7 @@ export function ForcePasswordChangeModal({
       {error && (
         <Alert
           type="error"
-          message={error}
+          title={error}
           style={{ marginBottom: 16 }}
           showIcon
           closable

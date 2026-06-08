@@ -2,9 +2,8 @@
  * React hook for fetching and subscribing to messages for a session
  */
 
-import type { AgorClient } from '@agor/core/api';
-import { PAGINATION } from '@agor/core/config/browser';
-import type { Message, SessionID } from '@agor/core/types';
+import type { AgorClient, Message, SessionID } from '@agor-live/client';
+import { PAGINATION } from '@agor-live/client';
 import { useCallback, useEffect, useState } from 'react';
 
 interface UseMessagesResult {
@@ -40,7 +39,7 @@ export function useMessages(
       setLoading(true);
       setError(null);
 
-      const result = await client.service('messages').find({
+      const messagesList = await client.service('messages').findAll({
         query: {
           session_id: sessionId,
           $limit: PAGINATION.DEFAULT_LIMIT,
@@ -49,8 +48,6 @@ export function useMessages(
           },
         },
       });
-
-      const messagesList = Array.isArray(result) ? result : result.data;
       setMessages(messagesList);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to fetch messages');

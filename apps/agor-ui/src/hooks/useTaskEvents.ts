@@ -5,14 +5,15 @@
  * emitted when tools start and complete execution.
  */
 
-import type { TaskID } from '@agor/core/types';
+import type { TaskID } from '@agor-live/client';
 import { useEffect, useState } from 'react';
+import type { FeathersEventHandler } from './index';
 import type { useAgorClient } from './useAgorClient';
 
 export interface ToolExecution {
   toolUseId: string;
   toolName: string;
-  status: 'executing' | 'complete';
+  status: 'executing';
 }
 
 interface ToolStartEvent {
@@ -66,7 +67,7 @@ export function useTaskEvents(
           {
             toolUseId: data.tool_use_id,
             toolName: data.tool_name,
-            status: 'executing',
+            status: 'executing' as const,
           },
         ];
       });
@@ -79,33 +80,20 @@ export function useTaskEvents(
         return;
       }
 
-      setToolsExecuting((prev) => {
-        // Mark as complete
-        const updated = prev.map((tool) =>
-          tool.toolUseId === data.tool_use_id ? { ...tool, status: 'complete' as const } : tool
-        );
-
-        return updated;
-      });
-
-      // Remove from list after 2 seconds (gives time for visual feedback)
-      setTimeout(() => {
-        setToolsExecuting((prev) => prev.filter((t) => t.toolUseId !== data.tool_use_id));
-      }, 2000);
+      // Remove immediately on completion. The tool row itself already shows completion state.
+      setToolsExecuting((prev) => prev.filter((t) => t.toolUseId !== data.tool_use_id));
     };
 
     // Register event listeners
-    // biome-ignore lint/suspicious/noExplicitAny: FeathersJS emit types are not strict
-    tasksService.on('tool:start', handleToolStart as any);
-    // biome-ignore lint/suspicious/noExplicitAny: FeathersJS emit types are not strict
-    tasksService.on('tool:complete', handleToolComplete as any);
+    // FeathersJS .on() expects (event: string, handler: (data: T) => void) but these
+    // handlers receive custom tool event payloads, not Task objects.
+    tasksService.on('tool:start', handleToolStart as FeathersEventHandler);
+    tasksService.on('tool:complete', handleToolComplete as FeathersEventHandler);
 
     // Cleanup on unmount or client/taskId change
     return () => {
-      // biome-ignore lint/suspicious/noExplicitAny: FeathersJS emit types are not strict
-      tasksService.removeListener('tool:start', handleToolStart as any);
-      // biome-ignore lint/suspicious/noExplicitAny: FeathersJS emit types are not strict
-      tasksService.removeListener('tool:complete', handleToolComplete as any);
+      tasksService.removeListener('tool:start', handleToolStart as FeathersEventHandler);
+      tasksService.removeListener('tool:complete', handleToolComplete as FeathersEventHandler);
     };
   }, [client, taskId]);
 

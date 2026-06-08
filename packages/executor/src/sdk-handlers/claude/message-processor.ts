@@ -11,6 +11,11 @@
  * - Yield structured events for database persistence
  */
 
+import {
+  SUPPRESSED_CLAUDE_STATUSES,
+  shouldSuppressClaudeSystemEvent,
+} from '@agor/core/client/claude-system-suppression';
+import { shortId } from '@agor/core/db';
 import type {
   SDKAssistantMessage,
   SDKCompactBoundaryMessage,
@@ -116,6 +121,34 @@ export type ProcessedEvent =
       };
     }
   | {
+      type: 'slash_commands_discovered';
+      slashCommands: string[];
+      skills: string[];
+      agentSessionId?: string;
+    }
+  | {
+      type: 'rate_limit';
+      status: 'allowed' | 'allowed_warning' | 'rejected';
+      resetsAt?: number;
+      rateLimitType?: string;
+      overageStatus?: string;
+      isUsingOverage?: boolean;
+      agentSessionId?: string;
+    }
+  | {
+      type: 'sdk_event';
+      sdkType: string;
+      sdkSubtype?: string;
+      summary: string;
+      rawMessage: Record<string, unknown>;
+      agentSessionId?: string;
+    }
+  | {
+      type: 'context_usage';
+      /** Raw response from SDK getContextUsage() — authoritative context window snapshot */
+      contextUsage: import('@agor/core/sdk').SDKControlGetContextUsageResponse;
+    }
+  | {
       type: 'stopped';
     }
   | {
@@ -151,6 +184,7 @@ interface ProcessorState {
   existingSdkSessionId?: string;
   capturedAgentSessionId?: string;
   messageCount: number;
+  assistantMessageCount: number;
   lastActivityTime: number;
   lastAssistantMessageTime: number;
   resolvedModel?: string;
@@ -167,6 +201,9 @@ interface ProcessorState {
   // Text chunk accumulation buffer
   textChunkBuffer: string;
   textChunkBufferSize: number;
+  // Available slash commands and skills (captured from init message)
+  slashCommands: string[];
+  skills: string[];
 }
 
 /**
@@ -184,6 +221,7 @@ export class SDKMessageProcessor {
       existingSdkSessionId: options.existingSdkSessionId,
       capturedAgentSessionId: undefined,
       messageCount: 0,
+      assistantMessageCount: 0,
       lastActivityTime: Date.now(),
       lastAssistantMessageTime: Date.now(),
       enableTokenStreaming: options.enableTokenStreaming ?? true,
@@ -192,6 +230,8 @@ export class SDKMessageProcessor {
       contentBlockStack: [],
       textChunkBuffer: '',
       textChunkBufferSize: 0,
+      slashCommands: [],
+      skills: [],
     };
   }
 
@@ -258,6 +298,10 @@ export class SDKMessageProcessor {
         return this.handleResult(msg as SDKResultMessage);
       case 'system':
         return this.handleSystem(msg as SDKSystemMessage | SDKCompactBoundaryMessage);
+      case 'rate_limit_event':
+        return this.handleRateLimitEvent(
+          msg as { type: string; rate_limit_info?: Record<string, unknown> }
+        );
       default:
         return this.handleUnknown(msg);
     }
@@ -288,8 +332,9 @@ export class SDKMessageProcessor {
    */
   private handleAssistant(msg: SDKAssistantMessage): ProcessedEvent[] {
     this.state.lastAssistantMessageTime = Date.now();
+    this.state.assistantMessageCount++;
 
-    const contentBlocks = this.processContentBlocks(msg.message?.content);
+    const contentBlocks = this.processContentBlocks(msg.message?.content as ContentBlock[]);
     const toolUses = this.extractToolUses(contentBlocks);
 
     return [
@@ -311,22 +356,21 @@ export class SDKMessageProcessor {
   private handleUser(msg: SDKUserMessage | SDKUserMessageReplay): ProcessedEvent[] {
     // Check if this is a replay message (already processed)
     if ('isReplay' in msg && msg.isReplay) {
-      console.debug(`🔄 User message replay (uuid: ${msg.uuid?.substring(0, 8)})`);
+      console.debug(`🔄 User message replay (uuid: ${msg.uuid ? shortId(msg.uuid) : 'unknown'})`);
       return []; // Skip replays - already in our database
     }
 
-    const content = msg.message?.content;
+    const content = msg.message?.content as ContentBlock[] | undefined;
     const uuid = 'uuid' in msg ? msg.uuid : undefined;
 
     // Check what type of content this user message has
-    const hasToolResult =
-      Array.isArray(content) && content.some((b: ContentBlock) => b.type === 'tool_result');
-    const hasText = Array.isArray(content) && content.some((b: ContentBlock) => b.type === 'text');
+    const hasToolResult = Array.isArray(content) && content.some((b) => b.type === 'tool_result');
+    const hasText = Array.isArray(content) && content.some((b) => b.type === 'text');
 
     if (hasToolResult) {
       // Tool result messages - save to database for conversation continuity
-      const toolResults = content.filter((b: ContentBlock) => b.type === 'tool_result');
-      const errorCount = toolResults.filter((tr: ContentBlock) => tr.is_error).length;
+      const toolResults = content.filter((b) => b.type === 'tool_result');
+      const errorCount = toolResults.filter((tr) => tr.is_error).length;
       const successCount = toolResults.length - errorCount;
       console.log(
         `🔧 SDK user message with ${toolResults.length} tool result(s) (✅ ${successCount}, ❌ ${errorCount})`
@@ -337,7 +381,7 @@ export class SDKMessageProcessor {
         {
           type: 'complete',
           role: MessageRole.USER,
-          content: content as ContentBlock[], // Tool result content
+          content: content, // Tool result content
           toolUses: undefined,
           parent_tool_use_id: msg.parent_tool_use_id || null,
           agentSessionId: this.state.capturedAgentSessionId,
@@ -345,16 +389,18 @@ export class SDKMessageProcessor {
         },
       ];
     } else if (hasText) {
-      const textBlocks = content.filter((b: ContentBlock) => b.type === 'text');
+      const textBlocks = content.filter((b) => b.type === 'text');
       const textPreview = textBlocks[0]?.text?.substring(0, 100) || '';
-      console.log(`👤 SDK user message (uuid: ${uuid?.substring(0, 8)}): "${textPreview}"`);
+      console.log(
+        `👤 SDK user message (uuid: ${uuid ? shortId(uuid) : 'unknown'}): "${textPreview}"`
+      );
 
       // Regular user text messages - also save for completeness
       return [
         {
           type: 'complete',
           role: MessageRole.USER,
-          content: content as ContentBlock[],
+          content: content,
           toolUses: undefined,
           parent_tool_use_id: msg.parent_tool_use_id || null,
           agentSessionId: this.state.capturedAgentSessionId,
@@ -362,10 +408,10 @@ export class SDKMessageProcessor {
         },
       ];
     } else {
-      console.log(`👤 SDK user message (uuid: ${uuid?.substring(0, 8)})`);
+      console.log(`👤 SDK user message (uuid: ${uuid ? shortId(uuid) : 'unknown'})`);
       console.log(
         `   Content types:`,
-        Array.isArray(content) ? content.map((b: ContentBlock) => b.type) : 'no content'
+        Array.isArray(content) ? content.map((b) => b.type) : 'no content'
       );
       return []; // Unknown user message type - log only
     }
@@ -545,7 +591,42 @@ export class SDKMessageProcessor {
       console.log(`   Model usage (with contextWindow):`, JSON.stringify(msg.modelUsage, null, 2));
     }
 
-    return [
+    const events: ProcessedEvent[] = [];
+
+    // The SDK puts final output text in result.result for both normal prompts and local commands.
+    // For local commands (e.g. /usage, /cost), this is the ONLY output (no assistant messages).
+    // For normal prompts, assistant messages are already streamed separately.
+    // We emit result text as a system message when no assistant messages were produced.
+    if (
+      msg.subtype === 'success' &&
+      'result' in msg &&
+      msg.result &&
+      typeof msg.result === 'string' &&
+      msg.result.trim().length > 0
+    ) {
+      const hasAssistantMessages = this.state.assistantMessageCount > 0;
+      console.log(
+        `📋 SDK result text (${msg.result.length} chars, hasAssistantMessages=${hasAssistantMessages})`
+      );
+      if (!hasAssistantMessages) {
+        events.push({
+          type: 'complete',
+          role: MessageRole.ASSISTANT,
+          content: [
+            {
+              type: 'text',
+              text: msg.result,
+            },
+          ],
+          toolUses: undefined,
+          parent_tool_use_id: null,
+          agentSessionId: this.state.capturedAgentSessionId,
+          resolvedModel: this.state.resolvedModel,
+        });
+      }
+    }
+
+    events.push(
       {
         type: 'result',
         raw_sdk_message: msg, // Pass the entire SDK message unchanged
@@ -554,8 +635,10 @@ export class SDKMessageProcessor {
       {
         type: 'end',
         reason: 'result',
-      },
-    ];
+      }
+    );
+
+    return events;
   }
 
   /**
@@ -607,33 +690,227 @@ export class SDKMessageProcessor {
       ];
     }
 
-    if ('subtype' in msg && msg.subtype === 'init') {
-      console.debug(`ℹ️  SDK system init:`, {
-        model: msg.model,
-        permissionMode: msg.permissionMode,
-        cwd: msg.cwd,
-        tools: msg.tools?.length,
-        mcp_servers: msg.mcp_servers?.length,
-      });
-
-      // Capture model from init message
-      if (msg.model) {
-        this.state.resolvedModel = msg.model;
-      }
-
+    // Suppress noisy status values (e.g. 'requesting' — fires on every API call).
+    // Other status variants (null, permissionMode change, compact_result/error) still
+    // flow through and get surfaced as generic sdk_event messages below.
+    if (
+      'status' in msg &&
+      typeof msg.status === 'string' &&
+      (SUPPRESSED_CLAUDE_STATUSES as ReadonlySet<string>).has(msg.status)
+    ) {
       return [];
     }
 
-    console.debug(`ℹ️  SDK system message:`, msg);
+    if ('subtype' in msg && msg.subtype === 'init') {
+      const initMsg = msg as SDKSystemMessage;
+      console.debug(`ℹ️  SDK system init:`, {
+        model: initMsg.model,
+        permissionMode: initMsg.permissionMode,
+        cwd: initMsg.cwd,
+        tools: initMsg.tools?.length,
+        mcp_servers: initMsg.mcp_servers?.length,
+        slash_commands: initMsg.slash_commands?.length,
+        skills: initMsg.skills?.length,
+      });
+
+      const events: ProcessedEvent[] = [];
+
+      // Capture model from init message
+      if (initMsg.model) {
+        this.state.resolvedModel = initMsg.model;
+      }
+
+      // Capture available slash commands and skills for autocomplete
+      if (initMsg.slash_commands || initMsg.skills) {
+        this.state.slashCommands = initMsg.slash_commands || [];
+        this.state.skills = initMsg.skills || [];
+        console.log(
+          `📋 Available commands: ${this.state.slashCommands.length} slash commands, ${this.state.skills.length} skills`
+        );
+
+        // Emit event so claude-tool can persist to session for UI autocomplete
+        events.push({
+          type: 'slash_commands_discovered',
+          slashCommands: this.state.slashCommands,
+          skills: this.state.skills,
+          agentSessionId: this.state.capturedAgentSessionId,
+        });
+      }
+
+      return events;
+    }
+
+    // Blacklist approach: surface unhandled system subtypes by default
+    const subtype =
+      ('subtype' in msg ? (msg as { subtype?: string }).subtype : undefined) || 'unknown';
+
+    if (shouldSuppressClaudeSystemEvent(msg as { subtype?: string; [key: string]: unknown })) {
+      console.debug(`🔇 Suppressed system subtype: ${subtype}`);
+      return [];
+    }
+
+    console.log(`📡 Surfacing unhandled system subtype: ${subtype}`);
+    return [
+      {
+        type: 'sdk_event',
+        sdkType: 'system',
+        sdkSubtype: subtype,
+        summary: this.summarizeMessage(msg as Record<string, unknown>),
+        rawMessage: msg as Record<string, unknown>,
+        agentSessionId: this.state.capturedAgentSessionId,
+      },
+    ];
+  }
+
+  /**
+   * Handle rate_limit_event messages from the SDK
+   *
+   * SDK statuses (from SDKRateLimitInfo):
+   * - 'allowed': Normal, fires on every API call — never surfaced (too noisy)
+   * - 'allowed_warning': Approaching rate limit — always surface
+   * - 'rejected': Hard blocked by rate limit — always surface
+   */
+  private handleRateLimitEvent(msg: {
+    type: string;
+    rate_limit_info?: Record<string, unknown>;
+  }): ProcessedEvent[] {
+    const info = msg.rate_limit_info || {};
+    const status = (info.status as string) || 'unknown';
+    const rateLimitType = info.rateLimitType as string | undefined;
+    const resetsAt = info.resetsAt as number | undefined;
+    const overageStatus = info.overageStatus as string | undefined;
+    const isUsingOverage = info.isUsingOverage as boolean | undefined;
+
+    // Always log rate limit events
+    if (status === 'allowed') {
+      console.log(
+        `⏳ Rate limit event: allowed (type: ${rateLimitType || 'unknown'}, overage: ${overageStatus || 'unknown'})`
+      );
+    } else {
+      console.warn(
+        `🚫 Rate limit event: ${status} (type: ${rateLimitType || 'unknown'}, resets: ${resetsAt ? new Date(resetsAt * 1000).toISOString() : 'unknown'})`
+      );
+    }
+
+    // Surface only events where the user is actually rate-limited or approaching a limit.
+    // 'allowed' fires on every API call — never surface it, even if overageStatus is 'rejected',
+    // because that just means the org doesn't have overage enabled (a permanent, non-actionable state).
+    // 'allowed_warning' and 'rejected' always get surfaced since they indicate real throttling.
+    const shouldSurface = status === 'allowed_warning' || status === 'rejected';
+
+    if (shouldSurface) {
+      return [
+        {
+          type: 'rate_limit',
+          status,
+          resetsAt,
+          rateLimitType,
+          overageStatus,
+          isUsingOverage,
+          agentSessionId: this.state.capturedAgentSessionId,
+        },
+      ];
+    }
+
     return [];
   }
 
   /**
-   * Handle unknown message types
+   * Message types to suppress (log-only, don't surface to users).
+   * Everything NOT in this set is surfaced as a system message by default.
+   */
+  private static readonly SUPPRESSED_MESSAGE_TYPES = new Set([
+    'tool_progress', // Fires constantly during tool execution — extremely noisy
+    'prompt_suggestion', // End-of-conversation suggestions, not relevant in Agor
+  ]);
+
+  /**
+   * Handle unknown/unhandled top-level message types.
+   * Blacklist approach: surface everything by default, suppress only known-noisy types.
    */
   private handleUnknown(msg: { type?: string; [key: string]: unknown }): ProcessedEvent[] {
-    console.warn(`⚠️  Unknown SDK message type: ${msg.type}`, msg);
-    return []; // Continue processing - don't fail on unknown types
+    const msgType = msg.type || 'unknown';
+
+    if (SDKMessageProcessor.SUPPRESSED_MESSAGE_TYPES.has(msgType)) {
+      console.debug(`🔇 Suppressed SDK message type: ${msgType}`);
+      return [];
+    }
+
+    console.log(`📡 Surfacing unhandled SDK message type: ${msgType}`);
+    return [
+      {
+        type: 'sdk_event',
+        sdkType: msgType,
+        summary: this.summarizeMessage(msg),
+        rawMessage: msg as Record<string, unknown>,
+        agentSessionId: this.state.capturedAgentSessionId,
+      },
+    ];
+  }
+
+  /**
+   * Create a human-readable summary from an SDK message for display in the conversation UI.
+   */
+  private summarizeMessage(msg: Record<string, unknown>): string {
+    const type = (msg.type as string) || 'unknown';
+    const subtype = msg.subtype as string | undefined;
+    const label = subtype ? `${type}/${subtype}` : type;
+
+    // Type-specific summaries for known unhandled types
+    if (type === 'api_retry') {
+      const attempt = msg.attempt as number | undefined;
+      const maxRetries = msg.max_retries as number | undefined;
+      const delayMs = msg.retry_delay_ms as number | undefined;
+      const errorStatus = msg.error_status as number | undefined;
+      const parts = [`API retry attempt ${attempt ?? '?'}/${maxRetries ?? '?'}`];
+      if (errorStatus) parts.push(`(HTTP ${errorStatus})`);
+      if (delayMs) parts.push(`— waiting ${Math.round(delayMs / 1000)}s`);
+      return parts.join(' ');
+    }
+
+    if (type === 'auth_status') {
+      const isAuth = msg.isAuthenticating as boolean | undefined;
+      const error = msg.error as string | undefined;
+      if (error) return `Authentication error: ${error}`;
+      return isAuth ? 'Authenticating...' : 'Authentication complete';
+    }
+
+    if (type === 'tool_use_summary') {
+      return (msg.summary as string) || 'Tool use summary';
+    }
+
+    if (subtype === 'api_retry') {
+      const attempt = msg.attempt as number | undefined;
+      const maxRetries = msg.max_retries as number | undefined;
+      const delayMs = msg.retry_delay_ms as number | undefined;
+      const parts = [`API retry ${attempt ?? '?'}/${maxRetries ?? '?'}`];
+      if (delayMs) parts.push(`— waiting ${Math.round(delayMs / 1000)}s`);
+      return parts.join(' ');
+    }
+
+    if (subtype === 'hook_started' || subtype === 'hook_progress' || subtype === 'hook_response') {
+      return `Hook: ${subtype.replace('hook_', '')}`;
+    }
+
+    if (
+      subtype === 'task_notification' ||
+      subtype === 'task_started' ||
+      subtype === 'task_progress'
+    ) {
+      return `Task: ${subtype.replace('task_', '')}`;
+    }
+
+    if (subtype === 'local_command_output') {
+      return 'Local command output';
+    }
+
+    if (subtype === 'status') {
+      const status = msg.status as string | undefined;
+      return status ? `Status: ${status}` : 'Status update';
+    }
+
+    // Generic fallback
+    return `SDK event: ${label}`;
   }
 
   /**

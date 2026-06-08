@@ -26,7 +26,7 @@ graph TD
     A[User] -->|Prompts| B[Agor UI]
     B -->|WebSocket| C[Agor Daemon]
     C -->|Manages| D[Sessions]
-    C -->|Creates| E[Worktrees]
+    C -->|Creates| E[Branches]
     D -->|Contains| F[Tasks]
     E -->|Tracks| G[Git Repos]
 
@@ -90,7 +90,7 @@ interface Session {
   title: string;
   status: 'idle' | 'running' | 'completed' | 'failed';
   agenticTool: 'claude-code' | 'codex' | 'gemini';
-  worktreeId: WorktreeId;
+  branchId: BranchId;
   createdAt: Date;
 }
 
@@ -195,7 +195,7 @@ Check out the [Streamdown documentation](https://streamdown.ai) for more details
 export const StreamdownDemo: React.FC = () => {
   return (
     <div style={{ padding: '24px', maxWidth: '1200px', margin: '0 auto' }}>
-      <Space direction="vertical" size="large" style={{ width: '100%' }}>
+      <Space orientation="vertical" size="large" style={{ width: '100%' }}>
         <Title level={2}>Streamdown Feature Showcase</Title>
 
         <Card>

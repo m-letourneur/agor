@@ -1,11 +1,18 @@
-import type { AgorClient } from '@agor/core/api';
-import type { User, UserID } from '@agor/core/types';
+import type { AgorClient, User, UserID, UserRole } from '@agor-live/client';
+import { hasMinimumRole, ROLES } from '@agor-live/client';
 import { ClipboardAddon } from '@xterm/addon-clipboard';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { Terminal } from '@xterm/xterm';
 import { App, Modal } from 'antd';
 import { useEffect, useRef, useState } from 'react';
 import '@xterm/xterm/css/xterm.css';
+
+/**
+ * Minimum role required to open a web terminal when the instance-level
+ * `execution.allow_web_terminal` flag is enabled. Shared with the app shell
+ * (`components/App/App.tsx`) so the gate only exists in one place.
+ */
+export const WEB_TERMINAL_MIN_ROLE: UserRole = ROLES.MEMBER;
 
 const OSC_SEQUENCE_START = '\u001B]8;';
 const OSC_SEQUENCE_END = '\u001B]8;;\u0007';
@@ -67,7 +74,7 @@ export interface TerminalModalProps {
   onClose: () => void;
   client: AgorClient | null;
   user?: User | null;
-  worktreeId?: string; // Worktree context for Zellij integration
+  branchId?: string; // Branch context for Zellij integration
   initialCommands?: string[]; // Commands to execute after connection
 }
 
@@ -76,27 +83,32 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
   onClose,
   client,
   user,
-  worktreeId,
+  branchId,
   initialCommands = [],
 }) => {
   const { modal } = App.useApp();
   const terminalDivRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [modalReady, setModalReady] = useState(false);
+  const [zellijMissing, setZellijMissing] = useState(false);
   const [sessionInfo, setSessionInfo] = useState<{
     zellijSession?: string;
     zellijReused?: boolean;
-    worktreeName?: string;
+    branchName?: string;
   }>({});
 
-  // Check if user has admin role
-  const isAdmin = user?.role === 'admin' || user?.role === 'owner';
+  // The instance-level `execution.allow_web_terminal` flag is enforced
+  // server-side and also gates whether the open-terminal buttons appear at
+  // all in the UI; here we only re-check the role as a belt-and-suspenders
+  // safeguard.
+  const canUseTerminal = hasMinimumRole(user?.role, WEB_TERMINAL_MIN_ROLE);
 
   useEffect(() => {
-    if (!open || !terminalDivRef.current || !client) return;
+    if (!open || !modalReady || !terminalDivRef.current || !client) return;
 
-    // Skip terminal setup for non-admin users
-    if (!isAdmin) return;
+    // Skip terminal setup for users without terminal access
+    if (!canUseTerminal) return;
 
     // Executor mode requires user to be logged in
     if (!user?.user_id) {
@@ -211,13 +223,13 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
         const result = (await client.service('terminals').create({
           rows: 40,
           cols: 160,
-          worktreeId,
+          branchId,
         })) as {
           userId: UserID;
           channel: string;
           sessionName: string;
           isNew: boolean;
-          worktreeName?: string;
+          branchName?: string;
         };
 
         if (!mounted) {
@@ -230,7 +242,7 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
         setSessionInfo({
           zellijSession: result.sessionName,
           zellijReused: !result.isNew,
-          worktreeName: result.worktreeName,
+          branchName: result.branchName,
         });
         // Only clear for new sessions - reconnections will get screen via redraw
         if (result.isNew) {
@@ -280,11 +292,20 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
         }
       } catch (error) {
         console.error('[Terminal] Failed to create terminal:', error);
+        const message = error instanceof Error ? error.message : String(error);
+        // Surface the "Zellij not installed" case as a friendly inline panel
+        // with a link to the install docs, rather than a raw xterm error.
+        if (/zellij is not installed/i.test(message)) {
+          setZellijMissing(true);
+          if (terminalRef.current) {
+            terminalRef.current.dispose();
+            terminalRef.current = null;
+          }
+          return;
+        }
         if (terminalRef.current) {
-          terminalRef.current.writeln('\r\n❌ Failed to connect to terminal');
-          terminalRef.current.writeln(
-            `Error: ${error instanceof Error ? error.message : String(error)}`
-          );
+          terminalRef.current.writeln('\r\nFailed to connect to terminal');
+          terminalRef.current.writeln(`Error: ${message}`);
         }
       }
     };
@@ -303,8 +324,9 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
       removeChannelListeners();
       setIsConnected(false);
       setSessionInfo({});
+      setZellijMissing(false);
     };
-  }, [open, client, initialCommands, isAdmin, worktreeId, user?.user_id]);
+  }, [open, modalReady, client, initialCommands, canUseTerminal, branchId, user?.user_id]);
 
   const handleClose = () => {
     if (isConnected) {
@@ -326,9 +348,10 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
 
   return (
     <Modal
-      title={`Terminal${sessionInfo.worktreeName ? ` - ${sessionInfo.worktreeName}` : ''}`}
+      title={`Terminal${sessionInfo.branchName ? ` - ${sessionInfo.branchName}` : ''}`}
       open={open}
       onCancel={handleClose}
+      afterOpenChange={setModalReady}
       footer={null}
       width="auto"
       styles={{
@@ -339,14 +362,42 @@ export const TerminalModal: React.FC<TerminalModalProps> = ({
       }}
       centered
     >
-      {!isAdmin ? (
+      {!canUseTerminal ? (
         <div style={{ padding: '24px', color: '#fff' }}>
           <p>
-            Terminal access requires <strong>admin</strong> or <strong>owner</strong> role.
+            Terminal access requires at least <strong>{WEB_TERMINAL_MIN_ROLE}</strong> role.
           </p>
           <p style={{ marginBottom: 0 }}>
-            Terminal sessions run as the daemon's system user and can execute arbitrary code.
             Contact your Agor administrator to request elevated permissions.
+          </p>
+        </div>
+      ) : zellijMissing ? (
+        <div style={{ padding: '24px', color: '#fff', maxWidth: 560 }}>
+          <p style={{ marginTop: 0 }}>
+            <strong>Zellij isn't installed on the daemon host.</strong>
+          </p>
+          <p>
+            The web terminal uses{' '}
+            <a
+              href="https://zellij.dev/"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: '#3db5ab' }}
+            >
+              Zellij
+            </a>{' '}
+            for persistent, multiplexed sessions. Install it to enable terminals — everything else
+            in Agor works without it.
+          </p>
+          <p style={{ marginBottom: 0 }}>
+            <a
+              href="https://agor.live/guide/extended-install#optional-zellij-for-the-web-terminal"
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ color: '#3db5ab' }}
+            >
+              Extended install guide →
+            </a>
           </p>
         </div>
       ) : (

@@ -1,158 +1,238 @@
 /**
- * MCP Session Tokens (Deterministic JWT-based)
+ * MCP Session Tokens (jti + exp)
  *
- * Generates deterministic JWT tokens for internal MCP authentication.
- * Tokens are derived from session ID + user ID + daemon secret, making them:
- * - Reproducible (same session always gets same token)
- * - Stateless (no database or in-memory storage needed)
- * - Restart-safe (daemon restarts don't invalidate tokens)
- * - Session-scoped (each session has unique token)
+ * MCP tokens authenticate internal daemon ↔ MCP-server communication (aud:
+ * `agor:mcp:internal`). Each issued token carries:
  *
- * Security: Designed for internal localhost/same-workspace communication only.
- * Uses HS256 (HMAC-SHA256) with daemon's internal secret.
+ * - `sub`  — session id
+ * - `uid`  — user id
+ * - `aud`  — `agor:mcp:internal`
+ * - `iss`  — `agor`
+ * - `iat`  — unix seconds, standard JWT "issued at"
+ * - `exp`  — unix seconds, enforced by `jsonwebtoken.verify`
+ * - `jti`  — per-issuance UUID (useful for log correlation)
+ *
+ * No revocation mechanics. Tokens are re-minted fresh on every `session.get` /
+ * `session.create` and carry a short `exp` (default 24h); any suspected
+ * compromise is addressed by rotating the JWT signing secret or letting the
+ * token expire. MCP is internal-only (loopback) — if/when it goes external
+ * we'd design auth from scratch (OAuth / API keys) rather than extending this.
+ *
+ * A session-existence check is still performed during validation so tokens
+ * for deleted sessions are rejected even if they haven't yet hit their `exp`.
  */
 
+import { MCP_TOKEN } from '@agor/core/config';
+import { type Database, generateId, SessionRepository, shortId } from '@agor/core/db';
 import type { Application } from '@agor/core/feathers';
-import type { SessionID, UserID } from '@agor/core/types';
+import {
+  MCP_TOKEN_AUDIENCE,
+  MCP_TOKEN_ISSUER,
+  type SessionID,
+  type UserID,
+} from '@agor/core/types';
 import jwt from 'jsonwebtoken';
 
-interface SessionTokenData {
-  userId: UserID;
+// Re-exported so daemon callers don't have to reach into @agor/core/types.
+export { MCP_TOKEN_AUDIENCE, MCP_TOKEN_ISSUER } from '@agor/core/types';
+
+// ============================================================================
+// Types
+// ============================================================================
+
+interface McpTokenPayload {
+  sub: SessionID;
+  uid: UserID;
+  aud: string;
+  iss?: string;
+  iat?: number;
+  exp?: number;
+  jti?: string;
+}
+
+export interface McpTokenContext {
   sessionId: SessionID;
+  userId: UserID;
+  jti: string;
+}
+
+export interface McpTokenInitOptions {
+  db: Database;
+  /** Token lifetime in ms. Falls back to `MCP_TOKEN.DEFAULT_EXPIRATION_MS` (24h). */
+  expirationMs?: number;
+  /** Override `Date.now()` for tests. */
+  now?: () => number;
+}
+
+// ============================================================================
+// Module state
+// ============================================================================
+
+interface ModuleState {
+  sessionRepo: SessionRepository;
+  expirationMs: number;
+  now: () => number;
+}
+
+let _state: ModuleState | null = null;
+
+function requireState(): ModuleState {
+  if (!_state) {
+    throw new Error(
+      'MCP token module not initialized — call initMcpTokens({ db, ... }) at daemon startup'
+    );
+  }
+  return _state;
+}
+
+// ============================================================================
+// Init / shutdown
+// ============================================================================
+
+/**
+ * Initialize the module. Idempotent — calling again replaces the previous
+ * state (tests rely on this).
+ */
+export function initMcpTokens(options: McpTokenInitOptions): void {
+  const expirationMs = options.expirationMs ?? MCP_TOKEN.DEFAULT_EXPIRATION_MS;
+  const now = options.now ?? (() => Date.now());
+
+  _state = {
+    sessionRepo: new SessionRepository(options.db),
+    expirationMs,
+    now,
+  };
+
+  console.log(`[mcp-tokens] initialized: exp=${expirationMs}ms`);
 }
 
 /**
- * Generate deterministic MCP session token for internal daemon communication.
- *
- * Uses JWT with HS256 algorithm and no timestamp (iat removed) to ensure
- * the same session+user always produces the same token.
- *
- * @param userId - User ID
- * @param sessionId - Session ID
- * @param daemonSecret - JWT secret from app settings
- * @returns Deterministic JWT token string
+ * Tear down the module. Tests only; production uses process exit.
  */
-export function generateSessionToken(
-  userId: UserID,
-  sessionId: SessionID,
-  daemonSecret: string
-): string {
-  // Generate deterministic JWT (no timestamp for reproducibility)
-  const token = jwt.sign(
-    {
-      sub: sessionId, // Subject = session ID
-      uid: userId, // Custom claim for user
-      aud: 'agor:mcp:internal', // Audience = internal MCP only
-      // NO iat (issued at) - this ensures determinism
-    },
-    daemonSecret,
-    {
-      algorithm: 'HS256',
-      noTimestamp: true, // Critical: makes token deterministic
-    }
-  );
+export function shutdownMcpTokens(): void {
+  _state = null;
+}
 
-  console.log(`🎫 Generated deterministic MCP token for session ${sessionId.substring(0, 8)}`);
+// ============================================================================
+// Issuance
+// ============================================================================
+
+/**
+ * Mint a fresh MCP token for a session.
+ *
+ * @throws if the module isn't initialized, the session doesn't exist, or the
+ *   app lacks a JWT secret.
+ */
+export async function generateSessionToken(
+  app: Application,
+  sessionId: SessionID,
+  userId: UserID
+): Promise<string> {
+  const s = requireState();
+  const jwtSecret = app.settings.authentication?.secret;
+  if (!jwtSecret) {
+    throw new Error('MCP token generation failed: JWT secret not configured in app settings');
+  }
+
+  const sessionExists = await s.sessionRepo.exists(sessionId);
+  if (!sessionExists) {
+    throw new Error(
+      `MCP token generation failed: session ${sessionId} not found — cannot mint token for a non-existent session`
+    );
+  }
+
+  const nowSec = Math.floor(s.now() / 1000);
+  const expSec = nowSec + Math.floor(s.expirationMs / 1000);
+  const jti = generateId();
+
+  const payload: McpTokenPayload = {
+    sub: sessionId,
+    uid: userId,
+    aud: MCP_TOKEN_AUDIENCE,
+    iss: MCP_TOKEN_ISSUER,
+    iat: nowSec,
+    exp: expSec,
+    jti,
+  };
+
+  const token = jwt.sign(payload, jwtSecret, { algorithm: 'HS256' });
+
+  console.log(
+    `🎫 MCP token issued: session=${shortId(sessionId)} jti=${jti.substring(0, 8)} exp=+${Math.floor(s.expirationMs / 1000)}s`
+  );
 
   return token;
 }
 
+/** Convenience alias kept for callers that already used this name. */
+export const getTokenForSession = generateSessionToken;
+
+// ============================================================================
+// Validation
+// ============================================================================
+
 /**
- * Validate an MCP session token and extract session/user context.
+ * Validate an MCP token and extract `{ sessionId, userId, jti }`.
  *
- * Verifies JWT signature and extracts sessionId + userId from claims.
- * No database lookup needed - validation is purely cryptographic.
+ * Rejection reasons:
+ *  - bad signature / wrong audience / wrong issuer / expired (`jsonwebtoken.verify`)
+ *  - missing `jti`/`exp` claims (pre-rollout tokens are rejected outright)
+ *  - session no longer exists
  *
- * @param app - FeathersJS application instance (used to get JWT secret)
- * @param token - JWT token to validate
- * @returns Token data if valid, null if invalid or expired
+ * Returns `null` on any failure.
  */
 export async function validateSessionToken(
   app: Application,
   token: string
-): Promise<SessionTokenData | null> {
+): Promise<McpTokenContext | null> {
+  const s = requireState();
+  const jwtSecret = app.settings.authentication?.secret;
+  if (!jwtSecret) {
+    console.error('[mcp-tokens] JWT secret not configured in app settings');
+    return null;
+  }
+
+  let payload: McpTokenPayload;
   try {
-    // Get JWT secret from app settings
-    const jwtSecret = app.settings.authentication?.secret;
-    if (!jwtSecret) {
-      console.error('❌ JWT secret not configured in app settings');
-      return null;
-    }
-
-    // Verify and decode JWT
-    const payload = jwt.verify(token, jwtSecret, {
-      audience: 'agor:mcp:internal',
+    payload = jwt.verify(token, jwtSecret, {
+      audience: MCP_TOKEN_AUDIENCE,
+      issuer: MCP_TOKEN_ISSUER,
       algorithms: ['HS256'],
-    }) as {
-      sub: SessionID;
-      uid: UserID;
-      aud: string;
-    };
-
-    // Extract session and user from claims
-    return {
-      sessionId: payload.sub,
-      userId: payload.uid,
-    };
-  } catch (error) {
-    // JWT verification failed (invalid signature, wrong audience, etc.)
-    if (error instanceof jwt.JsonWebTokenError) {
-      console.warn(`⚠️  Invalid MCP token: ${error.message}`);
+    }) as McpTokenPayload;
+  } catch (err) {
+    if (err instanceof jwt.TokenExpiredError) {
+      console.warn('[mcp-tokens] token rejected: expired');
+    } else if (err instanceof jwt.JsonWebTokenError) {
+      console.warn(`[mcp-tokens] token rejected: ${err.message}`);
     } else {
-      console.error('❌ Token validation error:', error);
+      console.error('[mcp-tokens] token verify error:', err);
     }
     return null;
   }
-}
 
-/**
- * Get token for a session (generates deterministically).
- *
- * Since tokens are deterministic, we can always regenerate them
- * instead of looking them up.
- *
- * @param sessionId - Session ID
- * @param userId - User ID
- * @param daemonSecret - JWT secret
- * @returns Token string
- */
-export function getTokenForSession(
-  sessionId: SessionID,
-  userId: UserID,
-  daemonSecret: string
-): string {
-  return generateSessionToken(userId, sessionId, daemonSecret);
-}
+  const sessionId = payload.sub;
+  const userId = payload.uid;
+  if (!sessionId || !userId) {
+    console.warn('[mcp-tokens] token rejected: missing sub/uid');
+    return null;
+  }
 
-/**
- * Revoke a session token.
- *
- * Note: With deterministic tokens, we can't truly "revoke" a token
- * without maintaining a blocklist. For now, this is a no-op.
- *
- * True revocation would require:
- * 1. Maintaining a blocklist of revoked tokens in DB
- * 2. Checking blocklist during validation
- * 3. Or rotating the daemon secret (invalidates ALL tokens)
- *
- * @param token - Token to revoke (currently no-op)
- */
-export function revokeSessionToken(token: string): void {
-  console.warn(
-    '⚠️  revokeSessionToken called but deterministic tokens cannot be revoked. ' +
-      'To revoke access, delete the session or rotate the daemon secret.'
-  );
-  // No-op: deterministic tokens can't be revoked without a blocklist
-}
+  // `jwt.verify` only enforces `exp` when the claim is present; a token with
+  // no `exp` would otherwise pass verify and be valid forever. Enforce both
+  // `jti` and `exp` explicitly so a forged but signature-valid token without
+  // `exp` cannot be minted and replayed indefinitely.
+  if (!payload.jti || payload.exp === undefined) {
+    console.warn('[mcp-tokens] token rejected: missing jti or exp');
+    return null;
+  }
 
-/**
- * Clean up expired tokens.
- *
- * Note: With deterministic stateless tokens, there's nothing to clean up.
- * Token expiration would need to be implemented via JWT 'exp' claim if needed.
- *
- * Currently a no-op for backward compatibility.
- */
-export function cleanupExpiredTokens(): void {
-  // No-op: no in-memory storage to clean up
+  // Reject tokens whose session has been deleted — protects against stale
+  // tokens outliving their session until `exp`.
+  const sessionExists = await s.sessionRepo.exists(sessionId);
+  if (!sessionExists) {
+    console.warn(`[mcp-tokens] token rejected: session ${shortId(sessionId)} not found`);
+    return null;
+  }
+
+  return { sessionId, userId, jti: payload.jti };
 }

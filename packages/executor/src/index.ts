@@ -8,6 +8,7 @@
  * 4. Exits when task completes
  */
 
+import { shortId } from '@agor/core/db';
 import type {
   MessageSource,
   PermissionMode,
@@ -15,27 +16,47 @@ import type {
   SessionID,
   TaskID,
 } from '@agor/core/types';
+import { TaskStatus } from '@agor/core/types';
+import { type ExecutorHeartbeatHandle, startExecutorHeartbeat } from './executor-heartbeat.js';
+import type { ResolvedConfigSlice } from './payload-types.js';
 import { globalPermissionManager } from './permissions/permission-manager.js';
 import { type AgorClient, createFeathersClient } from './services/feathers-client.js';
+import { tryMarkTaskTerminal } from './terminal-task.js';
 
 export interface ExecutorConfig {
   sessionToken: string;
   sessionId: string;
   taskId: string;
   prompt: string;
-  tool: 'claude-code' | 'gemini' | 'codex' | 'opencode';
+  tool: 'claude-code' | 'gemini' | 'codex' | 'opencode' | 'copilot' | 'cursor';
   permissionMode?: PermissionMode;
   daemonUrl: string;
   messageSource?: MessageSource;
+  /** Daemon-resolved config slice. See payload-types.ResolvedConfigSliceSchema. */
+  resolvedConfig?: ResolvedConfigSlice;
 }
 
 export class AgorExecutor {
   private client: AgorClient | null = null;
   private abortController: AbortController;
   private isRunning = false;
+  private heartbeat: ExecutorHeartbeatHandle | null = null;
 
   constructor(private config: ExecutorConfig) {
     this.abortController = new AbortController();
+  }
+
+  /**
+   * Bound wrapper around the standalone `tryMarkTaskTerminal` helper for
+   * the four fail-safe paths inside this class. Guards against a missing
+   * client (e.g. when the daemon connection never came up).
+   */
+  private async tryMarkTaskTerminal(
+    status: typeof TaskStatus.FAILED | typeof TaskStatus.STOPPED,
+    errorMessage?: string
+  ): Promise<void> {
+    if (!this.client) return;
+    await tryMarkTaskTerminal(this.client, this.config.taskId, status, errorMessage);
   }
 
   /**
@@ -45,8 +66,8 @@ export class AgorExecutor {
     console.log('[executor] Starting Agor Executor (Feathers mode)');
     const uid = typeof process.getuid === 'function' ? process.getuid() : 'N/A';
     console.log(`[executor] User: ${process.env.USER || 'unknown'} (uid: ${uid})`);
-    console.log(`[executor] Session: ${this.config.sessionId.substring(0, 8)}`);
-    console.log(`[executor] Task: ${this.config.taskId.substring(0, 8)}`);
+    console.log(`[executor] Session: ${shortId(this.config.sessionId)}`);
+    console.log(`[executor] Task: ${shortId(this.config.taskId)}`);
     console.log(`[executor] Tool: ${this.config.tool}`);
     console.log(`[executor] Daemon: ${this.config.daemonUrl}`);
 
@@ -70,70 +91,27 @@ export class AgorExecutor {
       process.exit(0);
     } catch (error) {
       console.error('[executor] Fatal error:', error);
-
-      // Try to update task status to FAILED
-      if (this.client) {
-        try {
-          await this.client.service('tasks').patch(this.config.taskId, {
-            status: 'failed',
-            completed_at: new Date().toISOString(),
-          });
-        } catch (patchError) {
-          console.error('[executor] Failed to update task status:', patchError);
-        }
-      }
-
+      await this.tryMarkTaskTerminal(
+        TaskStatus.FAILED,
+        error instanceof Error ? error.message : String(error)
+      );
       process.exit(1);
     }
   }
 
   /**
    * Setup event listeners for WebSocket events
+   *
+   * Stop signaling is handled via Unix signals (SIGTERM/SIGKILL) from the daemon,
+   * not WebSocket events. The SIGTERM handler in setupShutdownHandlers() calls
+   * abortController.abort() for graceful shutdown.
    */
   private setupEventListeners(): void {
     if (!this.client) return;
 
-    // Listen for task_stop events
-    // biome-ignore lint/suspicious/noExplicitAny: Feathers types don't support custom events
-    (this.client.service('sessions') as any).on(
-      'task_stop',
-      async (data: {
-        session_id: string;
-        task_id: string;
-        sequence: number;
-        timestamp: string;
-      }) => {
-        console.log('[executor] Received task_stop event:', data);
-
-        // Only stop if this signal is for our task (task IDs are globally unique UUIDs)
-        if (data.task_id === this.config.taskId) {
-          // IMMEDIATELY send acknowledgment (before stopping)
-          try {
-            // biome-ignore lint/suspicious/noExplicitAny: Feathers types don't support custom events
-            (this.client!.service('sessions') as any).emit('task_stop_ack', {
-              session_id: data.session_id,
-              task_id: data.task_id,
-              sequence: data.sequence,
-              received_at: new Date().toISOString(),
-              status: 'stopping',
-            });
-            console.log(`✅ [executor] Sent stop ACK (seq ${data.sequence})`);
-          } catch (error) {
-            console.error('❌ [executor] Failed to send stop ACK:', error);
-          }
-
-          // Now initiate the stop
-          console.log('[executor] Stop signal received, aborting execution');
-          this.abortController.abort();
-        }
-      }
-    );
-
     // Listen for permission_resolved events
-    // biome-ignore lint/suspicious/noExplicitAny: Feathers types don't support custom events
-    (this.client.service('messages') as any).on(
-      'permission_resolved',
-      (data: {
+    this.client.service('messages').on('permission_resolved', (data: unknown) => {
+      const event = data as {
         requestId: string;
         taskId: string;
         allow: boolean;
@@ -141,23 +119,22 @@ export class AgorExecutor {
         remember: boolean;
         scope: string;
         decidedBy: string;
-      }) => {
-        console.log('[executor] Received permission_resolved event:', data);
+      };
+      console.log('[executor] Received permission_resolved event:', event);
 
-        if (data.taskId === this.config.taskId) {
-          // Forward to global permission manager
-          globalPermissionManager.resolvePermission({
-            requestId: data.requestId,
-            taskId: data.taskId as TaskID,
-            allow: data.allow,
-            reason: data.reason,
-            remember: data.remember,
-            scope: data.scope as PermissionScope,
-            decidedBy: data.decidedBy,
-          });
-        }
+      if (event.taskId === this.config.taskId) {
+        // Forward to global permission manager
+        globalPermissionManager.resolvePermission({
+          requestId: event.requestId,
+          taskId: event.taskId as TaskID,
+          allow: event.allow,
+          reason: event.reason,
+          remember: event.remember,
+          scope: event.scope as PermissionScope,
+          decidedBy: event.decidedBy,
+        });
       }
-    );
+    });
 
     console.log('[executor] Event listeners registered');
   }
@@ -172,26 +149,39 @@ export class AgorExecutor {
 
     this.isRunning = true;
 
-    console.log(`[executor] Executing task with ${this.config.tool}...`);
-
-    // Import and initialize tool registry
-    const { ToolRegistry, initializeToolRegistry } = await import(
-      './handlers/sdk/tool-registry.js'
-    );
-    await initializeToolRegistry();
-
-    // Execute using registry
-    await ToolRegistry.execute(this.config.tool, {
+    const heartbeatConfig = this.config.resolvedConfig?.execution?.executor_heartbeat;
+    this.heartbeat = startExecutorHeartbeat({
       client: this.client,
-      sessionId: this.config.sessionId as SessionID,
-      taskId: this.config.taskId as TaskID,
-      prompt: this.config.prompt,
-      permissionMode: this.config.permissionMode,
-      abortController: this.abortController,
-      messageSource: this.config.messageSource,
+      taskId: this.config.taskId,
+      enabled: heartbeatConfig?.enabled ?? true,
+      intervalMs: heartbeatConfig?.interval_ms,
     });
 
-    this.isRunning = false;
+    console.log(`[executor] Executing task with ${this.config.tool}...`);
+
+    try {
+      // Import and initialize tool registry
+      const { ToolRegistry, initializeToolRegistry } = await import(
+        './handlers/sdk/tool-registry.js'
+      );
+      await initializeToolRegistry();
+
+      // Execute using registry
+      await ToolRegistry.execute(this.config.tool, {
+        client: this.client,
+        sessionId: this.config.sessionId as SessionID,
+        taskId: this.config.taskId as TaskID,
+        prompt: this.config.prompt,
+        permissionMode: this.config.permissionMode,
+        abortController: this.abortController,
+        messageSource: this.config.messageSource,
+        resolvedConfig: this.config.resolvedConfig,
+      });
+    } finally {
+      this.heartbeat?.stop();
+      this.heartbeat = null;
+      this.isRunning = false;
+    }
   }
 
   /**
@@ -205,18 +195,13 @@ export class AgorExecutor {
       if (this.isRunning) {
         this.abortController.abort();
       }
+      this.heartbeat?.stop();
+      this.heartbeat = null;
 
-      // Update task status to stopped
-      if (this.client) {
-        try {
-          await this.client.service('tasks').patch(this.config.taskId, {
-            status: 'stopped',
-            completed_at: new Date().toISOString(),
-          });
-        } catch (error) {
-          console.error('[executor] Failed to update task status:', error);
-        }
-      }
+      // The daemon's stop route already patches the task to STOPPED before
+      // sending the signal — this fallback only fires if we received an
+      // out-of-band signal and the task is still active.
+      await this.tryMarkTaskTerminal(TaskStatus.STOPPED);
 
       process.exit(0);
     };
@@ -226,37 +211,19 @@ export class AgorExecutor {
 
     process.on('uncaughtException', async (error) => {
       console.error('[executor] Uncaught exception:', error);
-
-      // Try to update task status
-      if (this.client) {
-        try {
-          await this.client.service('tasks').patch(this.config.taskId, {
-            status: 'failed',
-            completed_at: new Date().toISOString(),
-          });
-        } catch (patchError) {
-          console.error('[executor] Failed to update task status:', patchError);
-        }
-      }
-
+      await this.tryMarkTaskTerminal(
+        TaskStatus.FAILED,
+        `uncaughtException: ${error instanceof Error ? error.message : String(error)}`
+      );
       process.exit(1);
     });
 
     process.on('unhandledRejection', async (reason) => {
       console.error('[executor] Unhandled rejection:', reason);
-
-      // Try to update task status
-      if (this.client) {
-        try {
-          await this.client.service('tasks').patch(this.config.taskId, {
-            status: 'failed',
-            completed_at: new Date().toISOString(),
-          });
-        } catch (patchError) {
-          console.error('[executor] Failed to update task status:', patchError);
-        }
-      }
-
+      await this.tryMarkTaskTerminal(
+        TaskStatus.FAILED,
+        `unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`
+      );
       process.exit(1);
     });
   }

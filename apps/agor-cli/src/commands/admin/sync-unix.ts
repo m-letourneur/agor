@@ -6,10 +6,15 @@
  *
  * Default behavior (no flags needed):
  * - Creates missing Unix users for users with unix_username set
- * - Creates missing worktree groups (agor_wt_*) and repo groups (agor_rp_*)
- * - Sets filesystem permissions on worktrees and .git directories
- * - Adds users to their worktree and repo groups
+ * - Creates missing branch groups (agor_wt_*) and repo groups (agor_rp_*)
+ * - Backfills unix_group on branches that don't have one
+ * - Sets filesystem permissions on branches and repo directories (incl. .git)
+ * - Creates missing branch directories for non-archived branches
+ * - Adds users to their branch and repo groups
+ * - Prunes stale group memberships (users no longer owning a branch)
  * - Ensures agor_users group exists and contains all managed users
+ * - Applies daemon user ACLs on branch directories
+ * - Syncs user symlinks (creates missing, removes broken)
  *
  * Cleanup (opt-in, destructive):
  * - --cleanup: Deletes stale users and groups not in database
@@ -18,31 +23,47 @@
  */
 
 import { execSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '@agor/core/config';
 import {
+  branches,
+  branchOwners,
   createDatabase,
   eq,
   inArray,
   repos,
   select,
+  shortId,
   update,
   users,
-  worktreeOwners,
-  worktrees,
 } from '@agor/core/db';
-import type { RepoID, WorktreeID } from '@agor/core/types';
+import { restoreBranchFilesystem } from '@agor/core/git';
 import {
   AGOR_USERS_GROUP,
+  CommandError,
+  createAdminExecutor,
+  generateBranchGroupName,
   generateRepoGroupName,
-  generateWorktreeGroupName,
-  getWorktreePermissionMode,
+  getBranchDirectoryAction,
+  getBranchPermissionMode,
+  getBranchSymlinkPath,
+  getGroupMembers,
+  getUserBranchesDir,
+  getUserGroups,
+  groupExists,
+  isUserInGroup,
+  listAgorUsers,
+  listBranchGroups,
+  listRepoGroups,
   REPO_GIT_PERMISSION_MODE,
+  SymlinkCommands,
   UnixGroupCommands,
   UnixUserCommands,
+  unixUserExists,
 } from '@agor/core/unix';
+import type { BranchID, RepoID } from '@agor-live/client';
 import { Command, Flags } from '@oclif/core';
 import chalk from 'chalk';
 
@@ -53,8 +74,8 @@ interface UserWithUnix {
   unix_username: string;
 }
 
-interface WorktreeOwnership {
-  worktree_id: string;
+interface BranchOwnership {
+  branch_id: string;
   name: string;
   unix_group: string | null;
   repo_id: string;
@@ -82,6 +103,7 @@ export default class SyncUnix extends Command {
     '<%= config.bin %> <%= command.id %> --dry-run      # Preview what would be done',
     '<%= config.bin %> <%= command.id %> --cleanup      # Full sync + remove stale users/groups',
     '<%= config.bin %> <%= command.id %> --verbose      # Show detailed output',
+    '<%= config.bin %> <%= command.id %> --branch-id <uuid> --dry-run  # Preview sync for a single branch',
   ];
 
   static override flags = {
@@ -108,200 +130,12 @@ export default class SyncUnix extends Command {
       description: 'Delete stale agor_* users not in database (keeps home directories)',
       default: false,
     }),
+    'branch-id': Flags.string({
+      char: 'w',
+      description:
+        'Sync a single branch and its parent repo (skips unrelated user/membership/symlink phases)',
+    }),
   };
-
-  /**
-   * Check if a Unix user exists on the system
-   */
-  private userExists(username: string): boolean {
-    try {
-      execSync(UnixUserCommands.userExists(username), { stdio: 'ignore' });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Get groups a Unix user belongs to
-   */
-  private getUserGroups(username: string): string[] {
-    try {
-      const output = execSync(UnixUserCommands.getUserGroups(username), {
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'ignore'],
-      });
-      return output.trim().split(/\s+/).filter(Boolean);
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * Check if a Unix group exists
-   */
-  private groupExists(groupName: string): boolean {
-    try {
-      execSync(UnixGroupCommands.groupExists(groupName), { stdio: 'ignore' });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Check if a Unix user is in a group
-   */
-  private isUserInGroup(username: string, groupName: string): boolean {
-    try {
-      execSync(UnixGroupCommands.isUserInGroup(username, groupName), { stdio: 'ignore' });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Create a Unix user (assumes running as root via sudo)
-   */
-  private createUser(username: string, dryRun: boolean): boolean {
-    const cmd = UnixUserCommands.createUser(username);
-    if (dryRun) {
-      this.log(chalk.gray(`  [dry-run] Would run: ${cmd}`));
-      return true;
-    }
-    try {
-      execSync(cmd, { stdio: 'inherit' });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Add user to a group (assumes running as root via sudo)
-   */
-  private addUserToGroup(username: string, groupName: string, dryRun: boolean): boolean {
-    const cmd = UnixGroupCommands.addUserToGroup(username, groupName);
-    if (dryRun) {
-      this.log(chalk.gray(`  [dry-run] Would run: ${cmd}`));
-      return true;
-    }
-    try {
-      execSync(cmd, { stdio: 'inherit' });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Create a Unix group (assumes running as root via sudo)
-   */
-  private createGroup(groupName: string, dryRun: boolean): boolean {
-    const cmd = UnixGroupCommands.createGroup(groupName);
-    if (dryRun) {
-      this.log(chalk.gray(`  [dry-run] Would run: ${cmd}`));
-      return true;
-    }
-    try {
-      execSync(cmd, { stdio: 'inherit' });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Delete a Unix user (keeps home directory)
-   */
-  private deleteUser(username: string, dryRun: boolean): boolean {
-    const cmd = UnixUserCommands.deleteUser(username);
-    if (dryRun) {
-      this.log(chalk.gray(`  [dry-run] Would run: ${cmd}`));
-      return true;
-    }
-    try {
-      execSync(cmd, { stdio: 'inherit' });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Delete a Unix group
-   */
-  private deleteGroup(groupName: string, dryRun: boolean): boolean {
-    const cmd = UnixGroupCommands.deleteGroup(groupName);
-    if (dryRun) {
-      this.log(chalk.gray(`  [dry-run] Would run: ${cmd}`));
-      return true;
-    }
-    try {
-      execSync(cmd, { stdio: 'inherit' });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * List all agor_* users on the system (auto-generated format: agor_<8-hex>)
-   */
-  private listAgorUsers(): string[] {
-    try {
-      // Get all users from /etc/passwd matching agor_* pattern
-      const output = execSync("getent passwd | grep '^agor_' | cut -d: -f1", {
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'ignore'],
-      });
-      return output
-        .trim()
-        .split('\n')
-        .filter((u) => u && /^agor_[0-9a-f]{8}$/.test(u));
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * List all agor_wt_* groups on the system
-   */
-  private listWorktreeGroups(): string[] {
-    try {
-      // Get all groups from /etc/group matching agor_wt_* pattern
-      const output = execSync("getent group | grep '^agor_wt_' | cut -d: -f1", {
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'ignore'],
-      });
-      return output
-        .trim()
-        .split('\n')
-        .filter((g) => g && /^agor_wt_[0-9a-f]{8}$/.test(g));
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * List all agor_rp_* (repo) groups on the system
-   */
-  private listRepoGroups(): string[] {
-    try {
-      // Get all groups from /etc/group matching agor_rp_* pattern
-      const output = execSync("getent group | grep '^agor_rp_' | cut -d: -f1", {
-        encoding: 'utf-8',
-        stdio: ['pipe', 'pipe', 'ignore'],
-      });
-      return output
-        .trim()
-        .split('\n')
-        .filter((g) => g && /^agor_rp_[0-9a-f]{8}$/.test(g));
-    } catch {
-      return [];
-    }
-  }
 
   async run(): Promise<void> {
     const { flags } = await this.parse(SyncUnix);
@@ -311,19 +145,83 @@ export default class SyncUnix extends Command {
     // Cleanup flags - --cleanup enables both
     const cleanupGroups = flags.cleanup || flags['cleanup-groups'];
     const cleanupUsers = flags.cleanup || flags['cleanup-users'];
+    const targetBranchId = flags['branch-id'];
+
+    if (targetBranchId) {
+      this.log(chalk.cyan(`🎯 Targeting single branch: ${targetBranchId}\n`));
+    }
 
     if (dryRun) {
       this.log(chalk.yellow('🔍 Dry run mode - no changes will be made\n'));
     }
+
+    // Create executor for all privileged operations (handles dry-run + verbose)
+    const executor = createAdminExecutor({ 'dry-run': dryRun, verbose });
+
+    // Helper: print the underlying command failure so callers' generic
+    // "✗ Failed to ..." messages are preceded by actionable details (the
+    // failing command and its stderr). Without this, errors are silently
+    // swallowed and the user has no signal about what went wrong.
+    const logCmdError = (err: unknown, fallbackCmd?: string) => {
+      if (err instanceof CommandError) {
+        const cmd = err.command || fallbackCmd;
+        const stderr = err.result.stderr.trim();
+        if (cmd) this.log(chalk.red(`      ↳ ${cmd}`));
+        if (stderr) {
+          for (const line of stderr.split('\n').slice(0, 10)) {
+            this.log(chalk.red(`        ${line}`));
+          }
+        }
+        this.log(chalk.red(`        (exit ${err.result.exitCode})`));
+      } else {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (fallbackCmd) this.log(chalk.red(`      ↳ ${fallbackCmd}`));
+        this.log(chalk.red(`        ${msg}`));
+      }
+    };
+
+    // Helper: execute a single command, return true on success
+    const execCmd = async (cmd: string): Promise<boolean> => {
+      try {
+        await executor.exec(cmd);
+        return true;
+      } catch (err) {
+        logCmdError(err, cmd);
+        return false;
+      }
+    };
+
+    // Helper: execute multiple commands sequentially, return true on success.
+    // On failure, CommandError carries the specific command that failed along
+    // with its stderr — logCmdError surfaces both.
+    const execAllCmds = async (cmds: string[]): Promise<boolean> => {
+      try {
+        await executor.execAll(cmds);
+        return true;
+      } catch (err) {
+        logCmdError(err);
+        return false;
+      }
+    };
 
     // Track stats
     let groupsCreated = 0;
     let groupsDeleted = 0;
     let usersDeleted = 0;
     let cleanupErrors = 0;
-    let worktreesSynced = 0;
+    let branchesSynced = 0;
+    let branchesBackfilled = 0; // Branches that needed unix_group set in DB
+    let branchDirsCreated = 0; // Branch directories created on disk
+    let branchesRestored = 0; // Branches restored from failed status
+    let groupsCleaned = 0; // Archived+deleted branch groups removed
+    let statusFixed = 0; // Branches with filesystem_status corrected to 'ready'
+    let branchesSkipped = 0; // Branches skipped (archived/deleted, missing path, etc.)
     let reposBackfilled = 0; // Repos that needed unix_group set in DB
-    let reposPermSynced = 0; // Repos that had .git permissions synced
+    let reposPermSynced = 0; // Repos that had root/.git permissions synced
+    let membershipsRemoved = 0; // Stale group memberships pruned
+    let daemonAclsApplied = 0; // Daemon user ACLs applied
+    let symlinksCreated = 0; // User symlinks created
+    let symlinksCleaned = 0; // Broken symlinks removed
     let syncErrors = 0;
 
     try {
@@ -400,7 +298,7 @@ export default class SyncUnix extends Command {
       if (verbose) {
         this.log(
           chalk.gray(
-            `   (from config.daemon.unix_user, will be added to all repo and worktree groups)\n`
+            `   (from config.daemon.unix_user, will be added to all repo and branch groups)\n`
           )
         );
       }
@@ -408,11 +306,31 @@ export default class SyncUnix extends Command {
       // Track daemon memberships added
       let daemonMembershipsAdded = 0;
 
+      // Resolve the parent repo when scoping to a single branch.
+      // --branch-id is expected to sync *everything* the branch depends on,
+      // including the parent repo's group/permissions — otherwise a migrated
+      // box with a broken repo root leaves the targeted branch unusable.
+      let targetRepoId: RepoID | undefined;
+      if (targetBranchId) {
+        const targetWts = await select(db)
+          .from(branches)
+          .where(eq(branches.branch_id, targetBranchId))
+          .all();
+        if (targetWts.length === 0) {
+          this.log(chalk.red(`✗ Branch ${targetBranchId} not found in database\n`));
+          process.exit(1);
+        }
+        targetRepoId = (targetWts[0] as { repo_id: string }).repo_id as RepoID;
+        this.log(
+          chalk.cyan(`   Parent repo: ${shortId(targetRepoId)} (also scoped to this repo)\n`)
+        );
+      }
+
       // Ensure agor_users group exists (global group for all managed users)
       this.log(chalk.cyan(`Checking ${AGOR_USERS_GROUP} group...\n`));
-      if (!this.groupExists(AGOR_USERS_GROUP)) {
+      if (!groupExists(AGOR_USERS_GROUP)) {
         this.log(chalk.yellow(`   → Creating ${AGOR_USERS_GROUP} group...`));
-        if (this.createGroup(AGOR_USERS_GROUP, dryRun)) {
+        if (await execCmd(UnixGroupCommands.createGroup(AGOR_USERS_GROUP))) {
           groupsCreated++;
           this.log(chalk.green(`   ✓ Created ${AGOR_USERS_GROUP} group\n`));
         } else {
@@ -428,7 +346,179 @@ export default class SyncUnix extends Command {
 
       const results: SyncResult[] = [];
 
-      if (validUsers.length === 0) {
+      // ========================================
+      // Sync Repos Phase (deterministic)
+      //
+      // For every repo in scope, brings the system into the canonical state:
+      //   1. Unix group exists on the system (creates if missing — covers
+      //      both fresh repos and migrations where the DB has a group name
+      //      but /etc/group was not carried over).
+      //   2. Daemon user is a member of the group.
+      //   3. unix_group is backfilled in the DB if NULL.
+      //   4. Group ownership + ACLs + setgid applied to repo root
+      //      (non-recursive, for traversal) and recursively to `.git`
+      //      (shared git objects/refs + branch metadata).
+      //
+      // Idempotent: steps 1–3 only run when state drift is detected; step 4
+      // always runs because ACL/perm drift is cheap to fix and hard to detect.
+      //
+      // Runs BEFORE user/branch phases because they depend on repo groups
+      // being in place. In --branch-id mode, scoped to the parent repo only.
+      // ========================================
+      {
+        const reposInScope = targetRepoId
+          ? await select(db).from(repos).where(eq(repos.repo_id, targetRepoId)).all()
+          : await select(db).from(repos).all();
+
+        this.log(chalk.cyan.bold('\n━━━ Sync Repos ━━━\n'));
+
+        if (reposInScope.length === 0) {
+          this.log(chalk.yellow('   No repos in scope\n'));
+        } else {
+          this.log(chalk.cyan(`Processing ${reposInScope.length} repo(s)\n`));
+        }
+
+        for (const repo of reposInScope) {
+          const rawRepo = repo as {
+            repo_id: string;
+            slug: string;
+            unix_group: string | null;
+            data: { local_path?: string } | null;
+          };
+
+          const expectedGroup =
+            rawRepo.unix_group || generateRepoGroupName(rawRepo.repo_id as RepoID);
+          const dbNeedsBackfill = rawRepo.unix_group === null;
+          const groupMissingOnSystem = !groupExists(expectedGroup);
+          const repoPath = rawRepo.data?.local_path;
+          const pathUsable = repoPath ? existsSync(repoPath) : false;
+
+          this.log(chalk.bold(`📁 ${rawRepo.slug}`));
+          this.log(chalk.gray(`   repo_id: ${shortId(rawRepo.repo_id)}`));
+          this.log(
+            chalk.gray(`   unix_group: ${expectedGroup}${dbNeedsBackfill ? ' (to backfill)' : ''}`)
+          );
+          if (repoPath) {
+            this.log(chalk.gray(`   repo path: ${repoPath}${pathUsable ? '' : ' (missing)'}`));
+          } else {
+            this.log(chalk.gray(`   repo path: <none in data.local_path>`));
+          }
+
+          let hadError = false;
+
+          // 1. Ensure Unix group exists on the system
+          if (groupMissingOnSystem) {
+            this.log(chalk.yellow(`   → Creating Unix group ${expectedGroup}...`));
+            if (await execCmd(UnixGroupCommands.createGroup(expectedGroup))) {
+              groupsCreated++;
+              this.log(chalk.green(`   ✓ Created Unix group ${expectedGroup}`));
+            } else {
+              syncErrors++;
+              hadError = true;
+              this.log(chalk.red(`   ✗ Failed to create Unix group ${expectedGroup}`));
+            }
+          } else if (verbose) {
+            this.log(chalk.gray(`   ✓ Unix group exists`));
+          }
+
+          // 2. Ensure daemon user is in the group
+          if (!hadError && daemonUser) {
+            const daemonInGroup = dryRun ? false : isUserInGroup(daemonUser, expectedGroup);
+            if (!daemonInGroup) {
+              this.log(
+                chalk.yellow(`   → Adding daemon user ${daemonUser} to ${expectedGroup}...`)
+              );
+              if (await execCmd(UnixGroupCommands.addUserToGroup(daemonUser, expectedGroup))) {
+                daemonMembershipsAdded++;
+                this.log(chalk.green(`   ✓ Added daemon user to ${expectedGroup}`));
+              } else {
+                syncErrors++;
+                this.log(chalk.red(`   ✗ Failed to add daemon user to ${expectedGroup}`));
+              }
+            } else if (verbose) {
+              this.log(chalk.gray(`   ✓ Daemon user already in ${expectedGroup}`));
+            }
+          }
+
+          // 3. Backfill DB if unix_group was NULL
+          if (!hadError && dbNeedsBackfill) {
+            if (dryRun) {
+              this.log(
+                chalk.gray(
+                  `   [dry-run] Would update database: SET unix_group = '${expectedGroup}' WHERE repo_id = '${rawRepo.repo_id}'`
+                )
+              );
+              reposBackfilled++;
+            } else {
+              try {
+                await update(db, repos)
+                  .set({ unix_group: expectedGroup })
+                  .where(eq(repos.repo_id, rawRepo.repo_id))
+                  .run();
+                reposBackfilled++;
+                this.log(chalk.green(`   ✓ Backfilled unix_group in database`));
+              } catch (error) {
+                syncErrors++;
+                hadError = true;
+                this.log(chalk.red(`   ✗ Failed to update database: ${error}`));
+              }
+            }
+          }
+
+          // 4. Apply permissions (idempotent; always run unless error)
+          if (!hadError) {
+            if (!repoPath) {
+              this.log(chalk.yellow(`   ⚠ No local_path in repo data, skipping permissions`));
+            } else if (!pathUsable) {
+              if (verbose) {
+                this.log(chalk.gray(`   ⊘ Repo path missing on disk, skipping permissions`));
+              }
+            } else {
+              const gitPath = `${repoPath}/.git`;
+              const rootCmds = UnixGroupCommands.setDirectoryGroupShallow(
+                repoPath,
+                expectedGroup,
+                REPO_GIT_PERMISSION_MODE
+              );
+              const cmds = existsSync(gitPath)
+                ? [
+                    ...rootCmds,
+                    ...UnixGroupCommands.setDirectoryGroup(
+                      gitPath,
+                      expectedGroup,
+                      REPO_GIT_PERMISSION_MODE
+                    ),
+                  ]
+                : rootCmds;
+              if (await execAllCmds(cmds)) {
+                reposPermSynced++;
+                this.log(
+                  chalk.green(`   ✓ Applied repo permissions (${REPO_GIT_PERMISSION_MODE})`)
+                );
+                if (!existsSync(gitPath) && verbose) {
+                  this.log(chalk.gray(`   ⊘ .git path missing on disk, root traversal only`));
+                }
+              } else {
+                syncErrors++;
+                this.log(chalk.red(`   ✗ Failed to set repo permissions`));
+              }
+            }
+          }
+
+          this.log('');
+        }
+
+        if (reposInScope.length > 0) {
+          this.log(chalk.bold('Sync Repos Summary:'));
+          this.log(`  DB backfilled:     ${reposBackfilled}${dryRun ? ' (dry-run)' : ''}`);
+          this.log(`  Permissions synced:${reposPermSynced}${dryRun ? ' (dry-run)' : ''}`);
+          this.log('');
+        }
+      }
+
+      if (targetBranchId) {
+        this.log(chalk.gray('   ⊘ Skipping user sync phase (--branch-id mode)\n'));
+      } else if (validUsers.length === 0) {
         this.log(chalk.yellow('No users with unix_username found in database'));
         this.log(chalk.gray('\nTo set a unix_username for a user:'));
         this.log(chalk.gray('  agor user update <email> --unix-username <username>\n'));
@@ -436,187 +526,44 @@ export default class SyncUnix extends Command {
       } else {
         this.log(chalk.cyan(`Found ${validUsers.length} user(s) with unix_username\n`));
 
-        // Prefetch all worktree ownerships in a single query to avoid N+1
+        // Prefetch all branch ownerships in a single query to avoid N+1
         const userIds = validUsers.map((u) => u.user_id);
         // biome-ignore lint/suspicious/noExplicitAny: Join query requires type assertion
         const allOwnerships = await (db as any)
           .select()
-          .from(worktreeOwners)
-          .innerJoin(worktrees, eq(worktreeOwners.worktree_id, worktrees.worktree_id))
-          .where(inArray(worktreeOwners.user_id, userIds));
+          .from(branchOwners)
+          .innerJoin(branches, eq(branchOwners.branch_id, branches.branch_id))
+          .where(inArray(branchOwners.user_id, userIds));
 
         // Group ownerships by user_id for O(1) lookup
-        const ownershipsByUser = new Map<string, WorktreeOwnership[]>();
+        const ownershipsByUser = new Map<string, BranchOwnership[]>();
         for (const row of allOwnerships) {
           const userId = (
             row as {
-              worktree_owners: { user_id: string };
-              worktrees: {
-                worktree_id: string;
+              branch_owners: { user_id: string };
+              branches: {
+                branch_id: string;
                 name: string;
                 unix_group: string | null;
                 repo_id: string;
               };
             }
-          ).worktree_owners.user_id;
-          const ownership: WorktreeOwnership = {
-            worktree_id: (row as { worktrees: { worktree_id: string } }).worktrees.worktree_id,
-            name: (row as { worktrees: { name: string } }).worktrees.name,
-            unix_group: (row as { worktrees: { unix_group: string | null } }).worktrees.unix_group,
-            repo_id: (row as { worktrees: { repo_id: string } }).worktrees.repo_id,
+          ).branch_owners.user_id;
+          const ownership: BranchOwnership = {
+            branch_id: (row as { branches: { branch_id: string } }).branches.branch_id,
+            name: (row as { branches: { name: string } }).branches.name,
+            unix_group: (row as { branches: { unix_group: string | null } }).branches.unix_group,
+            repo_id: (row as { branches: { repo_id: string } }).branches.repo_id,
           };
           const existing = ownershipsByUser.get(userId) || [];
           existing.push(ownership);
           ownershipsByUser.set(userId, existing);
         }
 
-        // ========================================
-        // Sync Repos Phase
-        // Ensures all repos have unix_group set in the database
-        // and creates the corresponding Unix group if needed.
-        // This runs BEFORE the per-user loop so that the repoGroupMap
-        // will have the correct unix_group values when processing users.
-        // ========================================
-
-        // Get all repos first
-        let allRepos = await select(db).from(repos).all();
-
-        this.log(chalk.cyan.bold('\n━━━ Sync Repos ━━━\n'));
-
-        const reposWithoutGroup = allRepos.filter(
-          (r: { unix_group: string | null }) => r.unix_group === null
-        );
-
-        if (reposWithoutGroup.length === 0) {
-          this.log(chalk.green('   ✓ All repos have unix_group set\n'));
-        } else {
-          this.log(
-            chalk.cyan(
-              `Found ${reposWithoutGroup.length} repo(s) without unix_group (of ${allRepos.length} total)\n`
-            )
-          );
-
-          for (const repo of reposWithoutGroup) {
-            const rawRepo = repo as {
-              repo_id: string;
-              slug: string;
-              data: { local_path?: string } | null;
-            };
-
-            const repoGroup = generateRepoGroupName(rawRepo.repo_id as RepoID);
-
-            this.log(chalk.bold(`📁 ${rawRepo.slug}`));
-            this.log(chalk.gray(`   repo_id: ${rawRepo.repo_id.substring(0, 8)}`));
-            this.log(chalk.gray(`   generated group: ${repoGroup}`));
-
-            // Create the Unix group if it doesn't exist
-            const groupExistsOnSystem = this.groupExists(repoGroup);
-
-            if (groupExistsOnSystem) {
-              this.log(chalk.green(`   ✓ Unix group already exists`));
-            } else {
-              this.log(chalk.yellow(`   → Creating Unix group ${repoGroup}...`));
-              if (this.createGroup(repoGroup, dryRun)) {
-                groupsCreated++;
-                this.log(chalk.green(`   ✓ Created Unix group ${repoGroup}`));
-              } else {
-                syncErrors++;
-                this.log(chalk.red(`   ✗ Failed to create Unix group ${repoGroup}`));
-                this.log('');
-                continue; // Skip DB update if group creation failed
-              }
-            }
-
-            // Add daemon user to repo group
-            if (daemonUser) {
-              const daemonInGroup = dryRun ? false : this.isUserInGroup(daemonUser, repoGroup);
-              if (!daemonInGroup) {
-                this.log(chalk.yellow(`   → Adding daemon user ${daemonUser} to ${repoGroup}...`));
-                if (this.addUserToGroup(daemonUser, repoGroup, dryRun)) {
-                  daemonMembershipsAdded++;
-                  this.log(chalk.green(`   ✓ Added daemon user to ${repoGroup}`));
-                } else {
-                  this.log(chalk.red(`   ✗ Failed to add daemon user to ${repoGroup}`));
-                }
-              } else if (verbose) {
-                this.log(chalk.gray(`   ✓ Daemon user already in ${repoGroup}`));
-              }
-            }
-
-            // Update the database to set unix_group
-            if (dryRun) {
-              this.log(
-                chalk.gray(
-                  `   [dry-run] Would update database: SET unix_group = '${repoGroup}' WHERE repo_id = '${rawRepo.repo_id}'`
-                )
-              );
-            } else {
-              try {
-                await update(db, repos)
-                  .set({ unix_group: repoGroup })
-                  .where(eq(repos.repo_id, rawRepo.repo_id))
-                  .run();
-                this.log(chalk.green(`   ✓ Updated database with unix_group`));
-              } catch (error) {
-                syncErrors++;
-                this.log(chalk.red(`   ✗ Failed to update database: ${error}`));
-                this.log('');
-                continue;
-              }
-            }
-
-            // Set .git permissions if the repo has a local_path
-            const repoPath = rawRepo.data?.local_path;
-            if (repoPath) {
-              const gitPath = `${repoPath}/.git`;
-              this.log(chalk.gray(`   .git path: ${gitPath}`));
-
-              if (dryRun) {
-                this.log(chalk.gray(`   [dry-run] Would run: chgrp -R ${repoGroup} "${gitPath}"`));
-                this.log(
-                  chalk.gray(
-                    `   [dry-run] Would run: chmod -R ${REPO_GIT_PERMISSION_MODE} "${gitPath}"`
-                  )
-                );
-              } else {
-                try {
-                  for (const cmd of UnixGroupCommands.setDirectoryGroup(
-                    gitPath,
-                    repoGroup,
-                    REPO_GIT_PERMISSION_MODE
-                  )) {
-                    execSync(cmd, { stdio: 'pipe' });
-                  }
-                  this.log(
-                    chalk.green(`   ✓ Applied .git permissions (${REPO_GIT_PERMISSION_MODE})`)
-                  );
-                } catch (error) {
-                  syncErrors++;
-                  this.log(chalk.red(`   ✗ Failed to set .git permissions: ${error}`));
-                }
-              }
-            } else {
-              this.log(chalk.yellow(`   ⚠ No local_path found, skipping .git permissions`));
-            }
-
-            reposBackfilled++;
-            this.log('');
-          }
-
-          // Summary for repo backfill
-          this.log(chalk.bold('Repo Backfill Summary:'));
-          this.log(`  Repos backfilled: ${reposBackfilled}${dryRun ? ' (dry-run)' : ''}`);
-          if (syncErrors > 0) {
-            this.log(chalk.red(`  Errors: ${syncErrors}`));
-          }
-          this.log('');
-
-          // Refresh allRepos after updates so the repoGroupMap will have correct values
-          allRepos = await select(db).from(repos).all();
-        }
-
-        // Build a map of repo_id -> unix_group for quick lookup
-        // This happens AFTER the sync repos phase so newly created groups are included
+        // Build a map of repo_id -> unix_group for quick lookup in the
+        // per-user loop. The Sync Repos phase above already ensured every
+        // repo has a unix_group assigned (when it needed one).
+        const allRepos = await select(db).from(repos).all();
         const repoGroupMap = new Map<string, string | null>();
         for (const repo of allRepos) {
           const r = repo as { repo_id: string; unix_group: string | null };
@@ -639,10 +586,10 @@ export default class SyncUnix extends Command {
 
           this.log(chalk.bold(`📋 ${user.email}`));
           this.log(chalk.gray(`   unix_username: ${user.unix_username}`));
-          this.log(chalk.gray(`   user_id: ${user.user_id.substring(0, 8)}`));
+          this.log(chalk.gray(`   user_id: ${shortId(user.user_id)}`));
 
           // Check if Unix user exists
-          result.unixUserExists = this.userExists(user.unix_username);
+          result.unixUserExists = unixUserExists(user.unix_username);
 
           if (result.unixUserExists) {
             this.log(chalk.green(`   ✓ Unix user exists`));
@@ -650,7 +597,7 @@ export default class SyncUnix extends Command {
             this.log(chalk.red(`   ✗ Unix user does not exist`));
 
             this.log(chalk.yellow(`   → Creating Unix user...`));
-            if (this.createUser(user.unix_username, dryRun)) {
+            if (await execCmd(UnixUserCommands.createUser(user.unix_username))) {
               result.unixUserCreated = true;
               result.unixUserExists = true;
               this.log(chalk.green(`   ✓ Unix user created`));
@@ -662,9 +609,7 @@ export default class SyncUnix extends Command {
 
           // Get current groups (only if user exists)
           if (result.unixUserExists || dryRun) {
-            result.groups.actual = result.unixUserExists
-              ? this.getUserGroups(user.unix_username)
-              : [];
+            result.groups.actual = result.unixUserExists ? getUserGroups(user.unix_username) : [];
 
             if (verbose && result.groups.actual.length > 0) {
               this.log(chalk.gray(`   Current groups: ${result.groups.actual.join(', ')}`));
@@ -673,7 +618,11 @@ export default class SyncUnix extends Command {
             // Ensure user is in agor_users group
             if (!result.groups.actual.includes(AGOR_USERS_GROUP)) {
               this.log(chalk.yellow(`   → Adding to ${AGOR_USERS_GROUP}...`));
-              if (this.addUserToGroup(user.unix_username, AGOR_USERS_GROUP, dryRun)) {
+              if (
+                await execCmd(
+                  UnixGroupCommands.addUserToGroup(user.unix_username, AGOR_USERS_GROUP)
+                )
+              ) {
                 result.groups.added.push(AGOR_USERS_GROUP);
                 this.log(chalk.green(`   ✓ Added to ${AGOR_USERS_GROUP}`));
               } else {
@@ -682,27 +631,27 @@ export default class SyncUnix extends Command {
               }
             }
 
-            // Get worktrees owned by this user (from prefetched data)
-            const ownedWorktrees: WorktreeOwnership[] = ownershipsByUser.get(user.user_id) || [];
+            // Get branches owned by this user (from prefetched data)
+            const ownedBranches: BranchOwnership[] = ownershipsByUser.get(user.user_id) || [];
 
             if (verbose) {
-              this.log(chalk.gray(`   Owns ${ownedWorktrees.length} worktree(s)`));
+              this.log(chalk.gray(`   Owns ${ownedBranches.length} branch(s)`));
             }
 
-            // Build expected groups from owned worktrees
-            for (const wt of ownedWorktrees) {
-              // Use existing unix_group or generate from worktree_id
+            // Build expected groups from owned branches
+            for (const wt of ownedBranches) {
+              // Use existing unix_group or generate from branch_id
               const expectedGroup =
-                wt.unix_group || generateWorktreeGroupName(wt.worktree_id as WorktreeID);
+                wt.unix_group || generateBranchGroupName(wt.branch_id as BranchID);
               result.groups.expected.push(expectedGroup);
 
               const isInGroup = result.groups.actual.includes(expectedGroup);
-              const groupExistsOnSystem = this.groupExists(expectedGroup);
+              const groupExistsOnSystem = groupExists(expectedGroup);
 
               if (verbose) {
                 this.log(
                   chalk.gray(
-                    `   Worktree "${wt.name}" → group ${expectedGroup} ` +
+                    `   Branch "${wt.name}" → group ${expectedGroup} ` +
                       `(exists: ${groupExistsOnSystem ? 'yes' : 'no'}, member: ${isInGroup ? 'yes' : 'no'})`
                   )
                 );
@@ -713,7 +662,7 @@ export default class SyncUnix extends Command {
               // Create group if it doesn't exist
               if (!groupExistsOnSystem) {
                 this.log(chalk.yellow(`   → Creating group ${expectedGroup}...`));
-                if (this.createGroup(expectedGroup, dryRun)) {
+                if (await execCmd(UnixGroupCommands.createGroup(expectedGroup))) {
                   groupsCreated++;
                   groupReady = true;
                   this.log(chalk.green(`   ✓ Created group ${expectedGroup}`));
@@ -726,7 +675,9 @@ export default class SyncUnix extends Command {
               // Add user to group if it exists/was created and user is not already in it
               if (groupReady && !isInGroup) {
                 this.log(chalk.yellow(`   → Adding to group ${expectedGroup}...`));
-                if (this.addUserToGroup(user.unix_username, expectedGroup, dryRun)) {
+                if (
+                  await execCmd(UnixGroupCommands.addUserToGroup(user.unix_username, expectedGroup))
+                ) {
                   result.groups.added.push(expectedGroup);
                   this.log(chalk.green(`   ✓ Added to ${expectedGroup}`));
                 } else {
@@ -735,16 +686,14 @@ export default class SyncUnix extends Command {
                 }
               }
 
-              // Add daemon user to worktree group
+              // Add daemon user to branch group
               if (groupReady && daemonUser) {
-                const daemonInWtGroup = dryRun
-                  ? false
-                  : this.isUserInGroup(daemonUser, expectedGroup);
+                const daemonInWtGroup = dryRun ? false : isUserInGroup(daemonUser, expectedGroup);
                 if (!daemonInWtGroup) {
                   this.log(
                     chalk.yellow(`   → Adding daemon user ${daemonUser} to ${expectedGroup}...`)
                   );
-                  if (this.addUserToGroup(daemonUser, expectedGroup, dryRun)) {
+                  if (await execCmd(UnixGroupCommands.addUserToGroup(daemonUser, expectedGroup))) {
                     daemonMembershipsAdded++;
                     this.log(chalk.green(`   ✓ Added daemon user to ${expectedGroup}`));
                   } else {
@@ -756,9 +705,9 @@ export default class SyncUnix extends Command {
               }
             }
 
-            // Sync repo groups - user should be in repo group for each unique repo they own worktrees in
+            // Sync repo groups - user should be in repo group for each unique repo they own branches in
             const repoIdsSeen = new Set<string>();
-            for (const wt of ownedWorktrees) {
+            for (const wt of ownedBranches) {
               if (repoIdsSeen.has(wt.repo_id)) continue;
               repoIdsSeen.add(wt.repo_id);
 
@@ -768,12 +717,12 @@ export default class SyncUnix extends Command {
               result.groups.expected.push(repoGroup);
 
               const isInRepoGroup = result.groups.actual.includes(repoGroup);
-              const repoGroupExistsOnSystem = this.groupExists(repoGroup);
+              const repoGroupExistsOnSystem = groupExists(repoGroup);
 
               if (verbose) {
                 this.log(
                   chalk.gray(
-                    `   Repo ${wt.repo_id.substring(0, 8)} → group ${repoGroup} ` +
+                    `   Repo ${shortId(wt.repo_id)} → group ${repoGroup} ` +
                       `(exists: ${repoGroupExistsOnSystem ? 'yes' : 'no'}, member: ${isInRepoGroup ? 'yes' : 'no'})`
                   )
                 );
@@ -784,7 +733,7 @@ export default class SyncUnix extends Command {
               // Create repo group if it doesn't exist
               if (!repoGroupExistsOnSystem) {
                 this.log(chalk.yellow(`   → Creating repo group ${repoGroup}...`));
-                if (this.createGroup(repoGroup, dryRun)) {
+                if (await execCmd(UnixGroupCommands.createGroup(repoGroup))) {
                   groupsCreated++;
                   repoGroupReady = true;
                   this.log(chalk.green(`   ✓ Created repo group ${repoGroup}`));
@@ -797,7 +746,9 @@ export default class SyncUnix extends Command {
               // Add user to repo group if it exists/was created and user is not already in it
               if (repoGroupReady && !isInRepoGroup) {
                 this.log(chalk.yellow(`   → Adding to repo group ${repoGroup}...`));
-                if (this.addUserToGroup(user.unix_username, repoGroup, dryRun)) {
+                if (
+                  await execCmd(UnixGroupCommands.addUserToGroup(user.unix_username, repoGroup))
+                ) {
                   result.groups.added.push(repoGroup);
                   this.log(chalk.green(`   ✓ Added to ${repoGroup}`));
                 } else {
@@ -808,12 +759,12 @@ export default class SyncUnix extends Command {
 
               // Add daemon user to repo group
               if (repoGroupReady && daemonUser) {
-                const daemonInRpGroup = dryRun ? false : this.isUserInGroup(daemonUser, repoGroup);
+                const daemonInRpGroup = dryRun ? false : isUserInGroup(daemonUser, repoGroup);
                 if (!daemonInRpGroup) {
                   this.log(
                     chalk.yellow(`   → Adding daemon user ${daemonUser} to ${repoGroup}...`)
                   );
-                  if (this.addUserToGroup(daemonUser, repoGroup, dryRun)) {
+                  if (await execCmd(UnixGroupCommands.addUserToGroup(daemonUser, repoGroup))) {
                     daemonMembershipsAdded++;
                     this.log(chalk.green(`   ✓ Added daemon user to ${repoGroup}`));
                   } else {
@@ -829,90 +780,471 @@ export default class SyncUnix extends Command {
           results.push(result);
           this.log('');
         }
-      } // end if (validUsers.length > 0)
+      } // end if (targetBranchId / validUsers.length)
 
       // ========================================
-      // Worktree Permission Sync Phase
+      // Sync Branch Groups Phase (deterministic)
+      //
+      // For every non-archived-deleted branch in scope, brings group
+      // state to canonical:
+      //   1. Unix group exists on the system (creates if missing — covers
+      //      fresh branches and DB-migration cruft).
+      //   2. Daemon user is a member of the group.
+      //   3. unix_group is backfilled in the DB if NULL.
+      //
+      // Archived+deleted branches are left alone here; the Sync Branch
+      // Permissions phase below handles their group cleanup.
       // ========================================
 
-      this.log(chalk.cyan.bold('\n━━━ Sync Worktree Permissions ━━━\n'));
+      this.log(chalk.cyan.bold('\n━━━ Sync Branch Groups ━━━\n'));
 
-      // Get all worktrees with unix_group set
-      const allWorktreesForSync = await select(db).from(worktrees).all();
-      const worktreesWithGroup = allWorktreesForSync.filter(
-        (wt: { unix_group: string | null }) => wt.unix_group !== null
+      // Existence of the target branch was already verified earlier
+      // when resolving targetRepoId, so we can safely scope the fetch here.
+      const allBranchesForBackfill = targetBranchId
+        ? await select(db).from(branches).where(eq(branches.branch_id, targetBranchId)).all()
+        : await select(db).from(branches).all();
+
+      const branchesForGroupSync = allBranchesForBackfill.filter(
+        (wt: { archived: boolean; filesystem_status: string | null }) =>
+          !(wt.archived && wt.filesystem_status === 'deleted')
       );
 
-      if (worktreesWithGroup.length === 0) {
-        this.log(chalk.yellow('No worktrees with unix_group found\n'));
+      if (branchesForGroupSync.length === 0) {
+        this.log(chalk.yellow('   No active branches in scope\n'));
       } else {
-        this.log(chalk.cyan(`Found ${worktreesWithGroup.length} worktree(s) with unix_group\n`));
+        this.log(chalk.cyan(`Processing ${branchesForGroupSync.length} branch(s)\n`));
 
-        for (const wt of worktreesWithGroup) {
-          // Extract path from the data JSON blob (it's not a top-level column)
-          const rawWorktree = wt as {
-            worktree_id: string;
+        for (const wt of branchesForGroupSync) {
+          const rawWt = wt as {
+            branch_id: string;
             name: string;
-            unix_group: string;
-            others_fs_access: 'none' | 'read' | 'write' | null;
+            repo_id: string;
+            unix_group: string | null;
             data: { path?: string } | null;
           };
 
-          const worktreePath = rawWorktree.data?.path;
+          const expectedGroup =
+            rawWt.unix_group || generateBranchGroupName(rawWt.branch_id as BranchID);
+          const dbNeedsBackfill = rawWt.unix_group === null;
+          const groupMissingOnSystem = !groupExists(expectedGroup);
 
-          // Skip worktrees without a path
-          if (!worktreePath) {
-            this.log(chalk.yellow(`📁 ${rawWorktree.name}`));
-            this.log(chalk.gray(`   worktree_id: ${rawWorktree.worktree_id.substring(0, 8)}`));
-            this.log(chalk.gray(`   unix_group: ${rawWorktree.unix_group}`));
-            this.log(chalk.red(`   ⚠ No path found in worktree data, skipping\n`));
+          // Skip logging for branches already in canonical state (quiet mode)
+          if (!dbNeedsBackfill && !groupMissingOnSystem && !verbose) {
+            // Still need to ensure daemon membership, which is cheap to check
+            if (daemonUser && !isUserInGroup(daemonUser, expectedGroup)) {
+              this.log(chalk.bold(`📁 ${rawWt.name}`));
+              this.log(
+                chalk.yellow(`   → Adding daemon user ${daemonUser} to ${expectedGroup}...`)
+              );
+              if (await execCmd(UnixGroupCommands.addUserToGroup(daemonUser, expectedGroup))) {
+                daemonMembershipsAdded++;
+                this.log(chalk.green(`   ✓ Added daemon user to ${expectedGroup}\n`));
+              } else {
+                syncErrors++;
+                this.log(chalk.red(`   ✗ Failed to add daemon user to ${expectedGroup}\n`));
+              }
+            }
             continue;
           }
 
-          this.log(chalk.bold(`📁 ${rawWorktree.name}`));
-          this.log(chalk.gray(`   worktree_id: ${rawWorktree.worktree_id.substring(0, 8)}`));
-          this.log(chalk.gray(`   unix_group: ${rawWorktree.unix_group}`));
-          this.log(chalk.gray(`   path: ${worktreePath}`));
+          this.log(chalk.bold(`📁 ${rawWt.name}`));
+          this.log(chalk.gray(`   branch_id: ${shortId(rawWt.branch_id)}`));
+          this.log(
+            chalk.gray(`   unix_group: ${expectedGroup}${dbNeedsBackfill ? ' (to backfill)' : ''}`)
+          );
+
+          let hadError = false;
+
+          // 1. Ensure Unix group exists on the system
+          if (groupMissingOnSystem) {
+            this.log(chalk.yellow(`   → Creating Unix group ${expectedGroup}...`));
+            if (await execCmd(UnixGroupCommands.createGroup(expectedGroup))) {
+              groupsCreated++;
+              this.log(chalk.green(`   ✓ Created Unix group ${expectedGroup}`));
+            } else {
+              syncErrors++;
+              hadError = true;
+              this.log(chalk.red(`   ✗ Failed to create Unix group ${expectedGroup}`));
+            }
+          } else if (verbose) {
+            this.log(chalk.gray(`   ✓ Unix group exists`));
+          }
+
+          // 2. Ensure daemon user is in the group
+          if (!hadError && daemonUser) {
+            const daemonInGroup = dryRun ? false : isUserInGroup(daemonUser, expectedGroup);
+            if (!daemonInGroup) {
+              this.log(
+                chalk.yellow(`   → Adding daemon user ${daemonUser} to ${expectedGroup}...`)
+              );
+              if (await execCmd(UnixGroupCommands.addUserToGroup(daemonUser, expectedGroup))) {
+                daemonMembershipsAdded++;
+                this.log(chalk.green(`   ✓ Added daemon user to ${expectedGroup}`));
+              } else {
+                syncErrors++;
+                this.log(chalk.red(`   ✗ Failed to add daemon user to ${expectedGroup}`));
+              }
+            } else if (verbose) {
+              this.log(chalk.gray(`   ✓ Daemon user already in ${expectedGroup}`));
+            }
+          }
+
+          // 3. Backfill DB if unix_group was NULL
+          if (!hadError && dbNeedsBackfill) {
+            if (dryRun) {
+              this.log(
+                chalk.gray(
+                  `   [dry-run] Would update database: SET unix_group = '${expectedGroup}' WHERE branch_id = '${rawWt.branch_id}'`
+                )
+              );
+              branchesBackfilled++;
+            } else {
+              try {
+                await update(db, branches)
+                  .set({ unix_group: expectedGroup })
+                  .where(eq(branches.branch_id, rawWt.branch_id))
+                  .run();
+                branchesBackfilled++;
+                this.log(chalk.green(`   ✓ Backfilled unix_group in database`));
+              } catch (error) {
+                syncErrors++;
+                this.log(chalk.red(`   ✗ Failed to update database: ${error}`));
+              }
+            }
+          }
+
+          this.log('');
+        }
+
+        if (branchesBackfilled > 0 || groupsCreated > 0 || daemonMembershipsAdded > 0) {
+          this.log(chalk.bold('Sync Branch Groups Summary:'));
+          this.log(`  DB backfilled: ${branchesBackfilled}${dryRun ? ' (dry-run)' : ''}`);
+          this.log('');
+        }
+      }
+
+      // ========================================
+      // Branch Permission Sync Phase
+      // Archive-aware: handles missing directories, skips archived+deleted
+      // ========================================
+
+      this.log(chalk.cyan.bold('\n━━━ Sync Branch Permissions ━━━\n'));
+
+      // Refresh from DB to pick up unix_group values backfilled in the phase above.
+      const allBranchesForSync = targetBranchId
+        ? await select(db).from(branches).where(eq(branches.branch_id, targetBranchId)).all()
+        : await select(db).from(branches).all();
+      const branchesWithGroup = allBranchesForSync.filter(
+        (wt: { unix_group: string | null }) => wt.unix_group !== null
+      );
+
+      // Build repo path lookup map for git branch operations
+      const allReposForWtSync = await select(db).from(repos).all();
+      const repoPathMap = new Map<string, { localPath: string; defaultBranch: string }>();
+      for (const repo of allReposForWtSync) {
+        const r = repo as {
+          repo_id: string;
+          data: { local_path?: string; default_branch?: string } | null;
+        };
+        if (r.data?.local_path) {
+          repoPathMap.set(r.repo_id, {
+            localPath: r.data.local_path,
+            defaultBranch: r.data.default_branch || 'main',
+          });
+        }
+      }
+
+      if (branchesWithGroup.length === 0) {
+        this.log(chalk.yellow('No branches with unix_group found\n'));
+      } else {
+        this.log(chalk.cyan(`Found ${branchesWithGroup.length} branch(s) with unix_group\n`));
+
+        for (const wt of branchesWithGroup) {
+          const rawBranch = wt as {
+            branch_id: string;
+            name: string;
+            ref: string;
+            repo_id: string;
+            unix_group: string;
+            archived: boolean;
+            filesystem_status: string | null;
+            others_fs_access: 'none' | 'read' | 'write' | null;
+            data: { path?: string; base_ref?: string } | null;
+          };
+
+          const branchPath = rawBranch.data?.path;
+
+          // Skip branches without a path in the data blob
+          if (!branchPath) {
+            if (verbose) {
+              this.log(chalk.gray(`   ⚠ ${rawBranch.name}: no path in data, skipping`));
+            }
+            branchesSkipped++;
+            continue;
+          }
+
+          const dirExists = existsSync(branchPath);
+          const action = getBranchDirectoryAction(
+            dirExists,
+            rawBranch.archived,
+            rawBranch.filesystem_status
+          );
+
+          if (action === 'cleanup') {
+            // Archived+deleted: remove Unix group cruft
+            const wtGroup = rawBranch.unix_group;
+            if (groupExists(wtGroup)) {
+              this.log(
+                chalk.yellow(
+                  `   🧹 ${rawBranch.name}: archived+deleted, removing group ${wtGroup}...`
+                )
+              );
+              if (await execCmd(UnixGroupCommands.deleteGroup(wtGroup))) {
+                groupsCleaned++;
+                this.log(chalk.green(`   ✓ Deleted group ${wtGroup}`));
+              } else {
+                syncErrors++;
+                this.log(chalk.red(`   ✗ Failed to delete group ${wtGroup}`));
+              }
+            } else if (verbose) {
+              this.log(
+                chalk.gray(
+                  `   ⊘ ${rawBranch.name}: archived+deleted, group ${wtGroup} already gone`
+                )
+              );
+            }
+            continue;
+          }
+
+          if (action === 'skip') {
+            if (verbose) {
+              const reason =
+                rawBranch.filesystem_status === 'creating'
+                  ? 'still creating'
+                  : rawBranch.archived && !dirExists
+                    ? `archived (${rawBranch.filesystem_status || 'unknown'}), dir missing`
+                    : 'unknown';
+              this.log(chalk.gray(`   ⊘ ${rawBranch.name}: ${reason}, skipping`));
+            }
+            branchesSkipped++;
+            continue;
+          }
+
+          // Restore failed non-archived branches via shared restoreBranchFilesystem()
+          if (action === 'restore') {
+            const repoInfo = repoPathMap.get(rawBranch.repo_id);
+            if (!repoInfo) {
+              if (verbose) {
+                this.log(
+                  chalk.gray(`   ⊘ ${rawBranch.name}: failed, no repo path found, skipping restore`)
+                );
+              }
+              branchesSkipped++;
+              continue;
+            }
+
+            const baseRef = rawBranch.data?.base_ref || repoInfo.defaultBranch;
+
+            this.log(chalk.bold(`🔧 ${rawBranch.name}`));
+            this.log(chalk.gray(`   branch_id: ${shortId(rawBranch.branch_id)}`));
+            this.log(chalk.gray(`   status: failed → attempting restore`));
+            this.log(chalk.gray(`   ref: ${rawBranch.ref}, base: ${baseRef}`));
+            this.log(chalk.gray(`   path: ${branchPath}`));
+
+            if (dryRun) {
+              this.log(
+                chalk.gray(
+                  `   [dry-run] Would attempt restoreBranchFilesystem() for ${rawBranch.ref} at ${branchPath}`
+                )
+              );
+              branchesRestored++;
+              this.log('');
+              continue;
+            }
+
+            this.log(chalk.yellow(`   → Restoring branch filesystem...`));
+            const result = await restoreBranchFilesystem(
+              repoInfo.localPath,
+              branchPath,
+              rawBranch.ref,
+              baseRef
+            );
+
+            if (result.success) {
+              // Update filesystem_status to ready
+              await update(db, branches)
+                .set({ filesystem_status: 'ready' })
+                .where(eq(branches.branch_id, rawBranch.branch_id))
+                .run();
+
+              branchesRestored++;
+              this.log(chalk.green(`   ✓ Restored branch (${result.strategy}), status → ready`));
+            } else {
+              syncErrors++;
+              this.log(chalk.red(`   ✗ Failed to restore branch: ${result.error}`));
+            }
+            this.log('');
+            continue;
+          }
+
+          this.log(chalk.bold(`📁 ${rawBranch.name}`));
+          this.log(chalk.gray(`   branch_id: ${shortId(rawBranch.branch_id)}`));
+          this.log(chalk.gray(`   unix_group: ${rawBranch.unix_group}`));
+          this.log(chalk.gray(`   path: ${branchPath}`));
+          if (rawBranch.archived) {
+            this.log(
+              chalk.gray(`   archived: yes (fs: ${rawBranch.filesystem_status || 'preserved'})`)
+            );
+          }
+
+          // Create missing branch directory using shared restoreBranchFilesystem()
+          if (action === 'create') {
+            const repoInfo = repoPathMap.get(rawBranch.repo_id);
+
+            if (repoInfo) {
+              const baseRef = rawBranch.data?.base_ref || repoInfo.defaultBranch;
+              this.log(
+                chalk.yellow(
+                  `   → Directory missing, creating git branch (branch: ${rawBranch.ref}, base: ${baseRef})...`
+                )
+              );
+
+              if (dryRun) {
+                branchDirsCreated++;
+                this.log(
+                  chalk.gray(
+                    `   [dry-run] Would run restoreBranchFilesystem() for ${rawBranch.ref} at ${branchPath}`
+                  )
+                );
+              } else {
+                const result = await restoreBranchFilesystem(
+                  repoInfo.localPath,
+                  branchPath,
+                  rawBranch.ref,
+                  baseRef
+                );
+
+                if (result.success) {
+                  branchDirsCreated++;
+                  this.log(chalk.green(`   ✓ Created git branch (${result.strategy})`));
+                } else {
+                  // Fallback to mkdir -p
+                  this.log(
+                    chalk.yellow(
+                      `   ⚠ git worktree add failed (${result.error}), falling back to mkdir -p`
+                    )
+                  );
+                  if (await execCmd(`sudo -n mkdir -p "${branchPath}"`)) {
+                    branchDirsCreated++;
+                    this.log(chalk.green(`   ✓ Created directory (mkdir fallback)`));
+                  } else {
+                    syncErrors++;
+                    this.log(chalk.red(`   ✗ Failed to create directory`));
+                    this.log('');
+                    continue;
+                  }
+                }
+              }
+            } else {
+              // No repo info available, fall back to mkdir -p
+              this.log(
+                chalk.yellow(`   → Directory missing, creating (no repo path for git branch)...`)
+              );
+              if (await execCmd(`sudo -n mkdir -p "${branchPath}"`)) {
+                branchDirsCreated++;
+                this.log(chalk.green(`   ✓ Created directory`));
+              } else {
+                syncErrors++;
+                this.log(chalk.red(`   ✗ Failed to create directory`));
+                this.log('');
+                continue;
+              }
+            }
+          }
+
+          // Fix filesystem_status for active branches stuck as 'deleted' or 'preserved'
+          if (
+            action === 'sync' &&
+            !rawBranch.archived &&
+            (rawBranch.filesystem_status === 'deleted' ||
+              rawBranch.filesystem_status === 'preserved')
+          ) {
+            // Verify it's a valid git branch (has .git file)
+            const gitFilePath = join(branchPath, '.git');
+            if (existsSync(gitFilePath)) {
+              const oldStatus = rawBranch.filesystem_status;
+              this.log(chalk.yellow(`   → Fixing filesystem_status: ${oldStatus} → ready`));
+              if (!dryRun) {
+                try {
+                  await update(db, branches)
+                    .set({ filesystem_status: 'ready' })
+                    .where(eq(branches.branch_id, rawBranch.branch_id))
+                    .run();
+                  this.log(
+                    chalk.green(
+                      `   ✓ Fixed filesystem_status: ${oldStatus} → ready for ${rawBranch.name}`
+                    )
+                  );
+                } catch (error) {
+                  syncErrors++;
+                  this.log(chalk.red(`   ✗ Failed to fix filesystem_status: ${error}`));
+                }
+              } else {
+                this.log(
+                  chalk.gray(
+                    `   [dry-run] Would fix filesystem_status: ${oldStatus} → ready for ${rawBranch.name}`
+                  )
+                );
+              }
+              statusFixed++;
+            }
+          }
 
           // Calculate permission mode based on others_fs_access
-          const othersAccess = rawWorktree.others_fs_access || 'read';
-          const permissionMode = getWorktreePermissionMode(othersAccess);
+          const othersAccess = rawBranch.others_fs_access || 'read';
+          const permissionMode = getBranchPermissionMode(othersAccess);
 
           this.log(chalk.gray(`   others_fs_access: ${othersAccess} → mode: ${permissionMode}`));
 
-          if (dryRun) {
-            this.log(
-              chalk.gray(
-                `   [dry-run] Would run: chgrp -R ${rawWorktree.unix_group} "${worktreePath}"`
-              )
-            );
-            this.log(
-              chalk.gray(`   [dry-run] Would run: chmod -R ${permissionMode} "${worktreePath}"`)
-            );
-            this.log('');
+          const permCmds = UnixGroupCommands.setDirectoryGroup(
+            branchPath,
+            rawBranch.unix_group,
+            permissionMode
+          );
+          if (await execAllCmds(permCmds)) {
+            branchesSynced++;
+            this.log(chalk.green(`   ✓ Applied permissions (${permissionMode})`));
           } else {
-            try {
-              // Run each command separately (no sh -c wrapper for security)
-              for (const cmd of UnixGroupCommands.setDirectoryGroup(
-                worktreePath,
-                rawWorktree.unix_group,
-                permissionMode
-              )) {
-                execSync(cmd, { stdio: 'pipe' });
-              }
+            syncErrors++;
+            this.log(chalk.red(`   ✗ Failed to set permissions`));
+          }
 
-              worktreesSynced++;
-              this.log(chalk.green(`   ✓ Applied permissions (${permissionMode})\n`));
-            } catch (error) {
+          // Apply daemon user ACL so the running daemon can access without restart
+          if (daemonUser && (dirExists || action === 'create')) {
+            const aclCmds = UnixGroupCommands.setUserAcl(branchPath, daemonUser);
+            if (await execAllCmds(aclCmds)) {
+              daemonAclsApplied++;
+              if (verbose) {
+                this.log(chalk.green(`   ✓ Applied daemon ACL for ${daemonUser}`));
+              }
+            } else {
               syncErrors++;
-              this.log(chalk.red(`   ✗ Failed: ${error}\n`));
+              this.log(chalk.red(`   ✗ Failed to set daemon ACL`));
             }
           }
+
+          this.log('');
         }
 
-        // Summary for worktree sync
-        this.log(chalk.bold('Worktree Sync Summary:'));
-        this.log(`  Worktrees synced: ${worktreesSynced}${dryRun ? ' (dry-run)' : ''}`);
+        // Summary for branch sync
+        this.log(chalk.bold('Branch Sync Summary:'));
+        this.log(`  Branches synced: ${branchesSynced}${dryRun ? ' (dry-run)' : ''}`);
+        this.log(`  Directories created: ${branchDirsCreated}${dryRun ? ' (dry-run)' : ''}`);
+        this.log(`  Branches restored: ${branchesRestored}${dryRun ? ' (dry-run)' : ''}`);
+        this.log(`  Groups cleaned: ${groupsCleaned}${dryRun ? ' (dry-run)' : ''}`);
+        this.log(`  Status fixed: ${statusFixed}${dryRun ? ' (dry-run)' : ''}`);
+        this.log(`  Daemon ACLs applied: ${daemonAclsApplied}${dryRun ? ' (dry-run)' : ''}`);
+        this.log(`  Skipped: ${branchesSkipped}`);
         if (syncErrors > 0) {
           this.log(chalk.red(`  Errors: ${syncErrors}`));
         }
@@ -920,137 +1252,261 @@ export default class SyncUnix extends Command {
       }
 
       // ========================================
-      // Repo .git Permission Sync Phase
-      // (For repos that already have unix_group but need permissions applied)
+      // Membership Pruning Phase
+      // Removes users from branch groups they no longer own
       // ========================================
 
-      // The backfill phase above handled repos without unix_group.
-      // Now we need to ensure permissions are set on repos that already have unix_group.
-      this.log(chalk.cyan.bold('\n━━━ Sync Repo Permissions ━━━\n'));
-
-      // Get all repos with unix_group set (these already have groups, just need permission check)
-      const allReposForSync = await select(db).from(repos).all();
-      const reposWithGroup = allReposForSync.filter(
-        (r: { unix_group: string | null }) => r.unix_group !== null
-      );
-
-      if (reposWithGroup.length === 0) {
-        this.log(chalk.yellow('No repos with unix_group found\n'));
+      if (targetBranchId) {
+        this.log(chalk.gray('   ⊘ Skipping membership pruning phase (--branch-id mode)\n'));
       } else {
-        this.log(chalk.cyan(`Found ${reposWithGroup.length} repo(s) with unix_group\n`));
+        this.log(chalk.cyan.bold('\n━━━ Prune Stale Group Memberships ━━━\n'));
 
-        for (const repo of reposWithGroup) {
-          // Extract local_path from the data JSON blob
-          const rawRepo = repo as {
-            repo_id: string;
-            slug: string;
-            unix_group: string;
-            data: { local_path?: string } | null;
-          };
+        {
+          // Build a map of branch group → expected members (owners + daemon)
+          const allWtForPrune = await select(db).from(branches).all();
+          const allOwnerRows = await select(db).from(branchOwners).all();
 
-          const repoPath = rawRepo.data?.local_path;
-
-          // Skip repos without a path
-          if (!repoPath) {
-            this.log(chalk.yellow(`📁 ${rawRepo.slug}`));
-            this.log(chalk.gray(`   repo_id: ${rawRepo.repo_id.substring(0, 8)}`));
-            this.log(chalk.gray(`   unix_group: ${rawRepo.unix_group}`));
-            this.log(chalk.red(`   ⚠ No local_path found in repo data, skipping\n`));
-            continue;
+          // Map branch_id → unix_group
+          const wtGroupMap = new Map<string, string>();
+          for (const wt of allWtForPrune) {
+            const raw = wt as { branch_id: string; unix_group: string | null };
+            if (raw.unix_group) {
+              wtGroupMap.set(raw.branch_id, raw.unix_group);
+            }
           }
 
-          const gitPath = `${repoPath}/.git`;
+          // Map unix_group → set of expected user_ids
+          const groupToOwnerIds = new Map<string, Set<string>>();
+          for (const row of allOwnerRows) {
+            const raw = row as { branch_id: string; user_id: string };
+            const group = wtGroupMap.get(raw.branch_id);
+            if (group) {
+              const owners = groupToOwnerIds.get(group) || new Set();
+              owners.add(raw.user_id);
+              groupToOwnerIds.set(group, owners);
+            }
+          }
 
-          this.log(chalk.bold(`📁 ${rawRepo.slug}`));
-          this.log(chalk.gray(`   repo_id: ${rawRepo.repo_id.substring(0, 8)}`));
-          this.log(chalk.gray(`   unix_group: ${rawRepo.unix_group}`));
-          this.log(chalk.gray(`   .git path: ${gitPath}`));
-          this.log(chalk.gray(`   mode: ${REPO_GIT_PERMISSION_MODE} (setgid, owner+group rwx)`));
+          // Map user_id → unix_username for all users with unix_username
+          const allUsersForPrune = (await select(db).from(users).all()) as UserWithUnix[];
+          const userIdToUnixName = new Map<string, string>();
+          const unixNameToUserId = new Map<string, string>();
+          for (const u of allUsersForPrune) {
+            if (u.unix_username) {
+              userIdToUnixName.set(u.user_id, u.unix_username);
+              unixNameToUserId.set(u.unix_username, u.user_id);
+            }
+          }
 
-          // Ensure daemon user is in this repo group
-          if (daemonUser) {
-            const daemonInThisRepoGroup = dryRun
-              ? false
-              : this.isUserInGroup(daemonUser, rawRepo.unix_group);
-            if (!daemonInThisRepoGroup) {
-              this.log(
-                chalk.yellow(`   → Adding daemon user ${daemonUser} to ${rawRepo.unix_group}...`)
-              );
-              if (this.addUserToGroup(daemonUser, rawRepo.unix_group, dryRun)) {
-                daemonMembershipsAdded++;
-                this.log(chalk.green(`   ✓ Added daemon user to ${rawRepo.unix_group}`));
+          // Iterate ALL branch groups (including those with zero owners)
+          let pruneChecked = 0;
+          for (const [, group] of wtGroupMap.entries()) {
+            if (!groupExists(group)) continue;
+            pruneChecked++;
+
+            // Get expected unix_usernames for this group (may be empty if no owners)
+            const ownerIds = groupToOwnerIds.get(group) || new Set<string>();
+            const expectedUsernames = new Set<string>();
+            for (const ownerId of ownerIds) {
+              const uname = userIdToUnixName.get(ownerId);
+              if (uname) expectedUsernames.add(uname);
+            }
+            // Daemon user is always expected
+            if (daemonUser) expectedUsernames.add(daemonUser);
+
+            // Get actual members from OS
+            const actualMembers = getGroupMembers(group);
+
+            for (const member of actualMembers) {
+              if (expectedUsernames.has(member)) continue;
+              // Skip the daemon user (safety)
+              if (daemonUser && member === daemonUser) continue;
+              // Only prune DB-managed users (skip manually-added system users)
+              if (!unixNameToUserId.has(member)) continue;
+
+              this.log(chalk.yellow(`   → Removing ${member} from ${group} (no longer owner)`));
+              if (await execCmd(UnixGroupCommands.removeUserFromGroup(member, group))) {
+                membershipsRemoved++;
+                this.log(chalk.green(`   ✓ Removed ${member} from ${group}`));
               } else {
-                this.log(chalk.red(`   ✗ Failed to add daemon user to ${rawRepo.unix_group}`));
+                syncErrors++;
+                this.log(chalk.red(`   ✗ Failed to remove ${member} from ${group}`));
               }
-            } else if (verbose) {
-              this.log(chalk.gray(`   ✓ Daemon user already in ${rawRepo.unix_group}`));
             }
           }
 
-          if (dryRun) {
+          if (membershipsRemoved === 0) {
             this.log(
-              chalk.gray(`   [dry-run] Would run: chgrp -R ${rawRepo.unix_group} "${gitPath}"`)
+              chalk.green(`   ✓ No stale memberships found (checked ${pruneChecked} groups)\n`)
             );
-            this.log(
-              chalk.gray(
-                `   [dry-run] Would run: chmod -R ${REPO_GIT_PERMISSION_MODE} "${gitPath}"`
-              )
-            );
-            this.log('');
           } else {
-            try {
-              // Run each command separately (no sh -c wrapper for security)
-              for (const cmd of UnixGroupCommands.setDirectoryGroup(
-                gitPath,
-                rawRepo.unix_group,
-                REPO_GIT_PERMISSION_MODE
-              )) {
-                execSync(cmd, { stdio: 'pipe' });
-              }
+            this.log('');
+            this.log(chalk.bold('Membership Pruning Summary:'));
+            this.log(`  Memberships removed: ${membershipsRemoved}${dryRun ? ' (dry-run)' : ''}`);
+            this.log('');
+          }
+        }
+      } // end if (!targetBranchId) for membership pruning
 
-              reposPermSynced++;
-              this.log(
-                chalk.green(`   ✓ Applied .git permissions (${REPO_GIT_PERMISSION_MODE})\n`)
-              );
-            } catch (error) {
+      // ========================================
+      // Symlink Sync Phase
+      // Creates missing symlinks, removes broken ones
+      // ========================================
+
+      if (targetBranchId) {
+        this.log(chalk.gray('   ⊘ Skipping symlink sync phase (--branch-id mode)\n'));
+      } else if (validUsers.length > 0) {
+        this.log(chalk.cyan.bold('\n━━━ Sync User Symlinks ━━━\n'));
+
+        // Build branch ownership data for symlink creation
+        const allWtForSymlinks = await select(db).from(branches).all();
+        const allOwnershipsForSymlinks = await select(db).from(branchOwners).all();
+
+        // Map branch_id → branch info
+        const wtInfoMap = new Map<
+          string,
+          {
+            name: string;
+            path: string | undefined;
+            archived: boolean;
+            filesystem_status: string | null;
+          }
+        >();
+        for (const wt of allWtForSymlinks) {
+          const raw = wt as {
+            branch_id: string;
+            name: string;
+            archived: boolean;
+            filesystem_status: string | null;
+            data: { path?: string } | null;
+          };
+          wtInfoMap.set(raw.branch_id, {
+            name: raw.name,
+            path: raw.data?.path,
+            archived: raw.archived,
+            filesystem_status: raw.filesystem_status,
+          });
+        }
+
+        // Map user_id → list of branch_ids they own
+        const userToBranches = new Map<string, string[]>();
+        for (const row of allOwnershipsForSymlinks) {
+          const raw = row as { user_id: string; branch_id: string };
+          const existing = userToBranches.get(raw.user_id) || [];
+          existing.push(raw.branch_id);
+          userToBranches.set(raw.user_id, existing);
+        }
+
+        for (const user of validUsers) {
+          const branchesDir = getUserBranchesDir(user.unix_username);
+
+          if (verbose) {
+            this.log(chalk.gray(`   ${user.unix_username}: checking symlinks...`));
+          }
+
+          // Ensure ~/agor/worktrees/ directory exists
+          if (!existsSync(branchesDir)) {
+            const setupCmds = UnixUserCommands.setupBranchesDir(user.unix_username);
+            if (!(await execAllCmds(setupCmds))) {
+              // May already exist or user home may not exist yet
+              if (verbose) {
+                this.log(chalk.gray(`   ⚠ Could not create ${branchesDir}`));
+              }
+              continue;
+            }
+          }
+
+          // Clean up broken symlinks
+          if (existsSync(branchesDir)) {
+            await execCmd(SymlinkCommands.removeBrokenSymlinks(branchesDir));
+            symlinksCleaned++; // Count users cleaned, not individual symlinks
+          }
+
+          // Create symlinks for owned branches where directory exists
+          const ownedWtIds = userToBranches.get(user.user_id) || [];
+          for (const wtId of ownedWtIds) {
+            const wtInfo = wtInfoMap.get(wtId);
+            if (!wtInfo?.path) continue;
+
+            // Skip archived+deleted branches
+            if (wtInfo.archived && wtInfo.filesystem_status === 'deleted') continue;
+
+            // Skip if target directory doesn't exist
+            if (!existsSync(wtInfo.path)) continue;
+
+            const symlinkPath = getBranchSymlinkPath(user.unix_username, wtInfo.name);
+
+            // Check if symlink already exists and points to the correct target
+            let needsCreate = true;
+            try {
+              const currentTarget = readlinkSync(symlinkPath);
+              if (currentTarget === wtInfo.path) {
+                needsCreate = false;
+              }
+            } catch {
+              // Symlink doesn't exist or isn't a symlink — needs creation
+            }
+
+            if (!needsCreate) continue;
+
+            // SymlinkCommands don't include sudo prefix, so prepend it
+            const symlinkCmds = SymlinkCommands.createSymlinkWithOwnership(
+              wtInfo.path,
+              symlinkPath,
+              user.unix_username
+            ).map((cmd) => `sudo -n ${cmd}`);
+            if (await execAllCmds(symlinkCmds)) {
+              symlinksCreated++;
+              if (verbose) {
+                this.log(
+                  chalk.green(`   ✓ ${user.unix_username}: ${wtInfo.name} → ${wtInfo.path}`)
+                );
+              }
+            } else {
+              if (verbose) {
+                this.log(chalk.red(`   ✗ Failed to create symlink for ${wtInfo.name}`));
+              }
               syncErrors++;
-              this.log(chalk.red(`   ✗ Failed: ${error}\n`));
             }
           }
         }
 
-        // Summary for repo permission sync
-        this.log(chalk.bold('Repo Permission Sync Summary:'));
-        this.log(`  Repos synced: ${reposPermSynced}${dryRun ? ' (dry-run)' : ''}`);
-        if (syncErrors > 0) {
-          this.log(chalk.red(`  Errors: ${syncErrors}`));
+        if (symlinksCreated > 0 || symlinksCleaned > 0) {
+          this.log('');
+          this.log(chalk.bold('Symlink Sync Summary:'));
+          this.log(`  Symlinks created: ${symlinksCreated}${dryRun ? ' (dry-run)' : ''}`);
+          this.log(`  Users cleaned: ${symlinksCleaned}${dryRun ? ' (dry-run)' : ''}`);
+          this.log('');
+        } else {
+          this.log(chalk.green('   ✓ All symlinks up to date\n'));
         }
-        this.log('');
       }
 
       // ========================================
       // Cleanup Phase
       // ========================================
 
-      if (cleanupGroups || cleanupUsers) {
+      if (targetBranchId && (cleanupGroups || cleanupUsers)) {
+        this.log(chalk.gray('   ⊘ Skipping cleanup phase (--branch-id mode)\n'));
+      } else if (cleanupGroups || cleanupUsers) {
         this.log(chalk.cyan.bold('━━━ Cleanup ━━━\n'));
       }
 
-      // Cleanup stale worktree groups
-      if (cleanupGroups) {
-        this.log(chalk.cyan('Checking for stale worktree groups...\n'));
+      // Cleanup stale branch groups
+      if (cleanupGroups && !targetBranchId) {
+        this.log(chalk.cyan('Checking for stale branch groups...\n'));
 
-        // Get all worktree groups that should exist (from DB)
-        const allWorktrees = await select(db).from(worktrees).all();
+        // Get all branch groups that should exist (from DB)
+        const allBranches = await select(db).from(branches).all();
         const expectedGroups = new Set(
-          allWorktrees.map(
-            (wt: { worktree_id: string; unix_group: string | null }) =>
-              wt.unix_group || generateWorktreeGroupName(wt.worktree_id as WorktreeID)
+          allBranches.map(
+            (wt: { branch_id: string; unix_group: string | null }) =>
+              wt.unix_group || generateBranchGroupName(wt.branch_id as BranchID)
           )
         );
 
         // Get all agor_wt_* groups on the system
-        const systemGroups = this.listWorktreeGroups();
+        const systemGroups = listBranchGroups();
 
         if (verbose) {
           this.log(chalk.gray(`   Found ${systemGroups.length} agor_wt_* group(s) on system`));
@@ -1061,13 +1517,13 @@ export default class SyncUnix extends Command {
         const staleGroups = systemGroups.filter((g) => !expectedGroups.has(g));
 
         if (staleGroups.length === 0) {
-          this.log(chalk.green('   ✓ No stale worktree groups found\n'));
+          this.log(chalk.green('   ✓ No stale branch groups found\n'));
         } else {
           this.log(chalk.yellow(`   Found ${staleGroups.length} stale group(s) to remove:\n`));
 
           for (const groupName of staleGroups) {
             this.log(chalk.yellow(`   → Deleting group ${groupName}...`));
-            if (this.deleteGroup(groupName, dryRun)) {
+            if (await execCmd(UnixGroupCommands.deleteGroup(groupName))) {
               groupsDeleted++;
               this.log(chalk.green(`   ✓ Deleted ${groupName}`));
             } else {
@@ -1091,7 +1547,7 @@ export default class SyncUnix extends Command {
         );
 
         // Get all agor_rp_* groups on the system
-        const systemRepoGroups = this.listRepoGroups();
+        const systemRepoGroups = listRepoGroups();
 
         if (verbose) {
           this.log(chalk.gray(`   Found ${systemRepoGroups.length} agor_rp_* group(s) on system`));
@@ -1110,7 +1566,7 @@ export default class SyncUnix extends Command {
 
           for (const groupName of staleRepoGroups) {
             this.log(chalk.yellow(`   → Deleting group ${groupName}...`));
-            if (this.deleteGroup(groupName, dryRun)) {
+            if (await execCmd(UnixGroupCommands.deleteGroup(groupName))) {
               groupsDeleted++;
               this.log(chalk.green(`   ✓ Deleted ${groupName}`));
             } else {
@@ -1123,7 +1579,7 @@ export default class SyncUnix extends Command {
       }
 
       // Cleanup stale users
-      if (cleanupUsers) {
+      if (cleanupUsers && !targetBranchId) {
         this.log(chalk.cyan('Checking for stale Agor users...\n'));
 
         // Get all unix_usernames that should exist (from DB)
@@ -1133,7 +1589,7 @@ export default class SyncUnix extends Command {
         );
 
         // Get all agor_* users on the system (only auto-generated format)
-        const systemUsers = this.listAgorUsers();
+        const systemUsers = listAgorUsers();
 
         if (verbose) {
           this.log(chalk.gray(`   Found ${systemUsers.length} agor_* user(s) on system`));
@@ -1151,7 +1607,7 @@ export default class SyncUnix extends Command {
 
           for (const username of staleUsers) {
             this.log(chalk.yellow(`   → Deleting user ${username}...`));
-            if (this.deleteUser(username, dryRun)) {
+            if (await execCmd(UnixUserCommands.deleteUser(username))) {
               usersDeleted++;
               this.log(chalk.green(`   ✓ Deleted ${username}`));
             } else {
@@ -1179,17 +1635,33 @@ export default class SyncUnix extends Command {
       this.log(`  Users created:     ${usersCreated}${dryRunSuffix}`);
       this.log(`  Groups created:    ${groupsCreated}${dryRunSuffix}`);
       this.log(`  Memberships added: ${groupsAdded}${dryRunSuffix}`);
+      this.log(`  Memberships removed: ${membershipsRemoved}${dryRunSuffix}`);
       if (daemonUser) {
         this.log(`  Daemon memberships: ${daemonMembershipsAdded}${dryRunSuffix}`);
       }
 
-      // Worktree/Repo sync stats
+      // Branch/Repo sync stats
       this.log('');
       this.log(chalk.bold('Filesystem Sync:'));
-      this.log(`  Worktrees synced:  ${worktreesSynced}${dryRunSuffix}`);
+      this.log(`  WT groups backfilled: ${branchesBackfilled}${dryRunSuffix}`);
+      this.log(`  Branches synced:  ${branchesSynced}${dryRunSuffix}`);
+      this.log(`  Dirs created:      ${branchDirsCreated}${dryRunSuffix}`);
+      this.log(`  Branches restored:${branchesRestored}${dryRunSuffix}`);
+      this.log(`  Groups cleaned:    ${groupsCleaned}${dryRunSuffix}`);
+      this.log(`  Status fixed:      ${statusFixed}${dryRunSuffix}`);
+      this.log(`  Skipped:           ${branchesSkipped}`);
+      this.log(`  Daemon ACLs:       ${daemonAclsApplied}${dryRunSuffix}`);
       this.log(`  Repos backfilled:  ${reposBackfilled}${dryRunSuffix}`);
       this.log(`  Repo perms synced: ${reposPermSynced}${dryRunSuffix}`);
+
+      // Symlink stats
+      this.log('');
+      this.log(chalk.bold('Symlinks:'));
+      this.log(`  Created:           ${symlinksCreated}${dryRunSuffix}`);
+      this.log(`  Users cleaned:     ${symlinksCleaned}${dryRunSuffix}`);
+
       if (syncErrors > 0) {
+        this.log('');
         this.log(chalk.red(`  Sync errors:       ${syncErrors}`));
       }
 
@@ -1217,11 +1689,20 @@ export default class SyncUnix extends Command {
         groupsAdded > 0 ||
         groupsCreated > 0 ||
         daemonMembershipsAdded > 0 ||
+        membershipsRemoved > 0 ||
         usersDeleted > 0 ||
         groupsDeleted > 0 ||
-        worktreesSynced > 0 ||
+        branchesSynced > 0 ||
+        branchesBackfilled > 0 ||
+        branchDirsCreated > 0 ||
+        branchesRestored > 0 ||
+        groupsCleaned > 0 ||
+        statusFixed > 0 ||
+        daemonAclsApplied > 0 ||
         reposBackfilled > 0 ||
-        reposPermSynced > 0;
+        reposPermSynced > 0 ||
+        symlinksCreated > 0 ||
+        symlinksCleaned > 0;
       if (dryRun && hasChanges) {
         this.log(chalk.yellow('\nRun without --dry-run to apply changes'));
       }

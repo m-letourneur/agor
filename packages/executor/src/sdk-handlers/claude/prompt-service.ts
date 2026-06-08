@@ -5,18 +5,20 @@
  * Automatically loads CLAUDE.md and uses preset system prompts matching Claude Code CLI.
  */
 
-import type { PermissionMode } from '@agor/core/sdk';
+import { shortId } from '@agor/core/db';
+import type { PermissionMode, SDKResultMessage } from '@agor/core/sdk';
 import type {
+  BranchRepository,
   MCPServerRepository,
   MessagesRepository,
   SessionMCPServerRepository,
   SessionRepository,
-  WorktreeRepository,
+  UsersRepository,
 } from '../../db/feathers-repositories.js';
 import type { PermissionService } from '../../permissions/permission-service.js';
 import type { SessionID, TaskID } from '../../types.js';
 import { MessageRole } from '../../types.js';
-import type { SessionsService, TasksService } from './claude-tool.js';
+import type { MessagesService, SessionsPatchClient, TasksService } from '../base/index.js';
 import { type ProcessedEvent, SDKMessageProcessor } from './message-processor.js';
 import { setupQuery } from './query-builder.js';
 
@@ -44,11 +46,9 @@ export interface PromptResult {
 
 export class ClaudePromptService {
   /** Enable token-level streaming from Claude Agent SDK */
-  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: toggled in future when streaming support lands
   private static readonly ENABLE_TOKEN_STREAMING = true;
 
   /** Idle timeout for SDK event loop - throws error if no messages received for this duration */
-  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: reserved for future SDK config toggles
   private static readonly IDLE_TIMEOUT_MS = 300000; // 5 minutes
 
   /** Serialize permission checks per session to prevent duplicate prompts for concurrent tool calls */
@@ -62,15 +62,37 @@ export class ClaudePromptService {
     private mcpServerRepo?: MCPServerRepository,
     private permissionService?: PermissionService,
     private tasksService?: TasksService,
-    private sessionsService?: SessionsService, // FeathersJS Sessions service for WebSocket broadcasting
-    private worktreesRepo?: WorktreeRepository,
+    private sessionsService?: SessionsPatchClient, // FeathersJS Sessions service for WebSocket broadcasting
+    private branchesRepo?: BranchRepository,
     private reposRepo?: import('../../db/feathers-repositories').RepoRepository,
-    private messagesService?: import('./claude-tool').MessagesService, // FeathersJS Messages service for creating permission requests
+    private messagesService?: MessagesService, // FeathersJS Messages service for creating permission requests
     private mcpEnabled?: boolean,
-    // biome-ignore lint/suspicious/noExplicitAny: Feathers service type
-    private mcpOAuthNotifyService?: any // Service for notifying UI about OAuth requirements
+    private usersRepo?: UsersRepository
   ) {
     // No client initialization needed - Agent SDK is stateless
+  }
+
+  /**
+   * Build help message for CLI-only commands that don't work through the SDK
+   */
+  private buildCLICommandHelpMessage(command: string): string {
+    if (command === 'login') {
+      return `**[Agor system message]**
+
+\`/login\` is a CLI-only command that doesn't work in Agor.
+
+To configure your Anthropic API key:
+
+1. **System Settings → Agentic Tools → Claude Code**
+2. **User Settings → Claude Code**
+3. **For Claude Max Pro plan (OAuth):** You must start a \`claude\` CLI session while logged in as the Agor user
+
+If you continue to see authentication errors, please contact your Agor administrator.`;
+    }
+
+    return `**[Agor system message]**
+
+\`/${command}\` is a CLI-only command that only works in the standalone Claude Code terminal, not through Agor's SDK integration.`;
   }
 
   /**
@@ -95,11 +117,64 @@ export class ClaudePromptService {
     _chunkCallback?: (messageId: string, chunk: string) => void,
     abortController?: AbortController
   ): AsyncGenerator<ProcessedEvent> {
-    const {
-      query: result,
-      getStderr,
-      oauthServersNeedingAuth,
-    } = await setupQuery(
+    // Intercept slash commands that don't work via the Claude Agent SDK.
+    // Commands like /compact and /cost are handled natively by the SDK and pass through.
+    // Commands like /clear, /help, /usage are CLI-only and return "Unknown skill" errors
+    // from the SDK, so we intercept them with helpful messages instead.
+    const trimmedPrompt = prompt.trim();
+    const agorCommandMatch = trimmedPrompt.match(/^\/(\w+)(?:\s|$)/);
+    if (agorCommandMatch) {
+      const command = agorCommandMatch[1];
+      const agorInterceptedCommands = ['login', 'clear', 'help', 'usage'];
+
+      if (agorInterceptedCommands.includes(command)) {
+        const helpMessage = this.buildCLICommandHelpMessage(command);
+
+        // Yield synthetic complete message
+        yield {
+          type: 'complete',
+          role: MessageRole.ASSISTANT,
+          content: [{ type: 'text', text: helpMessage }],
+          toolUses: undefined,
+          parent_tool_use_id: null,
+          agentSessionId: undefined,
+          resolvedModel: undefined,
+        };
+
+        // Yield result with zero usage
+        yield {
+          type: 'result',
+          raw_sdk_message: {
+            type: 'result',
+            subtype: 'success',
+            duration_ms: 0,
+            duration_api_ms: 0,
+            is_error: false,
+            num_turns: 0,
+            result: '',
+            stop_reason: null,
+            total_cost_usd: 0,
+            usage: {
+              input_tokens: 0,
+              output_tokens: 0,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+            } as SDKResultMessage['usage'],
+            modelUsage: {},
+            permission_denials: [],
+            uuid: '00000000-0000-0000-0000-000000000000',
+            session_id: '00000000-0000-0000-0000-000000000000',
+          },
+          agentSessionId: undefined,
+        };
+
+        // Yield end
+        yield { type: 'end', reason: 'result' };
+        return;
+      }
+    }
+
+    const { query: result, getStderr } = await setupQuery(
       sessionId,
       prompt,
       {
@@ -114,7 +189,8 @@ export class ClaudePromptService {
         mcpEnabled: this.mcpEnabled,
         sessionsService: this.sessionsService,
         messagesService: this.messagesService,
-        worktreesRepo: this.worktreesRepo,
+        branchesRepo: this.branchesRepo,
+        usersRepo: this.usersRepo,
         permissionLocks: this.permissionLocks,
       },
       {
@@ -124,22 +200,6 @@ export class ClaudePromptService {
         abortController,
       }
     );
-
-    // Notify UI if OAuth MCP servers need authentication
-    if (oauthServersNeedingAuth.length > 0 && this.mcpOAuthNotifyService) {
-      try {
-        // Call the daemon's oauth-notify service to broadcast to UI
-        await this.mcpOAuthNotifyService.create({
-          session_id: sessionId,
-          servers: oauthServersNeedingAuth,
-        });
-        console.log(
-          `[OAuth] Notified UI about ${oauthServersNeedingAuth.length} server(s) needing auth`
-        );
-      } catch (error) {
-        console.warn('[OAuth] Failed to notify UI about OAuth requirements:', error);
-      }
-    }
 
     // Get session for reference (needed to check existing sdk_session_id)
     const session = await this.sessionsRepo?.findById(sessionId);
@@ -175,18 +235,43 @@ export class ClaudePromptService {
 
         // Handle each event from processor
         for (const event of events) {
-          // Handle session ID capture
+          // Handle session ID capture (only set if not already set — sdk_session_id is immutable)
           if (event.type === 'session_id_captured') {
-            if (this.sessionsRepo) {
+            if (this.sessionsRepo && !existingSdkSessionId) {
               await this.sessionsRepo.update(sessionId, {
                 sdk_session_id: event.agentSessionId,
               });
               console.log(`💾 Stored Agent SDK session_id in database`);
+            } else if (existingSdkSessionId && existingSdkSessionId !== event.agentSessionId) {
+              console.warn(
+                `⚠️  SDK returned new session_id ${shortId(event.agentSessionId)} but session already has ${shortId(existingSdkSessionId)} — keeping original`
+              );
             }
             continue; // Don't yield this event upstream
           }
 
-          // Handle end event (break loop)
+          // On result event, call getContextUsage() then release the held input
+          // stream so the SDK can close stdin.  The input iterable is kept alive
+          // (via a pending Promise) specifically so this control request can use
+          // stdin.  We must release it afterward regardless of success/failure.
+          if (event.type === 'result') {
+            try {
+              const contextUsage = await result.getContextUsage();
+              console.log(
+                `📊 SDK context usage: ${contextUsage.totalTokens}/${contextUsage.maxTokens} tokens (${contextUsage.percentage}%)`
+              );
+              yield { type: 'context_usage', contextUsage } as ProcessedEvent;
+            } catch (error) {
+              console.warn(
+                `⚠️  getContextUsage() unavailable (subprocess may have exited): ${error instanceof Error ? error.message : String(error)}`
+              );
+            } finally {
+              // Release the held input iterable so the SDK can close stdin
+              result.releaseInput();
+            }
+          }
+
+          // Handle end event
           if (event.type === 'end') {
             console.log(`🏁 Conversation ended: ${event.reason}`);
             break; // Exit for-await loop
@@ -202,6 +287,9 @@ export class ClaudePromptService {
         }
       }
     } catch (error) {
+      // Ensure stdin is released on any error so the subprocess can exit cleanly
+      result.releaseInput();
+
       const state = processor.getState();
 
       // Check if this is an AbortError from AbortController.abort()
@@ -210,9 +298,7 @@ export class ClaudePromptService {
         error instanceof Error &&
         (error.name === 'AbortError' || error.message.includes('abort'))
       ) {
-        console.log(
-          `🛑 [Stop] Query aborted for session ${sessionId.substring(0, 8)} - this is expected`
-        );
+        console.log(`🛑 [Stop] Query aborted for session ${shortId(sessionId)} - this is expected`);
         // Yield stopped event to signal execution was halted
         yield { type: 'stopped' } as ProcessedEvent;
         // Don't throw - this is a clean stop, not an error
@@ -232,7 +318,7 @@ export class ClaudePromptService {
         enhancedError.stack = error.stack;
       }
       console.error(`❌ SDK iteration failed:`, {
-        sessionId: sessionId.substring(0, 8),
+        sessionId: shortId(sessionId),
         messageCount: state.messageCount,
         error: error instanceof Error ? error.message : String(error),
         stderr: stderrOutput || '(no stderr output)',
@@ -254,7 +340,7 @@ export class ClaudePromptService {
    * @returns Complete assistant response with metadata
    */
   async promptSession(sessionId: SessionID, prompt: string): Promise<PromptResult> {
-    const { query: result, oauthServersNeedingAuth } = await setupQuery(
+    const { query: result } = await setupQuery(
       sessionId,
       prompt,
       {
@@ -269,7 +355,8 @@ export class ClaudePromptService {
         mcpEnabled: this.mcpEnabled,
         sessionsService: this.sessionsService,
         messagesService: this.messagesService,
-        worktreesRepo: this.worktreesRepo,
+        branchesRepo: this.branchesRepo,
+        usersRepo: this.usersRepo,
         permissionLocks: this.permissionLocks,
       },
       {
@@ -278,18 +365,6 @@ export class ClaudePromptService {
         resume: false,
       }
     );
-
-    // Notify UI if OAuth MCP servers need authentication
-    if (oauthServersNeedingAuth.length > 0 && this.mcpOAuthNotifyService) {
-      try {
-        await this.mcpOAuthNotifyService.create({
-          session_id: sessionId,
-          servers: oauthServersNeedingAuth,
-        });
-      } catch (error) {
-        console.warn('[OAuth] Failed to notify UI about OAuth requirements:', error);
-      }
-    }
 
     // Get session for reference
     const session = await this.sessionsRepo?.findById(sessionId);
@@ -362,7 +437,7 @@ export class ClaudePromptService {
         (error.name === 'AbortError' || error.message.includes('abort'))
       ) {
         console.log(
-          `🛑 [Stop] Query aborted via interrupt() for session ${sessionId.substring(0, 8)} (non-streaming) - this is expected`
+          `🛑 [Stop] Query aborted via interrupt() for session ${shortId(sessionId)} (non-streaming) - this is expected`
         );
         // Don't throw - this is a clean stop, not an error
         // Return empty result since we were stopped
@@ -397,7 +472,7 @@ export class ClaudePromptService {
    */
   async stopTask(sessionId: SessionID): Promise<{ success: boolean; reason?: string }> {
     console.log(
-      `🛑 [Deprecated] stopTask called for session ${sessionId.substring(0, 8)} - actual stop handled by AbortController`
+      `🛑 [Deprecated] stopTask called for session ${shortId(sessionId)} - actual stop handled by AbortController`
     );
     // Cancellation is now handled by AbortController passed to SDK
     // This method is kept for API compatibility

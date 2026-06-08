@@ -6,14 +6,20 @@
  * Supports hot-reload via config service updates.
  */
 
-export interface CredentialsConfig {
-  ANTHROPIC_API_KEY?: string;
-  GEMINI_API_KEY?: string;
-}
+import type { AgorCredentials } from '@agor/core/config';
+
+/**
+ * @deprecated Use AgorCredentials from @agor/core/config directly
+ */
+export type CredentialsConfig = AgorCredentials;
 
 export interface InitializedCredentials {
   anthropicApiKey?: string;
+  anthropicAuthToken?: string;
+  anthropicBaseUrl?: string;
   geminiApiKey?: string;
+  copilotGithubToken?: string;
+  cursorApiKey?: string;
 }
 
 /**
@@ -52,6 +58,50 @@ export function initializeAnthropicApiKey(
 }
 
 /**
+ * Initialize Anthropic auth token for proxy/enterprise setups
+ *
+ * Priority: config.yaml > env var
+ * Used by Claude Code SDK for token-based authentication (e.g., AWS Bedrock, OAuth proxies).
+ *
+ * @param config - Application config object with credentials
+ * @param envAuthToken - ANTHROPIC_AUTH_TOKEN from process.env
+ * @returns Resolved auth token or undefined
+ */
+export function initializeAnthropicAuthToken(
+  config: { credentials?: CredentialsConfig },
+  envAuthToken?: string
+): string | undefined {
+  if (config.credentials?.ANTHROPIC_AUTH_TOKEN && !envAuthToken) {
+    process.env.ANTHROPIC_AUTH_TOKEN = config.credentials.ANTHROPIC_AUTH_TOKEN;
+    console.log('✅ Set ANTHROPIC_AUTH_TOKEN from config for Claude Code');
+  }
+
+  return config.credentials?.ANTHROPIC_AUTH_TOKEN || envAuthToken;
+}
+
+/**
+ * Initialize Anthropic base URL for proxy/custom endpoint support
+ *
+ * Priority: config.yaml > env var
+ * Used for LiteLLM proxies, AWS Bedrock, Claude Enterprise, or compatible APIs.
+ *
+ * @param config - Application config object with credentials
+ * @param envBaseUrl - ANTHROPIC_BASE_URL from process.env
+ * @returns Resolved base URL or undefined (uses default https://api.anthropic.com)
+ */
+export function initializeAnthropicBaseUrl(
+  config: { credentials?: CredentialsConfig },
+  envBaseUrl?: string
+): string | undefined {
+  if (config.credentials?.ANTHROPIC_BASE_URL && !envBaseUrl) {
+    process.env.ANTHROPIC_BASE_URL = config.credentials.ANTHROPIC_BASE_URL;
+    console.log('✅ Set ANTHROPIC_BASE_URL from config for Claude Code');
+  }
+
+  return config.credentials?.ANTHROPIC_BASE_URL || envBaseUrl;
+}
+
+/**
  * Initialize Gemini API key with OAuth fallback support
  *
  * Priority: config.yaml > env var
@@ -87,6 +137,60 @@ export function initializeGeminiApiKey(
 }
 
 /**
+ * Initialize GitHub token for Copilot agent
+ *
+ * Priority: config.yaml > COPILOT_GITHUB_TOKEN > GH_TOKEN > GITHUB_TOKEN
+ * Used by the Copilot SDK for GitHub authentication.
+ *
+ * @param config - Application config object with credentials
+ * @param envCopilotToken - COPILOT_GITHUB_TOKEN from process.env
+ * @param envGhToken - GH_TOKEN from process.env
+ * @param envGithubToken - GITHUB_TOKEN from process.env
+ * @returns Resolved GitHub token or undefined
+ */
+export function initializeCopilotGithubToken(
+  config: { credentials?: CredentialsConfig },
+  envCopilotToken?: string,
+  envGhToken?: string,
+  envGithubToken?: string
+): string | undefined {
+  if (config.credentials?.COPILOT_GITHUB_TOKEN && !envCopilotToken) {
+    process.env.COPILOT_GITHUB_TOKEN = config.credentials.COPILOT_GITHUB_TOKEN;
+    console.log('✅ Set COPILOT_GITHUB_TOKEN from config for Copilot');
+  }
+
+  const token =
+    config.credentials?.COPILOT_GITHUB_TOKEN || envCopilotToken || envGhToken || envGithubToken;
+
+  if (!token) {
+    console.log('ℹ️  No COPILOT_GITHUB_TOKEN found - Copilot agent will not be available');
+    console.log('   To use Copilot: agor config set credentials.COPILOT_GITHUB_TOKEN <token>');
+    console.log('   Or set COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN env var');
+  }
+
+  return token;
+}
+
+/**
+ * Initialize Cursor API key for the experimental Cursor SDK provider.
+ *
+ * Priority: config.yaml > env var. Runtime support is intentionally gated
+ * elsewhere; this only keeps config/env propagation consistent with other
+ * provider credentials.
+ */
+export function initializeCursorApiKey(
+  config: { credentials?: CredentialsConfig },
+  envApiKey?: string
+): string | undefined {
+  if (config.credentials?.CURSOR_API_KEY && !envApiKey) {
+    process.env.CURSOR_API_KEY = config.credentials.CURSOR_API_KEY;
+    console.log('✅ Set CURSOR_API_KEY from config for Cursor SDK');
+  }
+
+  return config.credentials?.CURSOR_API_KEY || envApiKey;
+}
+
+/**
  * Initialize all AI service credentials
  *
  * Convenience function to initialize all supported API keys at once.
@@ -99,6 +203,15 @@ export function initializeCredentials(config: {
 }): InitializedCredentials {
   return {
     anthropicApiKey: initializeAnthropicApiKey(config, process.env.ANTHROPIC_API_KEY),
+    anthropicAuthToken: initializeAnthropicAuthToken(config, process.env.ANTHROPIC_AUTH_TOKEN),
+    anthropicBaseUrl: initializeAnthropicBaseUrl(config, process.env.ANTHROPIC_BASE_URL),
     geminiApiKey: initializeGeminiApiKey(config, process.env.GEMINI_API_KEY),
+    copilotGithubToken: initializeCopilotGithubToken(
+      config,
+      process.env.COPILOT_GITHUB_TOKEN,
+      process.env.GH_TOKEN,
+      process.env.GITHUB_TOKEN
+    ),
+    cursorApiKey: initializeCursorApiKey(config, process.env.CURSOR_API_KEY),
   };
 }

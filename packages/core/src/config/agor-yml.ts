@@ -1,141 +1,108 @@
 /**
- * .agor.yml Configuration Parser
+ * `.agor.yml` file I/O.
  *
- * Parses and writes `.agor.yml` files from repository roots.
- * Supports environment configuration with template variables.
+ * Thin Node-only wrapper that reads/writes `.agor.yml` files from a
+ * repository root and delegates all parsing, schema validation, and variant
+ * resolution to the browser-safe `variant-resolver` module. Kept separate so
+ * UI callers don't transitively pull in `node:fs`.
+ *
+ * Schema support (see `variant-resolver.ts`):
+ *   - v2 (preferred): named `environment.variants.<name>` with a `default`.
+ *   - v1 (legacy): flat `environment.{start,stop,...}` — wrapped into
+ *     `variants.default` at parse time so callers always get v2.
+ *
+ * YAML parsing/emission goes through `@agor/core/yaml` (js-yaml re-export)
+ * so the dep stays centralized in core.
+ *
+ * See `docs/designs/env-command-variants.md`.
  */
 
 import fs from 'node:fs';
-import yaml from 'js-yaml';
-import type { RepoEnvironmentConfig } from '../types/worktree';
+import type {
+  RepoEnvironment,
+  RepoEnvironmentConfigV1,
+  RepoEnvironmentVariant,
+} from '../types/branch';
+import * as yaml from '../yaml/index.js';
+import {
+  type AgorYmlSchema,
+  parseAgorYmlString,
+  resolveVariant,
+  resolveVariantOrThrow,
+  validateAgorYmlSchema,
+  validateExtends,
+  validateRepoEnvironment,
+  type YamlVariant,
+} from './variant-resolver.js';
+
+// Re-export the canonical pure logic so existing imports from this module
+// (daemon, CLI) keep working without touching call sites.
+export {
+  type AgorYmlSchema,
+  parseAgorYmlString,
+  resolveVariant,
+  resolveVariantOrThrow,
+  validateAgorYmlSchema,
+  validateExtends,
+  validateRepoEnvironment,
+  type YamlVariant,
+};
 
 /**
- * .agor.yml file schema
+ * Parse `.agor.yml` from a file path into a v2 {@link RepoEnvironment}.
  *
- * Example:
- * ```yaml
- * environment:
- *   start: "docker compose -p {{worktree.name}} up -d"
- *   stop: "docker compose -p {{worktree.name}} down"
- *   nuke: "docker compose -p {{worktree.name}} down -v"
- *   health: "http://localhost:{{add 9000 worktree.unique_id}}/health"
- *   app: "http://localhost:{{add 5000 worktree.unique_id}}"
- *   logs: "docker compose -p {{worktree.name}} logs --tail=100"
- * ```
+ * @param filePath - Absolute path to `.agor.yml` file
+ * @returns Parsed v2 environment, or null if file doesn't exist / has no
+ *          `environment:` block
+ * @throws Error if file exists but has invalid YAML, invalid schema,
+ *         `template_overrides:` at any level, or broken `extends` references.
  */
-export interface AgorYmlSchema {
-  environment?: {
-    start?: string;
-    stop?: string;
-    nuke?: string;
-    health?: string;
-    app?: string;
-    logs?: string;
-  };
-}
-
-/**
- * Parse .agor.yml from a file path
- *
- * @param filePath - Absolute path to .agor.yml file
- * @returns Parsed RepoEnvironmentConfig or null if file doesn't exist
- * @throws Error if file exists but has invalid YAML or schema
- */
-export function parseAgorYml(filePath: string): RepoEnvironmentConfig | null {
-  // Check if file exists
+export function parseAgorYml(filePath: string): RepoEnvironment | null {
   if (!fs.existsSync(filePath)) {
     return null;
   }
-
-  // Read file
   const content = fs.readFileSync(filePath, 'utf-8');
-
-  // Parse YAML
-  let parsed: unknown;
-  try {
-    parsed = yaml.load(content);
-  } catch (error) {
-    throw new Error(
-      `Invalid YAML syntax in .agor.yml: ${error instanceof Error ? error.message : String(error)}`
-    );
-  }
-
-  // Validate schema
-  if (typeof parsed !== 'object' || parsed === null) {
-    throw new Error('.agor.yml must contain an object');
-  }
-
-  const schema = parsed as AgorYmlSchema;
-
-  // No environment config = return null
-  if (!schema.environment) {
-    return null;
-  }
-
-  const env = schema.environment;
-
-  // Validate required fields
-  if (!env.start || !env.stop) {
-    throw new Error('.agor.yml environment config must have "start" and "stop" commands');
-  }
-
-  // Build RepoEnvironmentConfig
-  const config: RepoEnvironmentConfig = {
-    up_command: env.start,
-    down_command: env.stop,
-  };
-
-  // Add optional fields
-  if (env.nuke) {
-    config.nuke_command = env.nuke;
-  }
-
-  if (env.health) {
-    config.health_check = {
-      type: 'http',
-      url_template: env.health,
-    };
-  }
-
-  if (env.app) {
-    config.app_url_template = env.app;
-  }
-
-  if (env.logs) {
-    config.logs_command = env.logs;
-  }
-
-  return config;
+  return parseAgorYmlString(content);
 }
 
 /**
- * Write RepoEnvironmentConfig to .agor.yml file
+ * Serialize a v2 {@link RepoEnvironment} to a v2 `.agor.yml` file.
  *
- * @param filePath - Absolute path to .agor.yml file
- * @param config - Repository environment configuration
- * @throws Error if unable to write file
+ * - Always writes v2 (named variants + `default`).
+ * - `template_overrides` is always stripped (it is DB-only).
+ * - Undefined per-variant fields are omitted for cleaner output.
+ *
+ * Accepts either a v2 environment or the legacy v1 config; v1 is wrapped
+ * as `variants.default` before writing.
  */
-export function writeAgorYml(filePath: string, config: RepoEnvironmentConfig): void {
+export function writeAgorYml(
+  filePath: string,
+  config: RepoEnvironment | RepoEnvironmentConfigV1
+): void {
+  const env = isV2(config) ? config : wrapV1(config);
+
+  const variantsYaml: Record<string, YamlVariant> = {};
+  for (const [name, v] of Object.entries(env.variants)) {
+    const entry: YamlVariant = {
+      start: v.start,
+      stop: v.stop,
+    };
+    if (v.description) entry.description = v.description;
+    if (v.extends) entry.extends = v.extends;
+    if (v.nuke) entry.nuke = v.nuke;
+    if (v.logs) entry.logs = v.logs;
+    if (v.health) entry.health = v.health;
+    if (v.app) entry.app = v.app;
+    variantsYaml[name] = entry;
+  }
+
   const schema: AgorYmlSchema = {
     environment: {
-      start: config.up_command,
-      stop: config.down_command,
-      nuke: config.nuke_command,
-      health: config.health_check?.url_template,
-      app: config.app_url_template,
-      logs: config.logs_command,
+      default: env.default,
+      variants: variantsYaml,
     },
   };
 
-  // Remove undefined fields for cleaner output
-  if (schema.environment) {
-    if (!schema.environment.nuke) delete schema.environment.nuke;
-    if (!schema.environment.health) delete schema.environment.health;
-    if (!schema.environment.app) delete schema.environment.app;
-    if (!schema.environment.logs) delete schema.environment.logs;
-  }
-
-  // Convert to YAML
   const yamlContent = yaml.dump(schema, {
     indent: 2,
     lineWidth: 100,
@@ -143,7 +110,6 @@ export function writeAgorYml(filePath: string, config: RepoEnvironmentConfig): v
     forceQuotes: false,
   });
 
-  // Write to file
   try {
     fs.writeFileSync(filePath, yamlContent, 'utf-8');
   } catch (error) {
@@ -151,4 +117,24 @@ export function writeAgorYml(filePath: string, config: RepoEnvironmentConfig): v
       `Failed to write .agor.yml: ${error instanceof Error ? error.message : String(error)}`
     );
   }
+}
+
+function isV2(c: RepoEnvironment | RepoEnvironmentConfigV1): c is RepoEnvironment {
+  return (c as RepoEnvironment).version === 2 && (c as RepoEnvironment).variants !== undefined;
+}
+
+function wrapV1(v1: RepoEnvironmentConfigV1): RepoEnvironment {
+  const variant: RepoEnvironmentVariant = {
+    start: v1.up_command,
+    stop: v1.down_command,
+  };
+  if (v1.nuke_command) variant.nuke = v1.nuke_command;
+  if (v1.logs_command) variant.logs = v1.logs_command;
+  if (v1.app_url_template) variant.app = v1.app_url_template;
+  if (v1.health_check?.url_template) variant.health = v1.health_check.url_template;
+  return {
+    version: 2,
+    default: 'default',
+    variants: { default: variant },
+  };
 }

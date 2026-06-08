@@ -9,10 +9,9 @@
  * - Groups 3+ sequential tool-only messages into ToolBlock
  */
 
-import type { AgorClient } from '@agor/core/api';
+import type { AgorClient, StreamingMessageState } from '@agor-live/client';
 import {
   type Message,
-  type MessageID,
   MessageRole,
   type PermissionRequestContent,
   type PermissionScope,
@@ -21,9 +20,8 @@ import {
   type Task,
   TaskStatus,
   type User,
-} from '@agor/core/types';
+} from '@agor-live/client';
 // TODO: Move normalization to DB or daemon API
-// import { normalizeRawSdkResponse } from '@agor/core/utils/sdk-normalizer';
 import {
   DownOutlined,
   FileTextOutlined,
@@ -34,29 +32,25 @@ import {
 import { Bubble } from '@ant-design/x';
 import { Collapse, Flex, Spin, Typography, theme } from 'antd';
 import React, { useMemo } from 'react';
-import type { StreamingMessage } from '../../hooks/useStreamingMessages';
-import { useTaskEvents } from '../../hooks/useTaskEvents';
-import { useTaskMessages } from '../../hooks/useTaskMessages';
 import { getContextWindowGradient } from '../../utils/contextWindow';
 import { AgentChain } from '../AgentChain';
 import { AgorAvatar } from '../AgorAvatar';
 import { CompactionBlock } from '../CompactionBlock';
+import { CopyableContent } from '../CopyableContent';
 import { MessageBlock } from '../MessageBlock';
 import { CreatedByTag } from '../metadata/CreatedByTag';
 import {
   ContextWindowPill,
   GitStatePill,
-  MessageCountPill,
   ModelPill,
   ScheduledRunPill,
   TimerPill,
   TokenCountPill,
-  ToolCountPill,
 } from '../Pill';
+import { RateLimitBlock } from '../RateLimitBlock';
 import { StickyTodoRenderer } from '../StickyTodoRenderer';
 import { Tag } from '../Tag';
 import { TaskStatusIcon } from '../TaskStatusIcon';
-import ToolExecutingIndicator from '../ToolExecutingIndicator';
 import { ToolIcon } from '../ToolIcon';
 
 const { Paragraph } = Typography;
@@ -71,13 +65,17 @@ type Block =
 
 interface TaskBlockProps {
   task: Task;
-  client: AgorClient | null;
   agentic_tool?: string;
   sessionModel?: string;
   userById?: Map<string, User>;
   currentUserId?: string;
   isExpanded: boolean;
-  onExpandChange: (expanded: boolean) => void;
+  /**
+   * Called when the user toggles this task's expand state. Receives the
+   * `taskId` so the parent can use a single stable callback shared across
+   * every TaskBlock — see ConversationView's `handleTaskExpandChange`.
+   */
+  onExpandChange: (taskId: string, expanded: boolean) => void;
   sessionId?: SessionID | null;
   onPermissionDecision?: (
     sessionId: string,
@@ -86,16 +84,32 @@ interface TaskBlockProps {
     allow: boolean,
     scope: PermissionScope
   ) => void;
-  worktreeName?: string;
-  scheduledFromWorktree?: boolean;
+  branchName?: string;
+  scheduledFromBranch?: boolean;
   scheduledRunAt?: number;
-  streamingMessages?: Map<MessageID, StreamingMessage>;
+  streamingMessages?: Map<string, StreamingMessageState>;
+  taskMessages: Message[];
+  taskMessagesLoaded: boolean;
+  onLoadTaskMessages: (taskId: string) => Promise<void> | void;
+  onUnloadTaskMessages: (taskId: string) => void;
+  assistantEmoji?: string;
+  /** Authenticated Feathers client, forwarded to MessageBlock → WidgetBlock for inline submission. */
+  client?: AgorClient | null;
+  /** Whether this is the most recent task in the session */
+  isLatestTask?: boolean;
 }
 
 /**
- * Check if message contains ONLY tools/thinking/tool-results (no user-facing text)
- * Returns true if message should be in AgentChain, false if it should be a regular message bubble
+ * Check if a system message is an SDK status event (rate limit, API wait, or other SDK event).
+ * These render via RateLimitBlock instead of the regular MessageBlock.
  */
+function isSdkStatusMessage(message: Message): boolean {
+  if (message.role !== MessageRole.SYSTEM || !Array.isArray(message.content)) return false;
+  return message.content.some(
+    (b) => b.type === 'rate_limit' || b.type === 'api_wait' || b.type === 'sdk_event'
+  );
+}
+
 function isAgentChainMessage(message: Message): boolean {
   // EXCEPTION: User messages with ONLY tool_result blocks are part of agent execution
   // (tool results are technically "user" role per Anthropic API, but they're automated responses)
@@ -334,7 +348,6 @@ function groupMessagesIntoBlocks(messages: Message[]): Block[] {
 export const TaskBlock = React.memo<TaskBlockProps>(
   ({
     task,
-    client,
     agentic_tool,
     sessionModel,
     userById = new Map(),
@@ -343,22 +356,39 @@ export const TaskBlock = React.memo<TaskBlockProps>(
     onExpandChange,
     sessionId,
     onPermissionDecision,
-    worktreeName,
-    scheduledFromWorktree,
+    branchName,
+    scheduledFromBranch,
     scheduledRunAt,
     streamingMessages,
+    taskMessages,
+    taskMessagesLoaded,
+    onLoadTaskMessages,
+    onUnloadTaskMessages,
+    assistantEmoji,
+    isLatestTask = false,
+    client = null,
   }) => {
     const { token } = theme.useToken();
 
-    // Track real-time tool executions for this task
-    const { toolsExecuting } = useTaskEvents(client, task.task_id);
+    const [reactiveMessagesLoading, setReactiveMessagesLoading] = React.useState(false);
 
-    // Fetch messages for this task (only when expanded)
-    const { messages: taskMessages, loading: messagesLoading } = useTaskMessages(
-      client,
-      task.task_id,
-      isExpanded
-    );
+    React.useEffect(() => {
+      if (isExpanded) {
+        if (!taskMessagesLoaded) {
+          setReactiveMessagesLoading(true);
+          Promise.resolve(onLoadTaskMessages(task.task_id))
+            .catch((error) => {
+              console.error('[TaskBlock] Failed to load task messages:', error);
+            })
+            .finally(() => {
+              setReactiveMessagesLoading(false);
+            });
+        }
+      } else if (onUnloadTaskMessages && taskMessagesLoaded) {
+        onUnloadTaskMessages(task.task_id);
+      }
+    }, [isExpanded, onLoadTaskMessages, onUnloadTaskMessages, task.task_id, taskMessagesLoaded]);
+    const messagesLoading = reactiveMessagesLoading && !taskMessagesLoaded;
 
     // Convert streaming messages map to array once the reference changes
     const streamingForTask = useMemo(
@@ -381,16 +411,14 @@ export const TaskBlock = React.memo<TaskBlockProps>(
     // Group messages into blocks
     const blocks = useMemo(() => groupMessagesIntoBlocks(messages), [messages]);
 
-    // Calculate message count from task message_range
-    const messageCount = task.message_range.end_index - task.message_range.start_index + 1;
-
-    // Calculate tool count (hybrid approach)
-    // - For completed tasks: use stored count (no messages needed)
-    // - For running tasks: calculate from loaded messages (live count)
-    const toolCount =
-      task.status === TaskStatus.COMPLETED
-        ? task.tool_use_count
-        : messages.reduce((sum, msg) => sum + (msg.tool_uses?.length || 0), 0);
+    // Index of the last agent-chain block — used for isLatest so that a streaming
+    // text bubble appearing after the chain doesn't prematurely collapse it
+    const lastAgentChainIndex = useMemo(() => {
+      for (let i = blocks.length - 1; i >= 0; i--) {
+        if (blocks[i].type === 'agent-chain') return i;
+      }
+      return -1;
+    }, [blocks]);
 
     // Get normalized SDK response (computed by executor, stored in DB)
     const normalized = task.normalized_sdk_response || null;
@@ -399,7 +427,11 @@ export const TaskBlock = React.memo<TaskBlockProps>(
     // If undefined, it means the backend computation failed or hasn't run yet
     const contextWindowUsed = task.computed_context_window ?? 0;
     const contextWindowLimit = normalized?.contextWindowLimit ?? 200000;
-    const taskHeaderGradient = getContextWindowGradient(contextWindowUsed, contextWindowLimit);
+    const taskHeaderGradient = getContextWindowGradient(
+      contextWindowUsed,
+      contextWindowLimit,
+      normalized?.contextUsageSnapshot
+    );
 
     // Task header shows when collapsed
     const taskHeader = (
@@ -421,11 +453,28 @@ export const TaskBlock = React.memo<TaskBlockProps>(
 
         {/* Right column: Content */}
         <Flex vertical flex={1} style={{ minWidth: 0 }}>
-          <Typography.Text ellipsis style={{ marginBottom: token.sizeUnit }}>
-            {typeof task.description === 'string'
-              ? task.description || 'User Prompt'
-              : 'User Prompt'}
-          </Typography.Text>
+          {/* Full prompt rendered with one-line CSS ellipsis. The complete
+              text stays in the DOM so users can recover it via the
+              copy-overlay (matches MessageBlock's pattern) — no tooltip,
+              which got in the way of normal hover behavior. */}
+          <CopyableContent
+            textContent={task.full_prompt || ''}
+            // Default offsets place the icon outside the wrapper, but the
+            // task header has rounded corners with overflow:hidden which
+            // clips it. Pull the icon inside the prompt row instead.
+            copyButtonOffset={{ top: 0, right: 0 }}
+          >
+            <Typography.Text
+              ellipsis
+              style={{
+                marginBottom: token.sizeUnit,
+                display: 'block',
+                paddingRight: token.sizeUnit * 3,
+              }}
+            >
+              {task.full_prompt || 'User Prompt'}
+            </Typography.Text>
+          </CopyableContent>
 
           {/* Task metadata */}
           <Flex wrap gap={token.sizeUnit}>
@@ -439,9 +488,9 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                   : undefined)
               }
               durationMs={task.duration_ms}
-              tooltip="Task runtime"
+              lastExecutorHeartbeatAt={task.last_executor_heartbeat_at}
             />
-            {scheduledFromWorktree && scheduledRunAt && (
+            {scheduledFromBranch && scheduledRunAt && (
               <ScheduledRunPill scheduledRunAt={scheduledRunAt} />
             )}
             {task.created_by && (
@@ -452,8 +501,6 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                 prefix="By"
               />
             )}
-            <MessageCountPill count={messageCount} />
-            <ToolCountPill count={toolCount} />
             {normalized && (
               <TokenCountPill
                 count={normalized.tokenUsage.totalTokens}
@@ -472,6 +519,7 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                   duration_ms: task.duration_ms,
                   agentic_tool,
                   raw_sdk_response: task.raw_sdk_response,
+                  normalized_sdk_response: normalized ?? undefined,
                 }}
               />
             )}
@@ -481,7 +529,7 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                 <GitStatePill
                   branch={task.git_state.ref_at_start}
                   sha={task.git_state.sha_at_start}
-                  worktreeName={worktreeName}
+                  branchName={branchName}
                   style={{ fontSize: 11 }}
                 />
                 {task.git_state.sha_at_end &&
@@ -493,7 +541,7 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                       </Typography.Text>
                       <GitStatePill
                         sha={task.git_state.sha_at_end}
-                        worktreeName={worktreeName}
+                        branchName={branchName}
                         showDirtyIndicator={true}
                         style={{ fontSize: 11 }}
                       />
@@ -514,7 +562,7 @@ export const TaskBlock = React.memo<TaskBlockProps>(
     return (
       <Collapse
         activeKey={isExpanded ? ['task-content'] : []}
-        onChange={(keys) => onExpandChange(keys.length > 0)}
+        onChange={(keys) => onExpandChange(task.task_id, keys.length > 0)}
         expandIcon={() => null}
         style={{ background: 'transparent', margin: `${token.sizeUnit * 3}px 0` }}
         items={[
@@ -570,6 +618,17 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                         }
                       }
 
+                      // Render SDK status messages (rate limit, API wait, etc.) with dedicated component
+                      if (isSdkStatusMessage(block.message)) {
+                        return (
+                          <RateLimitBlock
+                            key={block.message.message_id}
+                            message={block.message}
+                            agentic_tool={agentic_tool}
+                          />
+                        );
+                      }
+
                       // Check if this is the latest agent message (last message block)
                       const isLatestMessage =
                         block.message.role === MessageRole.ASSISTANT &&
@@ -588,14 +647,22 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                           isFirstPendingPermission={isFirstPending}
                           isLatestMessage={isLatestMessage}
                           taskId={task.task_id}
-                          allMessages={messages}
+                          assistantEmoji={assistantEmoji}
+                          client={client}
                         />
                       );
                     }
                     if (block.type === 'agent-chain') {
                       // Use first message ID as key for agent chain
                       const blockKey = `agent-chain-${block.messages[0]?.message_id || 'unknown'}`;
-                      return <AgentChain key={blockKey} messages={block.messages} />;
+                      return (
+                        <AgentChain
+                          key={blockKey}
+                          messages={block.messages}
+                          isTaskRunning={task.status === TaskStatus.RUNNING}
+                          isLatest={isLatestTask && blockIndex === lastAgentChainIndex}
+                        />
+                      );
                     }
                     if (block.type === 'compaction') {
                       // Render compaction block with aggregated messages
@@ -611,15 +678,8 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                     return null;
                   })}
 
-                {/* Show tool execution indicators when tools are running */}
-                {toolsExecuting.length > 0 && (
-                  <div style={{ margin: `${token.sizeUnit * 1.5}px 0` }}>
-                    <ToolExecutingIndicator toolsExecuting={toolsExecuting} />
-                  </div>
-                )}
-
-                {/* Show sticky TODO (latest) above typing indicator when task is running */}
-                {task.status === TaskStatus.RUNNING && <StickyTodoRenderer messages={messages} />}
+                {/* Keep latest TODO visible even after completion (Claude parity). */}
+                <StickyTodoRenderer messages={messages} taskStatus={task.status} />
 
                 {/* Show typing indicator whenever task is actively running */}
                 {task.status === TaskStatus.RUNNING && (
@@ -627,7 +687,9 @@ export const TaskBlock = React.memo<TaskBlockProps>(
                     <Bubble
                       placement="start"
                       avatar={
-                        agentic_tool ? (
+                        assistantEmoji ? (
+                          <AgorAvatar>{assistantEmoji}</AgorAvatar>
+                        ) : agentic_tool ? (
                           <ToolIcon tool={agentic_tool} size={32} />
                         ) : (
                           <AgorAvatar

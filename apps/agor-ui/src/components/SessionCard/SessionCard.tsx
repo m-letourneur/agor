@@ -1,4 +1,4 @@
-import type { Session, Task, User } from '@agor/core/types';
+import type { Session, Task, User } from '@agor-live/client';
 import {
   BranchesOutlined,
   CloseOutlined,
@@ -12,6 +12,7 @@ import {
 } from '@ant-design/icons';
 import { App, Button, Card, Collapse, Space, Typography } from 'antd';
 import { useConnectionDisabled } from '../../contexts/ConnectionContext';
+import { parseGitStateSha } from '../../utils/gitState';
 import { getSessionDisplayTitle, getSessionTitleStyles } from '../../utils/sessionTitle';
 import { CreatedByTag } from '../metadata';
 import { Tag } from '../Tag';
@@ -23,7 +24,7 @@ const SESSION_CARD_MAX_WIDTH = 560;
 
 interface SessionCardProps {
   session: Session;
-  tasks?: Task[]; // Optional - will be fetched via useTasks if not provided
+  tasks?: Task[]; // Optional snapshot passed by parent
   userById: Map<string, User>;
   currentUserId?: string;
   onTaskClick?: (taskId: string) => void;
@@ -39,7 +40,7 @@ interface SessionCardProps {
 
 const SessionCard = ({
   session,
-  tasks = [], // Default to empty array - tasks fetching will be added later via useTasks
+  tasks = [], // Default empty snapshot
   userById,
   currentUserId,
   onTaskClick,
@@ -75,9 +76,7 @@ const SessionCard = ({
   const isForked = !!session.genealogy.forked_from_session_id;
   const isSpawned = !!session.genealogy.parent_session_id;
 
-  // Check if git state is dirty
-  const isDirty = session.git_state.current_sha.endsWith('-dirty');
-  const cleanSha = session.git_state.current_sha.replace('-dirty', '');
+  const { cleanSha, isDirty } = parseGitStateSha(session.git_state.current_sha);
 
   // Task list collapse header (just the "Tasks" label)
   const taskListHeader = (
@@ -154,11 +153,15 @@ const SessionCard = ({
 
         <Space size={4}>
           <div className="nodrag">
-            {isForked && (
+            {isForked && session.fork_origin === 'btw' ? (
+              <Tag icon={<ForkOutlined />} color="orange">
+                BTW
+              </Tag>
+            ) : isForked ? (
               <Tag icon={<ForkOutlined />} color="cyan">
                 FORK
               </Tag>
-            )}
+            ) : null}
             {isSpawned && (
               <Tag icon={<BranchesOutlined />} color="purple">
                 SPAWN
@@ -301,12 +304,8 @@ const SessionCard = ({
           style={{ marginTop: 8 }}
         />
 
-        {/* Footer metadata - always visible */}
-        <div style={{ marginTop: 12 }}>
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            💬 {session.message_count} messages
-          </Typography.Text>
-        </div>
+        {/* Footer spacer */}
+        <div style={{ marginTop: 12 }} />
       </div>
     </Card>
   );

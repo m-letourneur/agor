@@ -10,7 +10,7 @@
 # ============================================================================
 # Stage 1: Shared Base (dev and prod both use this)
 # ============================================================================
-FROM node:20-slim AS base
+FROM node:22-slim AS base
 
 # Install system dependencies (including git for repo cloning)
 RUN apt-get update && apt-get install -y \
@@ -30,6 +30,7 @@ RUN apt-get update && apt-get install -y \
   tree \
   openssh-server \
   acl \
+  ripgrep \
   && rm -rf /var/lib/apt/lists/*
 
 # Configure SSH server for multi-user testing (used in postgres profile)
@@ -60,10 +61,10 @@ RUN curl -fsSL "$(curl -s https://api.github.com/repos/cli/cli/releases/latest |
 # NOTE: Update these versions when upgrading Agor SDKs (see packages/core/package.json)
 RUN npm install -g \
   pnpm@9.15.1 \
-  @anthropic-ai/claude-code@2.1.33 \
-  @google/gemini-cli@0.27.2 \
-  @openai/codex@0.98.0 \
-  opencode-ai@1.1.53
+  @anthropic-ai/claude-code@2.1.154 \
+  @google/gemini-cli@0.31.0 \
+  @openai/codex@0.135.0 \
+  opencode-ai@1.2.15
 
 # Arguments for matching host user UID/GID (default to 1000)
 ARG UID=1000
@@ -115,6 +116,7 @@ COPY apps/agor-cli/package.json ./apps/agor-cli/
 COPY apps/agor-ui/package.json ./apps/agor-ui/
 COPY packages/core/package.json ./packages/core/
 COPY packages/executor/package.json ./packages/executor/
+COPY packages/client/package.json ./packages/client/
 
 # Install dependencies as agor user (cached in Docker layer)
 # This creates node_modules with correct platform binaries for container

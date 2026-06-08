@@ -5,9 +5,16 @@
  * Wraps @agor/core/config functions for UI access.
  */
 
-import { type AgorConfig, loadConfig, resolveApiKey, saveConfig } from '@agor/core/config';
+import {
+  type AgorConfig,
+  type ApiKeyName,
+  loadConfig,
+  resolveApiKey,
+  saveConfig,
+} from '@agor/core/config';
 import type { Database } from '@agor/core/db';
-import type { Params, TaskID, UserID } from '@agor/core/types';
+import type { Application } from '@agor/core/feathers';
+import type { AgenticToolName, Params, TaskID, UserID } from '@agor/core/types';
 
 /**
  * Mask API keys for secure display
@@ -28,6 +35,7 @@ function maskCredentials(config: AgorConfig): AgorConfig {
     ...config,
     credentials: {
       ANTHROPIC_API_KEY: maskApiKey(config.credentials.ANTHROPIC_API_KEY),
+      ANTHROPIC_AUTH_TOKEN: maskApiKey(config.credentials.ANTHROPIC_AUTH_TOKEN),
       ANTHROPIC_BASE_URL: config.credentials.ANTHROPIC_BASE_URL,
       OPENAI_API_KEY: maskApiKey(config.credentials.OPENAI_API_KEY),
       GEMINI_API_KEY: maskApiKey(config.credentials.GEMINI_API_KEY),
@@ -40,6 +48,8 @@ function maskCredentials(config: AgorConfig): AgorConfig {
  */
 export class ConfigService {
   private db: Database;
+  /** App reference injected after registration for cross-service calls */
+  app?: Application;
 
   constructor(db: Database) {
     this.db = db;
@@ -83,19 +93,27 @@ export class ConfigService {
    *
    * Called via: client.service('config').resolveApiKey({ taskId, keyName })
    */
-  async resolveApiKey(data: { taskId: TaskID; keyName: string }): Promise<{
+  async resolveApiKey(data: {
+    taskId: TaskID;
+    keyName: string;
+    /**
+     * Restrict the per-user lookup to this tool's credential bucket. Executors
+     * always pass this; absent it, the resolver falls back to a cross-tool
+     * sweep (legacy behavior preserved for non-SDK callers).
+     */
+    tool?: AgenticToolName;
+  }): Promise<{
     apiKey: string | null;
     source: 'user' | 'config' | 'env' | 'native';
     useNativeAuth: boolean;
     decryptionFailed?: boolean;
   }> {
-    const { taskId, keyName } = data;
+    const { taskId, keyName, tool } = data;
 
     // Fetch task to get creator user ID
     let userId: UserID | undefined;
     try {
-      // biome-ignore lint/suspicious/noExplicitAny: App reference stored dynamically for cross-service calls
-      const tasksService = (this as any).app?.service('tasks');
+      const tasksService = this.app?.service('tasks');
       if (tasksService) {
         const task = await tasksService.get(taskId, { provider: undefined });
         userId = task?.created_by;
@@ -105,10 +123,10 @@ export class ConfigService {
     }
 
     // Use core resolveApiKey with database access
-    // biome-ignore lint/suspicious/noExplicitAny: ApiKeyName type check happens at runtime
-    const result = await resolveApiKey(keyName as any, {
+    const result = await resolveApiKey(keyName as ApiKeyName, {
       userId,
       db: this.db,
+      tool,
     });
 
     // Map KeyResolutionResult to service response type
@@ -126,7 +144,12 @@ export class ConfigService {
    * SECURITY: Only allow updating credentials and opencode sections from UI
    */
   async patch(_id: null, data: Partial<AgorConfig>, _params?: Params): Promise<AgorConfig> {
-    console.log('[Config Service] Patch received:', JSON.stringify(data, null, 2));
+    // Log patch keys without values to avoid leaking secrets
+    const patchSections = Object.keys(data);
+    const credentialKeys = data.credentials ? Object.keys(data.credentials) : [];
+    console.log(
+      `[Config Service] Patch received: sections=[${patchSections}] credential_keys=[${credentialKeys}]`
+    );
     const config = await loadConfig();
 
     // Only allow updating credentials section for security
@@ -169,30 +192,15 @@ export class ConfigService {
       if (!config.onboarding) {
         config.onboarding = {};
       }
+      if (data.onboarding.assistantPending !== undefined) {
+        config.onboarding.assistantPending = data.onboarding.assistantPending;
+      }
+      // Backward compat: also handle legacy field name
       if (data.onboarding.persistedAgentPending !== undefined) {
-        config.onboarding.persistedAgentPending = data.onboarding.persistedAgentPending;
+        config.onboarding.assistantPending = data.onboarding.persistedAgentPending;
       }
       if (data.onboarding.frameworkRepoUrl !== undefined) {
         config.onboarding.frameworkRepoUrl = data.onboarding.frameworkRepoUrl;
-      }
-    }
-
-    // Allow updating codex configuration
-    if (data.codex) {
-      if (!config.codex) {
-        config.codex = {};
-      }
-
-      if (data.codex.home !== undefined) {
-        const home = data.codex.home;
-        if (home === null || home === '') {
-          // Treat empty string as unset
-          delete config.codex.home;
-        } else if (typeof home === 'string') {
-          config.codex.home = home;
-        } else {
-          throw new Error('codex.home must be a string');
-        }
       }
     }
 

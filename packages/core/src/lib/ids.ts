@@ -1,43 +1,50 @@
 /**
  * ID Management Utilities
  *
- * Agor uses UUIDv4 (random) for all entity identifiers.
- * This module provides generation, validation, and resolution utilities.
- *
- * Why UUIDv4 instead of UUIDv7?
- * - UUIDv7 has timestamp prefix → first 8 chars identical for ~65 seconds
- * - UUIDv4 is fully random → 8-char short IDs work perfectly (like Git)
- * - Database performance difference is negligible at our scale
+ * Agor uses UUIDv7 (time-ordered) for all entity identifiers, per
+ * context/concepts/id-management.md.
  *
  * Key concepts:
  * - Full UUIDs stored in database (36 chars)
- * - Short IDs displayed to users (8 chars, Git-style)
- * - Git-style collision resolution (expand prefix when ambiguous)
+ * - Short IDs displayed to users — always 20 hex chars via `shortId(id)`.
+ *   See `SHORT_ID_LENGTH` in `../types/id` for the collision math.
+ * - Git-style collision resolution on user input (expand prefix when
+ *   ambiguous) — handled centrally by `resolveByShortIdPrefix` in
+ *   `db/repositories/base.ts`.
  *
  * @see context/concepts/id-management.md
  */
 
-import { v4 as uuidv4 } from 'uuid';
+import { randomBytes } from 'node:crypto';
+import { v7 as uuidv7 } from 'uuid';
+import {
+  findByShortIdPrefix,
+  SHORT_ID_LENGTH,
+  shortId,
+  toShortId,
+  URL_SHORT_ID_LENGTH,
+} from '../types/id';
+
+export { findByShortIdPrefix, SHORT_ID_LENGTH, shortId, toShortId, URL_SHORT_ID_LENGTH };
 
 // ============================================================================
 // Types
 // ============================================================================
 
 /**
- * UUIDv4 identifier (36 characters including hyphens)
+ * UUIDv7 identifier (36 characters including hyphens)
  *
- * Format: 550e8400-e29b-41d4-a716-446655440000
- * - Fully random (122 bits of randomness)
- * - Version 4 (random) in version field
- * - Excellent for 8-char short IDs (like Git commit hashes)
+ * Format: 01933e4a-7b89-7c35-a8f3-9d2e1c4b5a6f
+ * - First 48 bits = Unix timestamp (ms precision)
+ * - Time-ordered (sortable by creation time)
+ * - Version 7 (time-ordered random) in version field
  */
 export type UUID = string & { readonly __brand: 'UUID' };
 
 /**
- * Short ID prefix (8-16 characters, no hyphens)
- *
- * Used for display and user input.
- * Example: "01933e4a" (8 chars) or "01933e4a7b89" (12 chars)
+ * Short ID prefix — hex, no hyphens, `SHORT_ID_LENGTH` chars when emitted by
+ * `shortId(id)`. May be shorter on inputs from users (CLI args, URL params),
+ * which are resolved through the centralized ambiguity-throwing resolver.
  */
 export type ShortID = string;
 
@@ -51,21 +58,40 @@ export type IDPrefix = string;
 // ============================================================================
 
 /**
- * Generate a new UUIDv4 identifier.
+ * Generate a new UUIDv7 identifier with full per-call entropy.
  *
- * UUIDv4 provides:
- * - Global uniqueness (2^122 possible values)
- * - Fully random (no timestamp clustering)
- * - Perfect for Git-style 8-char short IDs
+ * Why this isn't a bare `uuid.v7()` call:
  *
- * @returns A new UUIDv4 string
+ * The `uuid@14` package's default `v7()` implements RFC 9562 **method 1** —
+ * a per-millisecond-initialized monotonic counter (`seq`) that's encoded
+ * into bytes 6–10. Without our intervention, *only bytes 11–15 (the last
+ * 10 hex chars) are truly random per call* within a single millisecond.
+ * A 24-char display prefix would carry ~10 bits of per-call entropy —
+ * 50% birthday collision at ~32 same-ms IDs — the bug this whole effort
+ * exists to prevent (see "Child session 019e372a has completed").
+ *
+ * Passing `{ random: randomBytes(16) }` bypasses the library's `_state`
+ * machine entirely: bytes 6–15 are derived from the fresh random bytes we
+ * supply, giving us RFC 9562 **method 3** behavior (74 bits of per-call
+ * entropy). A 24-char prefix now carries ~42 random bits per ms (~2.5M
+ * same-ms IDs before 50% birthday collision) — past any realistic Agor
+ * workload by orders of magnitude.
+ *
+ * Trade-off: we give up the library's strict sub-millisecond `seq`
+ * ordering. Ms-resolution time-ordering on the timestamp prefix
+ * (bytes 0–5) is preserved, so DB index locality and "ORDER BY id ASC ≈
+ * insertion order at second resolution" still work. The one caller that
+ * relied on sub-ms ordering (`TaskRepository.createMany`) now imposes
+ * insertion order explicitly. Existing IDs in the DB are unaffected.
+ *
+ * @returns A UUIDv7-shaped, RFC 9562 method-3 identifier.
  *
  * @example
  * const sessionId = generateId();
- * // => "550e8400-e29b-41d4-a716-446655440000"
+ * // => "01933e4a-7b89-7c35-a8f3-9d2e1c4b5a6f"
  */
 export function generateId(): UUID {
-  return uuidv4() as UUID;
+  return uuidv7({ random: randomBytes(16) }) as UUID;
 }
 
 // ============================================================================
@@ -73,32 +99,26 @@ export function generateId(): UUID {
 // ============================================================================
 
 /**
- * Check if a string is a valid UUID (v4 or v7).
- *
- * Accepts both versions for backward compatibility:
- * - UUIDv4 (new): Fully random
- * - UUIDv7 (legacy): Timestamp-based
+ * Check if a string is a valid UUIDv7.
  *
  * Validates:
  * - Length (36 chars)
  * - Format (8-4-4-4-12 with hyphens)
- * - Version (4 or 7 in the version field)
+ * - Version (7 in the version field)
  * - Variant (RFC 4122 compliant)
  *
  * @param value - String to validate
- * @returns True if valid UUID
+ * @returns True if valid UUIDv7
  *
  * @example
- * isValidUUID("550e8400-e29b-41d4-a716-446655440000") // => true (v4)
- * isValidUUID("01933e4a-7b89-7c35-a8f3-9d2e1c4b5a6f") // => true (v7, legacy)
+ * isValidUUID("01933e4a-7b89-7c35-a8f3-9d2e1c4b5a6f") // => true
+ * isValidUUID("550e8400-e29b-41d4-a716-446655440000") // => false (v4)
  * isValidUUID("not-a-uuid") // => false
  * isValidUUID("01933e4a") // => false (too short)
  */
 export function isValidUUID(value: string): value is UUID {
-  // Accept both v4 and v7 for backward compatibility
-  // UUIDv4: xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx
   // UUIDv7: xxxxxxxx-xxxx-7xxx-[89ab]xxx-xxxxxxxxxxxx
-  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[47][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   return uuidPattern.test(value);
 }
 
@@ -128,57 +148,17 @@ export function isValidShortID(value: string): value is ShortID {
 // ============================================================================
 
 /**
- * Extract short ID prefix from a full UUID.
- *
- * Removes hyphens and truncates to specified length.
- * Default length is 8 characters (recommended for most use cases).
- *
- * @param uuid - Full UUID
- * @param length - Prefix length (8-32 chars, default: 8)
- * @returns Short ID without hyphens
- *
- * @example
- * const uuid = "01933e4a-7b89-7c35-a8f3-9d2e1c4b5a6f";
- * shortId(uuid) // => "01933e4a"
- * shortId(uuid, 12) // => "01933e4a7b89"
- * shortId(uuid, 16) // => "01933e4a7b897c35"
- */
-export function shortId(uuid: UUID, length: number = 8): ShortID {
-  const cleanUuid = uuid.replace(/-/g, '');
-  return cleanUuid.slice(0, Math.min(length, 32));
-}
-
-/**
- * Format short ID for display (alias for shortId for backward compatibility)
- *
- * @deprecated Use shortId() instead
- */
-export function formatShortId(uuid: UUID, length: number = 8): ShortID {
-  return shortId(uuid, length);
-}
-
-/**
  * Format a UUID for display in UI/CLI.
  *
- * Returns short ID by default, with option to show full UUID.
- *
- * @param uuid - Full UUID
- * @param options - Formatting options
- * @returns Formatted ID string
+ * Returns canonical short ID by default; pass `{ verbose: true }` to get the
+ * full UUID instead.
  *
  * @example
- * formatIdForDisplay(uuid) // => "01933e4a"
- * formatIdForDisplay(uuid, { verbose: true }) // => "01933e4a-7b89-7c35-a8f3-9d2e1c4b5a6f"
- * formatIdForDisplay(uuid, { length: 12 }) // => "01933e4a7b89"
+ * formatIdForDisplay(uuid) // => "01933e4a7b897c35a8f3"
+ * formatIdForDisplay(uuid, { verbose: true }) // => full UUID
  */
-export function formatIdForDisplay(
-  uuid: UUID,
-  options: { verbose?: boolean; length?: number } = {}
-): string {
-  if (options.verbose) {
-    return uuid;
-  }
-  return shortId(uuid, options.length);
+export function formatIdForDisplay(uuid: UUID, options: { verbose?: boolean } = {}): string {
+  return options.verbose ? uuid : shortId(uuid);
 }
 
 /**
@@ -294,14 +274,7 @@ export class IdResolutionError extends Error {
  * // => Error: Ambiguous ID prefix
  */
 export function resolveShortId<T extends { id: UUID }>(prefix: IDPrefix, entities: T[]): T {
-  // Normalize prefix (remove hyphens, lowercase)
-  const cleanPrefix = prefix.replace(/-/g, '').toLowerCase();
-
-  // Find all entities whose IDs start with this prefix
-  const matches = entities.filter((e) => {
-    const cleanId = e.id.replace(/-/g, '').toLowerCase();
-    return cleanId.startsWith(cleanPrefix);
-  });
+  const matches = findByShortIdPrefix(prefix, entities);
 
   if (matches.length === 0) {
     throw new IdResolutionError(
@@ -315,12 +288,12 @@ export function resolveShortId<T extends { id: UUID }>(prefix: IDPrefix, entitie
     return matches[0];
   }
 
-  // Multiple matches - show suggestions with longer prefixes
+  // Multiple matches - show suggestions at canonical display length
   const suggestions = matches
     .slice(0, 10) // Limit to first 10 matches
     .map((m) => {
       const description = getEntityDescription(m);
-      return `  - ${shortId(m.id, 12)}: ${description}`;
+      return `  - ${shortId(m.id)}: ${description}`;
     })
     .join('\n');
 
@@ -372,26 +345,25 @@ function truncate(str: string, maxLength: number): string {
 // ============================================================================
 
 /**
- * Find the minimum unique prefix length for a set of IDs.
+ * Find the minimum unique prefix length for a fixed set of IDs.
  *
- * Useful for determining optimal display length in tables.
+ * Used by table-rendering code that wants the tightest non-collision display
+ * for a known list (e.g. an `agor session list` table). This is the rare
+ * case that legitimately needs a non-canonical length, so it reaches for the
+ * lower-level `toShortId(id, length)` primitive directly.
+ *
+ * For general display (logs, notifications, URLs, single IDs in any
+ * unbounded set), use `shortId(id)` — it's `SHORT_ID_LENGTH` (24) chars,
+ * which is collision-safe for any realistic workload.
  *
  * @param ids - Array of UUIDs
- * @returns Minimum prefix length to ensure uniqueness (8-32)
- *
- * @example
- * const ids = [
- *   "01933e4a-7b89-7c35-a8f3-9d2e1c4b5a6f",
- *   "01933e4b-1234-7c35-a8f3-9d2e1c4b5a6f",
- * ];
- * findMinimumPrefixLength(ids) // => 9 (to distinguish 01933e4a vs 01933e4b)
+ * @returns Minimum prefix length to ensure uniqueness within this set (8–32)
  */
 export function findMinimumPrefixLength(ids: UUID[]): number {
-  if (ids.length <= 1) return 8; // Default minimum
+  if (ids.length <= 1) return 8; // Default minimum for empty/singleton sets
 
-  // Start with 8 chars and increment until all IDs are unique
   for (let length = 8; length <= 32; length++) {
-    const prefixes = new Set(ids.map((id) => shortId(id, length)));
+    const prefixes = new Set(ids.map((id) => toShortId(id, length)));
     if (prefixes.size === ids.length) {
       return length;
     }
@@ -428,10 +400,13 @@ export default {
   isValidUUID,
   isValidShortID,
   shortId,
-  formatShortId,
+  toShortId,
   formatIdForDisplay,
   expandPrefix,
   resolveShortId,
+  findByShortIdPrefix,
   findMinimumPrefixLength,
   isUniquePrefix,
+  SHORT_ID_LENGTH,
+  URL_SHORT_ID_LENGTH,
 };

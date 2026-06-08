@@ -1,16 +1,27 @@
 import type { AgenticToolName } from './agentic-tool';
-import type { BoardID, WorktreeID } from './id';
+import type { CardID } from './card';
+import type { ArtifactID, BoardID, BranchID } from './id';
+
+/**
+ * Canvas position (x/y coordinates in board space)
+ */
+export type BoardPosition = { x: number; y: number };
 
 /**
  * Board object types for canvas annotations
  */
-export type BoardObjectType = 'text' | 'zone' | 'markdown';
+export type BoardObjectType = 'text' | 'zone' | 'markdown' | 'app' | 'artifact';
 
 /**
- * Positioned worktree card on a board
+ * Entity type discriminator for board objects
+ */
+export type BoardEntityType = 'branch' | 'card';
+
+/**
+ * Positioned entity on a board (branch or card)
  *
- * Boards display worktrees as primary units. Sessions are accessed
- * through the worktree card's session tree.
+ * Polymorphic placement: exactly one of branch_id or card_id is set.
+ * The entity_type field indicates which one.
  */
 export interface BoardEntityObject {
   /** Unique object identifier */
@@ -19,13 +30,19 @@ export interface BoardEntityObject {
   /** Board this entity belongs to */
   board_id: BoardID;
 
-  /** Worktree reference */
-  worktree_id: WorktreeID;
+  /** Branch reference (set when entity_type === 'branch') */
+  branch_id?: BranchID;
+
+  /** Card reference (set when entity_type === 'card') */
+  card_id?: CardID;
+
+  /** Computed entity type discriminator */
+  entity_type: BoardEntityType;
 
   /** Position on canvas */
-  position: { x: number; y: number };
+  position: BoardPosition;
 
-  /** Zone this worktree is pinned to (optional) */
+  /** Zone this entity is pinned to (optional) */
   zone_id?: string;
 
   /** When this entity was added to the board */
@@ -48,14 +65,14 @@ export interface TextBoardObject {
 }
 
 /**
- * Zone trigger behavior modes for worktree drops
+ * Zone trigger behavior modes for branch drops
  */
 export type ZoneTriggerBehavior = 'always_new' | 'show_picker';
 
 /**
- * Zone trigger configuration for worktree drops
+ * Zone trigger configuration for branch drops
  *
- * When a worktree is dropped on a zone with a trigger:
+ * When a branch is dropped on a zone with a trigger:
  * - 'always_new': Automatically create new root session and apply trigger
  * - 'show_picker': Open modal to select existing session or create new one
  */
@@ -107,9 +124,86 @@ export interface MarkdownBoardObject {
 }
 
 /**
+ * Sandpack template options for app board objects
+ */
+export type SandpackTemplate =
+  | 'react'
+  | 'react-ts'
+  | 'vanilla'
+  | 'vanilla-ts'
+  | 'vue'
+  | 'vue3'
+  | 'svelte'
+  | 'solid'
+  | 'angular';
+
+/**
+ * Live web application rendered via Sandpack (in-browser bundler)
+ *
+ * Apps render as interactive iframes on the board canvas.
+ * Agents can create/update apps via MCP tools.
+ */
+export interface AppBoardObject {
+  type: 'app';
+  x: number;
+  y: number;
+  width: number; // Default: 600, min: 300
+  height: number; // Default: 400, min: 200
+  /** App title shown in the card header */
+  title: string;
+  /** Optional description */
+  description?: string;
+
+  /** Sandpack template (default: 'react') */
+  template: SandpackTemplate;
+  /** File map: path -> code content */
+  files: Record<string, string>;
+  /** NPM dependencies beyond template defaults */
+  dependencies?: Record<string, string>;
+  /** Entry file path (default: determined by template) */
+  entryFile?: string;
+  /** Whether to show the code editor alongside preview */
+  showEditor?: boolean;
+  /** Whether to show the console output */
+  showConsole?: boolean;
+}
+
+/**
+ * Artifact board object - thin reference to an Artifact entity
+ *
+ * Unlike AppBoardObject (which inlines all code), this stores only the
+ * artifact_id. The frontend fetches the payload from the daemon REST API.
+ */
+export interface ArtifactBoardObject {
+  type: 'artifact';
+  x: number;
+  y: number;
+  width: number; // Default: 600, min: 300
+  height: number; // Default: 400, min: 200
+  /** Reference to the artifact entity */
+  artifact_id: ArtifactID;
+}
+
+/**
  * Union type for all board objects
  */
-export type BoardObject = TextBoardObject | ZoneBoardObject | MarkdownBoardObject;
+export type BoardObject =
+  | TextBoardObject
+  | ZoneBoardObject
+  | MarkdownBoardObject
+  | AppBoardObject
+  | ArtifactBoardObject;
+
+export interface AssistantWelcomeNoteRequest {
+  /** Board to create/update the bundled assistant welcome note on. */
+  boardId?: BoardID | string;
+  /** Alias accepted by Feathers custom method callers. */
+  id?: BoardID | string;
+  /** User-provided assistant display name. */
+  assistantName: string;
+  /** Optional user-provided assistant emoji/icon. */
+  assistantEmoji?: string | null;
+}
 
 export interface Board {
   /** Unique board identifier (UUIDv7) */
@@ -130,6 +224,7 @@ export interface Board {
   slug?: string;
 
   description?: string;
+  primary_assistant_id?: BranchID;
 
   /**
    * DEPRECATED: Sessions and layout are now tracked in board_objects table
@@ -171,6 +266,13 @@ export interface Board {
   background_color?: string;
 
   /**
+   * Custom CSS for the board canvas (rendered in a scoped <style> tag).
+   * Supports @keyframes, animation, background-size, and other CSS that
+   * can't be expressed as inline styles. Sanitized before rendering.
+   */
+  custom_css?: string;
+
+  /**
    * Custom context for Handlebars templates (board-level)
    * Example: { "team": "Backend", "sprint": 42, "deadline": "2025-03-15" }
    * Access in templates: {{ board.context.team }}
@@ -178,18 +280,29 @@ export interface Board {
   custom_context?: Record<string, unknown>;
 
   /**
-   * External/user-facing URL for viewing this board in the UI
+   * External/user-facing URL for viewing this board in the UI.
    *
-   * Computed property added by API hooks.
-   * Format: {baseUrl}/b/{boardId}/
+   * Computed property added by the repository layer.
+   * Format: `{baseUrl}/ui/b/{slug-or-shortId}/`
+   * Prefers the board's slug when set; falls back to the canonical
+   * short ID.
    */
   url: string;
+
+  /** Whether this board is archived (soft deleted) */
+  archived: boolean;
+
+  /** ISO 8601 timestamp when the board was archived */
+  archived_at?: string;
+
+  /** User ID of the user who archived this board */
+  archived_by?: string;
 }
 
 /**
  * Portable board export format (shell only)
  *
- * Contains board metadata and annotations, but no worktrees or sessions.
+ * Contains board metadata and annotations, but no branches or sessions.
  * Can be serialized to YAML/JSON for sharing or archival.
  */
 export interface BoardExportBlob {
@@ -200,6 +313,7 @@ export interface BoardExportBlob {
   icon?: string;
   color?: string;
   background_color?: string;
+  custom_css?: string;
 
   // Annotations (zones, text, markdown)
   objects?: {

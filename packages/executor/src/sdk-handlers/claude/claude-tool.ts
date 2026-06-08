@@ -10,23 +10,22 @@
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { generateId } from '@agor/core/db';
+import { generateId, shortId } from '@agor/core/db';
 import type { PermissionMode as ClaudeSDKPermissionMode } from '@agor/core/sdk';
 import { mapPermissionMode } from '@agor/core/utils/permission-mode-mapper';
 import type {
+  BranchRepository,
   MCPServerRepository,
   MessagesRepository,
   RepoRepository,
   SessionMCPServerRepository,
   SessionRepository,
-  WorktreeRepository,
 } from '../../db/feathers-repositories.js';
 import type { PermissionService } from '../../permissions/permission-service.js';
 import type { NormalizedSdkResponse, RawSdkResponse } from '../../types/sdk-response.js';
 // Removed import of calculateModelContextWindowUsage - inlined instead
 import type { TokenUsage } from '../../types/token-usage.js';
 import {
-  type Message,
   type MessageID,
   MessageRole,
   type MessageSource,
@@ -35,7 +34,17 @@ import {
   type TaskID,
   TaskStatus,
 } from '../../types.js';
-import type { ImportOptions, ITool, SessionData, ToolCapabilities } from '../base/index.js';
+import { enrichToolResults, registerToolUses } from '../base/diff-enrichment.js';
+import type {
+  ImportOptions,
+  ITool,
+  MessagesService,
+  SessionData,
+  SessionsPatchClient,
+  TasksService,
+  TasksStreamingService,
+  ToolCapabilities,
+} from '../base/index.js';
 import { loadClaudeSession } from './import/load-session.js';
 import { transcriptsToMessages } from './import/message-converter.js';
 import {
@@ -49,6 +58,46 @@ import type { ProcessedEvent } from './message-processor.js';
 import { ClaudePromptService } from './prompt-service.js';
 
 /**
+ * Format a human-readable rate limit message for the conversation UI.
+ *
+ * Only called for statuses that indicate actual throttling:
+ * - 'rejected': Hard blocked — show urgently
+ * - 'allowed_warning': Approaching limit — show as warning
+ */
+function formatRateLimitText(event: Extract<ProcessedEvent, { type: 'rate_limit' }>): string {
+  const type = event.rateLimitType || 'unknown';
+  const resetsAtStr = event.resetsAt ? new Date(event.resetsAt * 1000).toLocaleString() : undefined;
+
+  if (event.status === 'rejected') {
+    return `Rate limited (${type}). ${resetsAtStr ? `Resets at ${resetsAtStr}.` : ''} Waiting for limit to reset...`;
+  }
+  if (event.status === 'allowed_warning') {
+    return `Approaching rate limit (${type}). ${resetsAtStr ? `Resets at ${resetsAtStr}.` : ''} Requests may be delayed.`;
+  }
+  return `Rate limit: ${event.status} (${type})`;
+}
+
+/**
+ * Build a rate_limit content block for system messages.
+ * Shared between streaming and non-streaming paths.
+ */
+function buildRateLimitContentBlock(
+  event: Extract<ProcessedEvent, { type: 'rate_limit' }>
+): Array<{ type: string; [key: string]: unknown }> {
+  return [
+    {
+      type: 'rate_limit',
+      text: formatRateLimitText(event),
+      status: event.status,
+      rateLimitType: event.rateLimitType,
+      resetsAt: event.resetsAt,
+      overageStatus: event.overageStatus,
+      isUsingOverage: event.isUsingOverage,
+    },
+  ];
+}
+
+/**
  * Wrapper for withSessionGuard that accepts Feathers repositories
  * The Feathers repositories have the same interface but different type signatures
  */
@@ -60,42 +109,11 @@ async function withFeathersSessionGuard<T>(
   // Check session exists before executing operation
   const sessionExists = await sessionsRepo?.findById(sessionId);
   if (!sessionExists) {
-    console.warn(
-      `⚠️  Session ${sessionId.substring(0, 8)} no longer exists, skipping guarded operation`
-    );
+    console.warn(`⚠️  Session ${shortId(sessionId)} no longer exists, skipping guarded operation`);
     return null;
   }
 
   return operation();
-}
-
-/**
- * Service interface for creating messages via FeathersJS
- * This ensures WebSocket events are emitted when messages are created
- */
-export interface MessagesService {
-  create(data: Partial<Message>): Promise<Message>;
-}
-
-/**
- * Service interface for updating tasks via FeathersJS
- * This ensures WebSocket events are emitted when tasks are updated
- * Note: emit() is called directly on the service in handlers (socket.io feature)
- */
-export interface TasksService {
-  // biome-ignore lint/suspicious/noExplicitAny: FeathersJS service returns dynamic task data
-  get(id: string): Promise<any>;
-  // biome-ignore lint/suspicious/noExplicitAny: FeathersJS service accepts partial task updates
-  patch(id: string, data: Partial<any>): Promise<any>;
-}
-
-/**
- * Service interface for updating sessions via FeathersJS
- * This ensures WebSocket events are emitted when sessions are updated (e.g., permission config)
- */
-export interface SessionsService {
-  // biome-ignore lint/suspicious/noExplicitAny: FeathersJS service accepts partial session updates
-  patch(id: string, data: Partial<any>): Promise<any>;
 }
 
 export class ClaudeTool implements ITool {
@@ -113,13 +131,13 @@ export class ClaudeTool implements ITool {
     mcpServerRepo?: MCPServerRepository,
     permissionService?: PermissionService,
     private tasksService?: TasksService,
-    sessionsService?: SessionsService,
-    worktreesRepo?: WorktreeRepository,
+    private tasksStreamingService?: TasksStreamingService,
+    sessionsService?: SessionsPatchClient,
+    branchesRepo?: BranchRepository,
     reposRepo?: RepoRepository,
     mcpEnabled?: boolean,
     _useNativeAuth?: boolean, // Claude supports `claude login` OAuth, but no special handling needed in tool
-    // biome-ignore lint/suspicious/noExplicitAny: Feathers service type
-    mcpOAuthNotifyService?: any // Service for notifying UI about OAuth requirements
+    usersRepo?: import('../../db/feathers-repositories').UsersRepository
   ) {
     if (messagesRepo && sessionsRepo) {
       this.promptService = new ClaudePromptService(
@@ -131,11 +149,11 @@ export class ClaudeTool implements ITool {
         permissionService,
         tasksService,
         sessionsService,
-        worktreesRepo,
+        branchesRepo,
         reposRepo,
         messagesService,
         mcpEnabled,
-        mcpOAuthNotifyService
+        usersRepo
       );
     }
   }
@@ -161,6 +179,19 @@ export class ClaudeTool implements ITool {
     } catch {
       return false;
     }
+  }
+
+  private async emitTaskEvent(
+    event: 'tool:start' | 'tool:complete' | 'thinking:chunk',
+    data: Record<string, unknown>
+  ): Promise<void> {
+    if (this.tasksStreamingService) {
+      await this.tasksStreamingService.create({ event, data });
+      return;
+    }
+
+    // Fallback for environments that don't expose /tasks/streaming.
+    this.tasksService?.emit(event, data);
   }
 
   async importSession(sessionId: string, options?: ImportOptions): Promise<SessionData> {
@@ -226,7 +257,12 @@ export class ClaudeTool implements ITool {
     model?: string;
     modelUsage?: unknown;
     rawSdkResponse?: import('@agor/core/sdk').SDKResultMessage;
+    /** Raw SDK context usage snapshot from getContextUsage() — authoritative source */
+    rawContextUsage?: import('@agor/core/sdk').SDKControlGetContextUsageResponse;
     wasStopped?: boolean;
+    hadError?: boolean;
+    /** Error details from SDK when hadError is true (e.g., errors array from error_during_execution) */
+    errorDetails?: string[];
   }> {
     if (!this.promptService || !this.messagesRepo) {
       throw new Error('ClaudeTool not initialized with repositories for live execution');
@@ -240,15 +276,18 @@ export class ClaudeTool implements ITool {
     const existingMessages = await this.messagesRepo.findBySessionId(sessionId);
     let nextIndex = existingMessages.length;
 
-    // Create user message
+    // Create user message (or reuse the daemon's pre-write — see Alt D in
+    // docs/never-lose-prompt-design.md). When the row is reused, advance
+    // nextIndex from the returned message's actual index.
     const userMessage = await createUserMessage(
       sessionId,
       prompt,
       taskId,
-      nextIndex++,
+      nextIndex,
       this.messagesService!,
-      messageSource
+      { messageSource, existingMessages }
     );
+    nextIndex = userMessage.index + 1;
 
     // Execute prompt via Agent SDK with streaming
     const assistantMessageIds: MessageID[] = [];
@@ -283,13 +322,19 @@ export class ClaudeTool implements ITool {
 
     let streamStartTime = Date.now();
     let firstTokenTime: number | null = null;
+    let firstActivityTime: number | null = null; // Any SDK activity (thinking, tools, text)
+    let apiWaitMessageSent = false; // Track whether we've sent an "API waiting" message
+    const API_WAIT_THRESHOLD_MS = 30_000; // 30 seconds before warning user
     let tokenUsage: TokenUsage | undefined;
     let durationMs: number | undefined;
     let contextWindow: number | undefined;
     let contextWindowLimit: number | undefined;
     let modelUsage: unknown | undefined;
     let rawSdkResponse: import('@agor/core/sdk').SDKResultMessage | undefined;
+    let rawContextUsage: import('@agor/core/sdk').SDKControlGetContextUsageResponse | undefined;
     let wasStopped = false;
+    let hadError = false;
+    let errorDetails: string[] | undefined;
 
     // Map our permission mode to Claude SDK's permission mode
     const mappedPermissionMode = permissionMode
@@ -322,11 +367,30 @@ export class ClaudeTool implements ITool {
         await this.captureAgentSessionId(sessionId, capturedAgentSessionId);
       }
 
+      // Handle slash commands discovered (persist to session for UI autocomplete)
+      if (event.type === 'slash_commands_discovered') {
+        if (this.sessionsRepo) {
+          try {
+            // Repository does deep merge in transaction - just pass the keys we want to update
+            await this.sessionsRepo.update(sessionId, {
+              custom_context: {
+                slash_commands: event.slashCommands,
+                skills: event.skills,
+              },
+            });
+            console.log(
+              `📋 Stored ${event.slashCommands.length} slash commands and ${event.skills.length} skills on session`
+            );
+          } catch (error) {
+            console.warn('Failed to persist slash commands to session:', error);
+          }
+        }
+      }
+
       // Handle tool execution start
       if (event.type === 'tool_start') {
-        if (this.tasksService && taskId) {
-          // biome-ignore lint/suspicious/noExplicitAny: emit is available at runtime from socket.io
-          (this.tasksService as any).emit('tool:start', {
+        if (taskId) {
+          await this.emitTaskEvent('tool:start', {
             task_id: taskId,
             session_id: sessionId,
             tool_use_id: event.toolUseId,
@@ -337,9 +401,8 @@ export class ClaudeTool implements ITool {
 
       // Handle tool execution complete
       if (event.type === 'tool_complete') {
-        if (this.tasksService && taskId) {
-          // biome-ignore lint/suspicious/noExplicitAny: emit is available at runtime from socket.io
-          (this.tasksService as any).emit('tool:complete', {
+        if (taskId) {
+          await this.emitTaskEvent('tool:complete', {
             task_id: taskId,
             session_id: sessionId,
             tool_use_id: event.toolUseId,
@@ -347,12 +410,72 @@ export class ClaudeTool implements ITool {
         }
       }
 
+      // Check for slow API response BEFORE marking first activity.
+      // This ensures the warning fires when the first event arrives after the threshold.
+      const isActivityEvent =
+        event.type === 'partial' ||
+        event.type === 'thinking_partial' ||
+        event.type === 'tool_start' ||
+        event.type === 'message_start' ||
+        event.type === 'rate_limit' ||
+        event.type === 'sdk_event' ||
+        event.type === 'complete';
+
+      if (
+        !apiWaitMessageSent &&
+        !firstActivityTime &&
+        isActivityEvent &&
+        Date.now() - streamStartTime > API_WAIT_THRESHOLD_MS
+      ) {
+        apiWaitMessageSent = true;
+        const waitSeconds = Math.round((Date.now() - streamStartTime) / 1000);
+        const waitText = `API response delayed (waiting ${waitSeconds}s+). The API may be experiencing high load.`;
+        console.warn(`⏳ ${waitText}`);
+
+        await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+          const waitMessageId = generateId() as MessageID;
+
+          if (streamingCallbacks) {
+            await streamingCallbacks.onStreamStart(waitMessageId, {
+              session_id: sessionId,
+              task_id: taskId,
+              role: MessageRole.SYSTEM,
+              timestamp: new Date().toISOString(),
+            });
+          }
+
+          await createSystemMessage(
+            sessionId,
+            waitMessageId,
+            [
+              {
+                type: 'api_wait',
+                text: waitText,
+                waitMs: Date.now() - streamStartTime,
+              },
+            ],
+            taskId,
+            nextIndex++,
+            resolvedModel,
+            this.messagesService!
+          );
+
+          if (streamingCallbacks) {
+            await streamingCallbacks.onStreamEnd(waitMessageId);
+          }
+        });
+      }
+
+      // Track first SDK activity AFTER the api_wait check so the warning can fire
+      if (!firstActivityTime && isActivityEvent) {
+        firstActivityTime = Date.now();
+      }
+
       // Handle thinking partial (streaming)
       if (event.type === 'thinking_partial') {
         // Emit to tasks service for task-level tracking
-        if (this.tasksService && taskId) {
-          // biome-ignore lint/suspicious/noExplicitAny: emit is available at runtime from socket.io
-          (this.tasksService as any).emit('thinking:chunk', {
+        if (taskId) {
+          await this.emitTaskEvent('thinking:chunk', {
             task_id: taskId,
             session_id: sessionId,
             chunk: event.thinkingChunk,
@@ -444,9 +567,135 @@ export class ClaudeTool implements ITool {
         }
       }
 
+      // Handle rate_limit events — surface as system messages
+      if (event.type === 'rate_limit') {
+        const rateLimitEvent = event as Extract<ProcessedEvent, { type: 'rate_limit' }>;
+        const content = buildRateLimitContentBlock(rateLimitEvent);
+        console.log(`⏳ Rate limit → system message: ${content[0].text}`);
+
+        await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+          const rateLimitMessageId = generateId() as MessageID;
+
+          if (streamingCallbacks) {
+            await streamingCallbacks.onStreamStart(rateLimitMessageId, {
+              session_id: sessionId,
+              task_id: taskId,
+              role: MessageRole.SYSTEM,
+              timestamp: new Date().toISOString(),
+            });
+          }
+
+          await createSystemMessage(
+            sessionId,
+            rateLimitMessageId,
+            content,
+            taskId,
+            nextIndex++,
+            resolvedModel,
+            this.messagesService!
+          );
+
+          if (streamingCallbacks) {
+            await streamingCallbacks.onStreamEnd(rateLimitMessageId);
+          }
+        });
+      }
+
+      // Handle sdk_event — surface unhandled SDK messages as system messages
+      if (event.type === 'sdk_event') {
+        const sdkEvent = event as Extract<ProcessedEvent, { type: 'sdk_event' }>;
+        const content: Array<{
+          type: string;
+          text?: string;
+          sdkType?: string;
+          sdkSubtype?: string;
+          metadata?: Record<string, unknown>;
+          [key: string]: unknown;
+        }> = [
+          {
+            type: 'sdk_event',
+            text: sdkEvent.summary,
+            sdkType: sdkEvent.sdkType,
+            sdkSubtype: sdkEvent.sdkSubtype,
+            metadata: sdkEvent.rawMessage,
+          },
+        ];
+        console.log(`📡 SDK event → system message: ${sdkEvent.summary}`);
+
+        await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+          const sdkEventMessageId = generateId() as MessageID;
+
+          if (streamingCallbacks) {
+            await streamingCallbacks.onStreamStart(sdkEventMessageId, {
+              session_id: sessionId,
+              task_id: taskId,
+              role: MessageRole.SYSTEM,
+              timestamp: new Date().toISOString(),
+            });
+          }
+
+          await createSystemMessage(
+            sessionId,
+            sdkEventMessageId,
+            content,
+            taskId,
+            nextIndex++,
+            resolvedModel,
+            this.messagesService!
+          );
+
+          if (streamingCallbacks) {
+            await streamingCallbacks.onStreamEnd(sdkEventMessageId);
+          }
+        });
+      }
+
       // Capture raw SDK response for token accounting
       if (event.type === 'result') {
         rawSdkResponse = event.raw_sdk_message;
+        // Detect error results from SDK (e.g., error_during_execution)
+        if (rawSdkResponse && 'subtype' in rawSdkResponse) {
+          const sdkResult = rawSdkResponse as {
+            subtype?: string;
+            errors?: string[];
+            is_error?: boolean;
+          };
+          if (sdkResult.subtype && sdkResult.subtype !== 'success') {
+            hadError = true;
+            errorDetails = sdkResult.errors;
+            console.error(
+              `[claude-code] SDK result indicates error: subtype=${sdkResult.subtype}, errors=${JSON.stringify(sdkResult.errors)}`
+            );
+
+            // Create a system message with the error details so it's visible in the conversation UI
+            if (this.messagesService && sdkResult.errors?.length) {
+              const errorText = sdkResult.errors.join('\n');
+              const errorMessageId = generateId() as MessageID;
+              await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+                await createSystemMessage(
+                  sessionId,
+                  errorMessageId,
+                  [
+                    {
+                      type: 'text',
+                      text: `Agent SDK error (${sdkResult.subtype}): ${errorText}`,
+                    },
+                  ],
+                  taskId,
+                  nextIndex++,
+                  resolvedModel,
+                  this.messagesService!
+                );
+                return true;
+              });
+            }
+          }
+        }
+      }
+
+      // Capture SDK context usage snapshot (authoritative context window data)
+      if (event.type === 'context_usage') {
+        rawContextUsage = event.contextUsage;
       }
 
       // Capture metadata from result events (SDK may not type this properly)
@@ -522,6 +771,11 @@ export class ClaudeTool implements ITool {
           const assistantMessageId =
             currentTextMessageId || currentThinkingMessageId || (generateId() as MessageID);
 
+          // Register tool uses for diff enrichment lookup
+          if (completeEvent.toolUses?.length) {
+            registerToolUses(completeEvent.toolUses);
+          }
+
           // Create assistant message with session guard (handles deleted sessions gracefully)
           const created = await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
             await createAssistantMessage(
@@ -550,9 +804,14 @@ export class ClaudeTool implements ITool {
           currentThinkingMessageId = null;
           streamStartTime = Date.now();
           firstTokenTime = null;
+          firstActivityTime = null;
+          apiWaitMessageSent = false; // Reset for next message cycle
         } else if (event.type === 'complete' && event.role === MessageRole.USER) {
           // Type assertion for user message
           const completeEvent = event as Extract<ProcessedEvent, { type: 'complete' }>;
+
+          // Best-effort: enrich Edit/Write tool results with structuredPatch diff data
+          enrichToolResults(completeEvent.content);
 
           // Create user message with session guard (handles deleted sessions gracefully)
           await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
@@ -607,7 +866,10 @@ export class ClaudeTool implements ITool {
       model: resolvedModel,
       modelUsage,
       rawSdkResponse,
+      rawContextUsage,
       wasStopped,
+      hadError,
+      errorDetails,
     };
   }
 
@@ -622,9 +884,20 @@ export class ClaudeTool implements ITool {
 
     if (this.sessionsRepo) {
       try {
-        console.log(
-          `📝 About to update session with: ${JSON.stringify({ sdk_session_id: agentSessionId })}`
-        );
+        // Guard: only set sdk_session_id if not already set (immutable after first capture)
+        const existingSession = await this.sessionsRepo.findById(sessionId);
+        if (existingSession?.sdk_session_id) {
+          if (existingSession.sdk_session_id === agentSessionId) {
+            console.log(`💾 Agent SDK session_id unchanged (already ${shortId(agentSessionId)})`);
+          } else {
+            console.warn(
+              `⚠️  Agent SDK returned new session_id ${shortId(agentSessionId)} but session already has ${shortId(existingSession.sdk_session_id)} — keeping original (sdk_session_id is immutable)`
+            );
+          }
+          return;
+        }
+
+        console.log(`📝 Setting sdk_session_id for first time: ${shortId(agentSessionId)}`);
         const updated = await this.sessionsRepo.update(sessionId, {
           sdk_session_id: agentSessionId,
         });
@@ -670,7 +943,12 @@ export class ClaudeTool implements ITool {
     model?: string;
     modelUsage?: unknown;
     rawSdkResponse?: import('@agor/core/sdk').SDKResultMessage;
+    /** Raw SDK context usage snapshot from getContextUsage() — authoritative source */
+    rawContextUsage?: import('@agor/core/sdk').SDKControlGetContextUsageResponse;
     wasStopped?: boolean;
+    hadError?: boolean;
+    /** Error details from SDK when hadError is true (e.g., errors array from error_during_execution) */
+    errorDetails?: string[];
   }> {
     if (!this.promptService || !this.messagesRepo) {
       throw new Error('ClaudeTool not initialized with repositories for live execution');
@@ -684,15 +962,17 @@ export class ClaudeTool implements ITool {
     const existingMessages = await this.messagesRepo.findBySessionId(sessionId);
     let nextIndex = existingMessages.length;
 
-    // Create user message
+    // Create user message (or reuse the daemon's pre-write — see Alt D in
+    // docs/never-lose-prompt-design.md).
     const userMessage = await createUserMessage(
       sessionId,
       prompt,
       taskId,
-      nextIndex++,
+      nextIndex,
       this.messagesService!,
-      messageSource
+      { messageSource, existingMessages }
     );
+    nextIndex = userMessage.index + 1;
 
     // Execute prompt via Agent SDK
     const assistantMessageIds: MessageID[] = [];
@@ -704,7 +984,10 @@ export class ClaudeTool implements ITool {
     let contextWindowLimit: number | undefined;
     let modelUsage: unknown | undefined;
     let rawSdkResponse: import('@agor/core/sdk').SDKResultMessage | undefined;
+    let rawContextUsage: import('@agor/core/sdk').SDKControlGetContextUsageResponse | undefined;
     let wasStopped = false;
+    let hadError = false;
+    let errorDetails: string[] | undefined;
 
     // Map our permission mode to Claude SDK's permission mode
     const mappedPermissionMode = permissionMode
@@ -735,9 +1018,99 @@ export class ClaudeTool implements ITool {
         await this.captureAgentSessionId(sessionId, capturedAgentSessionId);
       }
 
+      // Handle rate_limit events in non-streaming path
+      if (event.type === 'rate_limit') {
+        const rateLimitEvent = event as Extract<ProcessedEvent, { type: 'rate_limit' }>;
+        const content = buildRateLimitContentBlock(rateLimitEvent);
+        console.log(`⏳ Rate limit → system message: ${content[0].text}`);
+
+        await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+          const rateLimitMessageId = generateId() as MessageID;
+          await createSystemMessage(
+            sessionId,
+            rateLimitMessageId,
+            content,
+            taskId,
+            nextIndex++,
+            resolvedModel,
+            this.messagesService!
+          );
+        });
+      }
+
+      // Handle sdk_event in non-streaming path
+      if (event.type === 'sdk_event') {
+        const sdkEvent = event as Extract<ProcessedEvent, { type: 'sdk_event' }>;
+        console.log(`📡 SDK event → system message: ${sdkEvent.summary}`);
+
+        await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+          const sdkEventMessageId = generateId() as MessageID;
+          await createSystemMessage(
+            sessionId,
+            sdkEventMessageId,
+            [
+              {
+                type: 'sdk_event',
+                text: sdkEvent.summary,
+                sdkType: sdkEvent.sdkType,
+                sdkSubtype: sdkEvent.sdkSubtype,
+                metadata: sdkEvent.rawMessage,
+              },
+            ],
+            taskId,
+            nextIndex++,
+            resolvedModel,
+            this.messagesService!
+          );
+        });
+      }
+
       // Capture raw SDK response for token accounting
       if (event.type === 'result') {
         rawSdkResponse = event.raw_sdk_message;
+        // Detect error results from SDK (e.g., error_during_execution)
+        if (rawSdkResponse && 'subtype' in rawSdkResponse) {
+          const sdkResult = rawSdkResponse as {
+            subtype?: string;
+            errors?: string[];
+            is_error?: boolean;
+          };
+          if (sdkResult.subtype && sdkResult.subtype !== 'success') {
+            hadError = true;
+            errorDetails = sdkResult.errors;
+            console.error(
+              `[claude-code] SDK result indicates error: subtype=${sdkResult.subtype}, errors=${JSON.stringify(sdkResult.errors)}`
+            );
+
+            // Create a system message with the error details so it's visible in the conversation UI
+            if (this.messagesService && sdkResult.errors?.length) {
+              const errorText = sdkResult.errors.join('\n');
+              const errorMessageId = generateId() as MessageID;
+              await withFeathersSessionGuard(sessionId, this.sessionsRepo, async () => {
+                await createSystemMessage(
+                  sessionId,
+                  errorMessageId,
+                  [
+                    {
+                      type: 'text',
+                      text: `Agent SDK error (${sdkResult.subtype}): ${errorText}`,
+                    },
+                  ],
+                  taskId,
+                  nextIndex++,
+                  resolvedModel,
+                  this.messagesService!
+                );
+                return true;
+              });
+            }
+          }
+        }
+      }
+
+      // Capture SDK context usage snapshot (authoritative context window data)
+      if (event.type === 'context_usage') {
+        rawContextUsage = event.contextUsage;
       }
 
       // Capture metadata from result events (SDK may not type this properly)
@@ -824,7 +1197,10 @@ export class ClaudeTool implements ITool {
       model: resolvedModel,
       modelUsage,
       rawSdkResponse,
+      rawContextUsage,
       wasStopped,
+      hadError,
+      errorDetails,
     };
   }
 
@@ -884,239 +1260,49 @@ export class ClaudeTool implements ITool {
   }
 
   /**
-   * Compute token count from a Claude SDK raw response
+   * Compute context window usage for a Claude Code session
    *
-   * Sums across ALL models (Haiku for tools, Sonnet for responses, etc.)
-   * since they all contribute to the context window.
+   * Primary source: SDK's getContextUsage() (captured during prompt execution as context_usage event).
+   * This method serves as a fallback when getContextUsage() is not available.
    *
-   * @param rawResponse - Raw SDK response from Claude Agent SDK
-   * @returns Total tokens (input + output) across all models
-   */
-  private computeContextTokensFromRawResponse(rawResponse: unknown): number {
-    const response = rawResponse as import('../../types/sdk-response').ClaudeCodeSdkResponseTyped;
-
-    // If modelUsage exists, sum across all models
-    if (response.modelUsage && typeof response.modelUsage === 'object') {
-      let total = 0;
-      for (const modelData of Object.values(response.modelUsage)) {
-        const input = modelData.inputTokens || 0;
-        const output = modelData.outputTokens || 0;
-        total += input + output;
-      }
-      return total;
-    }
-
-    // Fallback to top-level usage (older SDK or single model)
-    const inputTokens = response.usage?.input_tokens || 0;
-    const outputTokens = response.usage?.output_tokens || 0;
-    return inputTokens + outputTokens;
-  }
-
-  /**
-   * Compute cumulative context window usage for a Claude Code session
+   * Uses the result message's usage data to estimate context:
+   *   context = input_tokens + cache_creation_input_tokens + cache_read_input_tokens
    *
-   * Algorithm:
-   * 1. Query messages to find compaction boundary events
-   * 2. Build set of task IDs that had compaction events
-   * 3. Query previous completed tasks (ordered by created_at ASC for proper iteration)
-   * 4. Find the most recent compaction task
-   * 5. Sum tokens only from tasks AFTER the last compaction
-   * 6. Add BASELINE context on FIRST message after session start or compaction:
-   *    - Fresh session: cache_read + cache_creation (~23-27K for system prompt + tools)
-   *    - Post-compaction: cache_creation only (the compacted conversation summary)
-   * 7. Add current task tokens (and baseline if this IS the first task)
+   * This represents what's actually in the context window for the current turn,
+   * as input_tokens + cache tokens = total input context sent to the model.
    *
-   * Why baseline matters:
-   * - cache_read_tokens: System prompt, tool definitions (~20K tokens)
-   * - cache_creation_tokens: CLAUDE.md, MCP server tools (~3-7K tokens)
-   * - These are part of the context window but not reported in input/output tokens
-   *
-   * Note: This is called BEFORE the task UPDATE, so querying the DB is safe.
-   * The current task is not yet in the DB, so we receive its raw response separately.
+   * Note: In practice this fallback is rarely used — getContextUsage() from the SDK
+   * is the primary source and is captured via the context_usage event in prompt-service.
    *
    * @param sessionId - Session ID to compute context for
-   * @param currentTaskId - Current task ID (excluded from DB query)
-   * @param currentRawSdkResponse - Raw SDK response for the current task (not yet in DB)
+   * @param _currentTaskId - Current task ID (unused in new implementation)
+   * @param currentRawSdkResponse - Raw SDK response for the current task
    * @returns Promise resolving to computed context window usage in tokens
+   */
+  /**
+   * Fallback context window computation when getContextUsage() was unavailable.
+   * The primary path (SDK's getContextUsage()) is handled in base-executor.ts
+   * via rawContextUsage. This method is only called when that path fails.
+   *
+   * NOTE: The raw SDK response only has CUMULATIVE token counts across all API
+   * calls in a task (input + cache_creation + cache_read).  These sums routinely
+   * exceed the model's context window (e.g. 500k+ for a 200k window) because
+   * they count every API round-trip, not the current window snapshot.  Clamping
+   * the sum to maxContextWindow always produces exactly 100%, which is what
+   * caused the "everything shows 100%" bug.
+   *
+   * Rather than display a misleading value, return 0 so the UI shows "unknown"
+   * instead of a wrong percentage.  The SDK's getContextUsage() is the only
+   * reliable source for this metric.
    */
   async computeContextWindow(
     sessionId: string,
-    currentTaskId?: string,
-    currentRawSdkResponse?: unknown
+    _currentTaskId?: string,
+    _currentRawSdkResponse?: unknown
   ): Promise<number> {
-    // Start with current task tokens
-    let currentTaskTokens = 0;
-    if (currentRawSdkResponse) {
-      currentTaskTokens = this.computeContextTokensFromRawResponse(currentRawSdkResponse);
-    }
-
-    // Query previous completed tasks to sum their tokens
-    // This is safe because we're called BEFORE the UPDATE (not during)
-    if (!this.tasksService) {
-      console.warn(
-        `⚠️  computeContextWindow: tasksService not available, returning current task tokens only`
-      );
-      return currentTaskTokens;
-    }
-
-    try {
-      // Step 1: Find compaction events from messages
-      const compactionTaskIds = await this.findCompactionTaskIds(sessionId as SessionID);
-
-      // Step 2: Query previous completed tasks (chronological order for proper iteration)
-      // biome-ignore lint/suspicious/noExplicitAny: FeathersJS service find returns paginated or array
-      const result = await (this.tasksService as any).find({
-        query: {
-          session_id: sessionId,
-          status: 'completed', // Only completed tasks have token data
-          $sort: { created_at: 1 }, // Chronological order (oldest first)
-          $limit: 100, // Reasonable limit for context window computation
-        },
-      });
-
-      // biome-ignore lint/suspicious/noExplicitAny: FeathersJS service returns dynamic task data
-      const tasks: any[] = Array.isArray(result) ? result : result.data || [];
-
-      // Step 3: Find the most recent compaction event index
-      let lastCompactionIndex = -1;
-      for (let i = tasks.length - 1; i >= 0; i--) {
-        if (compactionTaskIds.has(tasks[i].task_id)) {
-          lastCompactionIndex = i;
-          break;
-        }
-      }
-
-      // Step 4: Sum tokens starting from after the last compaction
-      const startIndex = lastCompactionIndex >= 0 ? lastCompactionIndex + 1 : 0;
-      let totalTokens = 0;
-      let tasksCounted = 0;
-      let baselineTokensAdded = 0;
-
-      for (let i = startIndex; i < tasks.length; i++) {
-        const task = tasks[i];
-        // Skip current task (it's not in DB yet anyway, but just in case)
-        if (task.task_id === currentTaskId) continue;
-
-        // Get tokens from normalized_sdk_response
-        const normalized = task.normalized_sdk_response;
-        if (normalized?.tokenUsage) {
-          const taskTokens =
-            (normalized.tokenUsage.inputTokens || 0) + (normalized.tokenUsage.outputTokens || 0);
-          totalTokens += taskTokens;
-          tasksCounted++;
-
-          // CRITICAL: Add baseline context on FIRST message after start/compaction
-          // This accounts for system prompt, CLAUDE.md, MCP tools, etc.
-          if (i === startIndex) {
-            if (lastCompactionIndex === -1) {
-              // Fresh session: cache_read (~20K system prompt) + cache_creation (CLAUDE.md + MCP tools ~3-7K)
-              // Total baseline: ~23K-27K tokens for a fresh session
-              const cacheRead = normalized.tokenUsage.cacheReadInputTokens || 0;
-              const cacheCreation = normalized.tokenUsage.cacheCreationInputTokens || 0;
-              baselineTokensAdded = cacheRead + cacheCreation;
-              totalTokens += baselineTokensAdded;
-            } else {
-              // Post-compaction: cache_creation only (the compacted conversation summary)
-              // Note: We exclude cache_read here because it can exceed 200K context limits
-              // post-compaction (observed: 248K-1.9M tokens), likely due to cumulative caching
-              const cacheCreation = normalized.tokenUsage.cacheCreationInputTokens || 0;
-              baselineTokensAdded = cacheCreation;
-              totalTokens += baselineTokensAdded;
-            }
-          }
-        }
-      }
-
-      // Add current task tokens
-      totalTokens += currentTaskTokens;
-
-      // CRITICAL: Handle the case where THIS is the first task (no previous tasks)
-      // In this case, we need to add baseline context from the current task's raw response
-      if (tasksCounted === 0 && currentRawSdkResponse && lastCompactionIndex === -1) {
-        const response =
-          currentRawSdkResponse as import('../../types/sdk-response').ClaudeCodeSdkResponseTyped;
-        // Extract cache tokens from the first model in modelUsage
-        if (response.modelUsage && typeof response.modelUsage === 'object') {
-          const firstModelUsage = Object.values(response.modelUsage)[0];
-          if (firstModelUsage) {
-            // Fresh session: add cache_read + cache_creation as baseline
-            const cacheRead = firstModelUsage.cacheReadInputTokens || 0;
-            const cacheCreation = firstModelUsage.cacheCreationInputTokens || 0;
-            baselineTokensAdded = cacheRead + cacheCreation;
-            totalTokens += baselineTokensAdded;
-          }
-        }
-      }
-
-      const compactionInfo =
-        lastCompactionIndex >= 0
-          ? ` (reset after compaction at task index ${lastCompactionIndex})`
-          : ' (no compaction detected)';
-
-      const baselineInfo = baselineTokensAdded > 0 ? `, baseline: ${baselineTokensAdded}` : '';
-
-      console.log(
-        `✅ Computed cumulative context window for session ${sessionId}: ${totalTokens} tokens (${tasksCounted} previous tasks + current${baselineInfo})${compactionInfo}`
-      );
-
-      return totalTokens;
-    } catch (error) {
-      console.error(`❌ Failed to compute context window:`, error);
-      // Fall back to just current task tokens
-      return currentTaskTokens;
-    }
-  }
-
-  /**
-   * Find task IDs that have compaction events in their messages
-   *
-   * Compaction events are system messages with:
-   * - type === 'system' AND content is object with status === 'compacting'
-   * - OR content is array with a block having type === 'system_status' and status === 'compacting'
-   */
-  private async findCompactionTaskIds(sessionId: SessionID): Promise<Set<string>> {
-    const compactionTaskIds = new Set<string>();
-
-    if (!this.messagesRepo) {
-      console.warn(
-        `⚠️  findCompactionTaskIds: messagesRepo not available, skipping compaction detection`
-      );
-      return compactionTaskIds;
-    }
-
-    try {
-      const messages = await this.messagesRepo.findBySessionId(sessionId);
-
-      for (const msg of messages) {
-        if (msg.role !== MessageRole.SYSTEM) continue;
-        if (!msg.content || typeof msg.content !== 'object') continue;
-
-        const content = msg.content as { type?: string; status?: string } | unknown[];
-
-        // Check if content is array with compaction block
-        if (Array.isArray(content)) {
-          const hasCompaction = (content as Array<{ type?: string; status?: string }>).some(
-            (block) => block.type === 'system_status' && block.status === 'compacting'
-          );
-          if (hasCompaction && msg.task_id) {
-            compactionTaskIds.add(msg.task_id);
-          }
-        }
-        // Check if content is object with compacting status
-        else if (content.status === 'compacting' && msg.task_id) {
-          compactionTaskIds.add(msg.task_id);
-        }
-      }
-
-      if (compactionTaskIds.size > 0) {
-        console.log(
-          `🔄 Found ${compactionTaskIds.size} compaction event(s) in session ${sessionId}`
-        );
-      }
-    } catch (error) {
-      console.error(`❌ Failed to find compaction events:`, error);
-    }
-
-    return compactionTaskIds;
+    console.log(
+      `📊 Context window fallback for session ${sessionId}: returning 0 (cumulative token sums are unreliable for context window percentage)`
+    );
+    return 0;
   }
 }

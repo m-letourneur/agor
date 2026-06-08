@@ -1,38 +1,47 @@
-import type { AgorClient } from '@agor/core/api';
 import type {
   AgenticToolName,
+  AgorClient,
+  Branch,
   CodexApprovalPolicy,
   CodexSandboxMode,
+  EffortLevel,
   MCPServer,
   PermissionMode,
   User,
-  Worktree,
-} from '@agor/core/types';
-import { getDefaultPermissionMode } from '@agor/core/types';
+} from '@agor-live/client';
+import { getDefaultPermissionMode, mapToCodexPermissionConfig } from '@agor-live/client';
 import { DownOutlined } from '@ant-design/icons';
 import { Alert, Collapse, Form, Input, Modal, Typography } from 'antd';
 import { useEffect, useState } from 'react';
-import { AgenticToolConfigForm } from '../AgenticToolConfigForm';
+import { AgenticToolConfigForm, getFormValuesFromConfig } from '../AgenticToolConfigForm';
 import {
   type AgenticToolOption,
   AgentSelectionGrid,
 } from '../AgentSelectionGrid/AgentSelectionGrid';
 import { AutocompleteTextarea } from '../AutocompleteTextarea';
+import { SessionMcpServersField } from '../MCPServerSelect';
 import type { ModelConfig } from '../ModelSelector';
+import { SessionEnvVarsSelector } from '../SessionEnvVarsSelector';
 
 export interface NewSessionConfig {
-  worktree_id: string; // Required - sessions are always created from a worktree
+  branch_id: string; // Required - sessions are always created from a branch
   agent: string;
   title?: string;
   initialPrompt?: string;
 
   // Advanced configuration
   modelConfig?: ModelConfig;
+  effort?: EffortLevel;
   mcpServerIds?: string[];
   permissionMode?: PermissionMode;
   codexSandboxMode?: CodexSandboxMode;
   codexApprovalPolicy?: CodexApprovalPolicy;
   codexNetworkAccess?: boolean;
+  /**
+   * Session-scope env var names (belonging to the creator) to export into this
+   * session's executor process once it is created.
+   */
+  envVarNames?: string[];
 }
 
 export interface NewSessionModalProps {
@@ -40,8 +49,8 @@ export interface NewSessionModalProps {
   onClose: () => void;
   onCreate: (config: NewSessionConfig) => void;
   availableAgents: AgenticToolOption[];
-  worktreeId: string; // Required - the worktree to create the session in
-  worktree?: Worktree; // Optional - worktree details for display
+  branchId: string; // Required - the branch to create the session in
+  branch?: Branch; // Optional - branch details for display
   mcpServerById?: Map<string, MCPServer>;
   currentUser?: User | null; // Optional - current user for default settings
   client: AgorClient | null;
@@ -53,8 +62,8 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
   onClose,
   onCreate,
   availableAgents,
-  worktreeId,
-  worktree,
+  branchId,
+  branch,
   mcpServerById = new Map(),
   currentUser,
   client,
@@ -63,89 +72,107 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
   const [form] = Form.useForm();
   const [selectedAgent, setSelectedAgent] = useState<string>('claude-code');
   const [isCreating, setIsCreating] = useState(false);
+  const [envVarNames, setEnvVarNames] = useState<string[]>([]);
   const isFormValid = !!selectedAgent;
 
   // Reset form when modal opens, using user defaults if available
+  // Only depends on `open` — branch/user refs may change while modal is open
+  // and we must not wipe user edits on live WebSocket refreshes.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally only reset on modal open
   useEffect(() => {
     if (!open) return;
 
     setSelectedAgent('claude-code');
     setIsCreating(false); // Reset creating state when modal opens
+    setEnvVarNames([]);
 
     // Get default config for the selected agent
     const agentDefaults = currentUser?.default_agentic_config?.['claude-code'];
+    const baseValues = getFormValuesFromConfig('claude-code', agentDefaults);
+
+    // MCP inheritance: branch config > user defaults
+    const branchMcpIds = branch?.mcp_server_ids;
 
     form.setFieldsValue({
       title: '',
       initialPrompt: '',
-      permissionMode: agentDefaults?.permissionMode || getDefaultPermissionMode('claude-code'),
-      mcpServerIds: agentDefaults?.mcpServerIds || [],
-      modelConfig: agentDefaults?.modelConfig,
-      codexSandboxMode: agentDefaults?.codexSandboxMode || 'workspace-write',
-      codexApprovalPolicy: agentDefaults?.codexApprovalPolicy || 'on-request',
-      codexNetworkAccess: agentDefaults?.codexNetworkAccess ?? false,
+      ...baseValues,
+      mcpServerIds:
+        branchMcpIds && branchMcpIds.length > 0 ? branchMcpIds : baseValues.mcpServerIds,
     });
-  }, [open, form, currentUser]);
+  }, [open, form]);
 
   // Update permission mode and other defaults when agent changes
   useEffect(() => {
     if (selectedAgent) {
-      const agentDefaults = currentUser?.default_agentic_config?.[selectedAgent as AgenticToolName];
+      const tool = selectedAgent as AgenticToolName;
+      const agentDefaults = currentUser?.default_agentic_config?.[tool];
+      const baseValues = getFormValuesFromConfig(tool, agentDefaults);
 
+      // MCP inheritance: branch config > user defaults
       form.setFieldsValue({
-        permissionMode:
-          agentDefaults?.permissionMode ||
-          getDefaultPermissionMode((selectedAgent as AgenticToolName) || 'claude-code'),
-        mcpServerIds: agentDefaults?.mcpServerIds || [],
-        modelConfig: agentDefaults?.modelConfig,
-        ...(selectedAgent === 'codex'
-          ? {
-              codexSandboxMode: agentDefaults?.codexSandboxMode || 'workspace-write',
-              codexApprovalPolicy: agentDefaults?.codexApprovalPolicy || 'on-request',
-              codexNetworkAccess: agentDefaults?.codexNetworkAccess ?? false,
-            }
-          : {
-              codexSandboxMode: undefined,
-              codexApprovalPolicy: undefined,
-              codexNetworkAccess: undefined,
-            }),
+        ...baseValues,
+        mcpServerIds:
+          branch?.mcp_server_ids && branch.mcp_server_ids.length > 0
+            ? branch.mcp_server_ids
+            : baseValues.mcpServerIds,
+        // Clear codex fields when switching away from codex
+        ...(tool !== 'codex' && {
+          codexSandboxMode: undefined,
+          codexApprovalPolicy: undefined,
+          codexNetworkAccess: undefined,
+        }),
       });
     }
-  }, [selectedAgent, form, currentUser]);
+  }, [selectedAgent, form, currentUser, branch?.mcp_server_ids]);
 
   const handleCreate = () => {
-    form.validateFields().then((values) => {
+    form.validateFields().then(() => {
+      // Use getFieldsValue(true) to include values from collapsed panels
+      const values = form.getFieldsValue(true);
       // Prevent duplicate submissions
       setIsCreating(true);
 
       // Get user defaults for the selected agent (fallback if form fields weren't mounted)
       const agentDefaults = currentUser?.default_agentic_config?.[selectedAgent as AgenticToolName];
 
+      // MCP fallback must respect branch > user defaults (same as open-reset effect)
+      const branchMcpIds = branch?.mcp_server_ids;
+      const fallbackMcpServerIds =
+        branchMcpIds && branchMcpIds.length > 0 ? branchMcpIds : agentDefaults?.mcpServerIds;
+
+      const permissionMode: PermissionMode =
+        (values.permissionMode as PermissionMode | undefined) ??
+        agentDefaults?.permissionMode ??
+        getDefaultPermissionMode(selectedAgent as AgenticToolName);
+
       const config: NewSessionConfig = {
-        worktree_id: worktreeId,
+        branch_id: branchId,
         agent: selectedAgent,
         title: values.title,
         initialPrompt: values.initialPrompt,
-        // Use form values if present (user expanded advanced), otherwise use defaults
+        // Daemon's applySessionConfigDefaults hook fills the tool default.
         modelConfig: values.modelConfig ?? agentDefaults?.modelConfig,
-        mcpServerIds: values.mcpServerIds ?? agentDefaults?.mcpServerIds,
-        permissionMode:
-          (values.permissionMode as PermissionMode | undefined) ??
-          agentDefaults?.permissionMode ??
-          getDefaultPermissionMode(selectedAgent as AgenticToolName),
+        effort: (values.effort as EffortLevel | undefined) ?? agentDefaults?.modelConfig?.effort,
+        mcpServerIds: values.mcpServerIds ?? fallbackMcpServerIds,
+        permissionMode,
+        envVarNames: envVarNames.length > 0 ? envVarNames : undefined,
       };
 
       if (selectedAgent === 'codex') {
+        const codexDefaults = mapToCodexPermissionConfig(permissionMode);
         config.codexSandboxMode =
           (values.codexSandboxMode as CodexSandboxMode | undefined) ??
           agentDefaults?.codexSandboxMode ??
-          ('workspace-write' as CodexSandboxMode);
+          codexDefaults.sandboxMode;
         config.codexApprovalPolicy =
           (values.codexApprovalPolicy as CodexApprovalPolicy | undefined) ??
           agentDefaults?.codexApprovalPolicy ??
-          ('on-request' as CodexApprovalPolicy);
+          codexDefaults.approvalPolicy;
         config.codexNetworkAccess =
-          values.codexNetworkAccess ?? agentDefaults?.codexNetworkAccess ?? false;
+          values.codexNetworkAccess ??
+          agentDefaults?.codexNetworkAccess ??
+          codexDefaults.networkAccess;
       }
 
       onCreate(config);
@@ -173,12 +200,12 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
       }}
     >
       <Form form={form} layout="vertical" style={{ marginTop: 16 }} preserve={false}>
-        {/* Worktree Info */}
-        {worktree && (
+        {/* Branch Info */}
+        {branch && (
           <Alert
-            message={
+            title={
               <>
-                Creating session in worktree: <strong>{worktree.name}</strong> ({worktree.ref})
+                Creating session in branch: <strong>{branch.name}</strong> ({branch.ref})
               </>
             }
             type="info"
@@ -221,9 +248,13 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
           />
         </Form.Item>
 
+        {/* MCP Servers — first-class field, mirrors SessionSettingsModal */}
+        <SessionMcpServersField mcpServerById={mcpServerById} />
+
         {/* Advanced Configuration (Collapsible) */}
         <Collapse
           ghost
+          destroyOnHidden={false}
           expandIcon={({ isActive }) => <DownOutlined rotate={isActive ? 180 : 0} />}
           items={[
             {
@@ -234,9 +265,27 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
                   agenticTool={(selectedAgent as AgenticToolName) || 'claude-code'}
                   mcpServerById={mcpServerById}
                   showHelpText={true}
+                  hideMcpServers
+                  client={client}
                 />
               ),
             },
+            ...(currentUser && client
+              ? [
+                  {
+                    key: 'env-vars',
+                    label: <Typography.Text strong>Environment Variables</Typography.Text>,
+                    children: (
+                      <SessionEnvVarsSelector
+                        ownerUserId={currentUser.user_id}
+                        client={client}
+                        value={envVarNames}
+                        onChange={setEnvVarNames}
+                      />
+                    ),
+                  },
+                ]
+              : []),
           ]}
           style={{ marginTop: 16 }}
         />

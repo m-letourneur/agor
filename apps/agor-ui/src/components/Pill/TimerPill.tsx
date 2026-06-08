@@ -1,18 +1,22 @@
 import type {
   SessionStatus as SessionStatusValue,
   TaskStatus as TaskStatusValue,
-} from '@agor/core/types';
-import { SessionStatus, TaskStatus } from '@agor/core/types';
+} from '@agor-live/client';
+import { SessionStatus, TaskStatus } from '@agor-live/client';
 import {
   CheckCircleOutlined,
+  ClockCircleOutlined,
   CloseCircleOutlined,
+  HeartOutlined,
   HourglassOutlined,
   PauseCircleOutlined,
+  QuestionCircleOutlined,
   StopOutlined,
 } from '@ant-design/icons';
-import { Tooltip, theme } from 'antd';
+import { Popover, theme } from 'antd';
 import type React from 'react';
 import { useEffect, useMemo, useState } from 'react';
+import { formatAbsoluteTime } from '../../utils/time';
 import { Tag } from '../Tag';
 import { PILL_COLORS } from './Pill';
 
@@ -23,7 +27,7 @@ interface TimerPillProps {
   startedAt?: string | number | Date;
   endedAt?: string | number | Date;
   durationMs?: number | null;
-  tooltip?: string;
+  lastExecutorHeartbeatAt?: string | number | Date | null;
   style?: React.CSSProperties;
 }
 
@@ -31,6 +35,7 @@ const ACTIVE_STATUSES: TimerStatus[] = [
   TaskStatus.RUNNING,
   TaskStatus.STOPPING,
   TaskStatus.AWAITING_PERMISSION,
+  TaskStatus.AWAITING_INPUT,
 ];
 
 const statusConfig: Record<
@@ -53,6 +58,10 @@ const statusConfig: Record<
     icon: <PauseCircleOutlined />,
     color: PILL_COLORS.warning,
   },
+  [TaskStatus.AWAITING_INPUT]: {
+    icon: <QuestionCircleOutlined />,
+    color: PILL_COLORS.processing,
+  },
   [TaskStatus.COMPLETED]: {
     icon: <CheckCircleOutlined />,
     color: PILL_COLORS.success,
@@ -69,10 +78,19 @@ const statusConfig: Record<
     icon: <HourglassOutlined />,
     color: PILL_COLORS.session,
   },
+  [TaskStatus.TIMED_OUT]: {
+    icon: <ClockCircleOutlined />,
+    color: PILL_COLORS.warning,
+  },
   [TaskStatus.CREATED]: {
     icon: <HourglassOutlined />,
     color: PILL_COLORS.session,
     label: '00:00',
+  },
+  [TaskStatus.QUEUED]: {
+    icon: <ClockCircleOutlined />,
+    color: PILL_COLORS.session,
+    label: 'Queued',
   },
   pending: {
     icon: <HourglassOutlined />,
@@ -119,12 +137,16 @@ export const TimerPill: React.FC<TimerPillProps> = ({
   startedAt,
   endedAt,
   durationMs,
-  tooltip,
+  lastExecutorHeartbeatAt,
   style,
 }) => {
   const { token } = theme.useToken();
   const startMs = useMemo(() => parseTimestamp(startedAt), [startedAt]);
   const endMs = useMemo(() => parseTimestamp(endedAt), [endedAt]);
+  const heartbeatMs = useMemo(
+    () => parseTimestamp(lastExecutorHeartbeatAt ?? undefined),
+    [lastExecutorHeartbeatAt]
+  );
 
   const fixedDuration = useMemo(() => {
     if (typeof durationMs === 'number' && durationMs >= 0) {
@@ -180,17 +202,75 @@ export const TimerPill: React.FC<TimerPillProps> = ({
     return () => window.clearInterval(interval);
   }, [startMs, status]);
 
+  const isActive = ACTIVE_STATUSES.includes(status);
+
+  const popoverContent = useMemo(() => {
+    const labelStyle: React.CSSProperties = {
+      color: token.colorTextSecondary,
+      minWidth: 60,
+    };
+    const valueStyle: React.CSSProperties = {
+      fontFamily: token.fontFamilyCode,
+      color: token.colorText,
+    };
+    const rowStyle: React.CSSProperties = {
+      display: 'flex',
+      gap: 8,
+      alignItems: 'baseline',
+    };
+
+    const heartbeatAgeMs = heartbeatMs ? Math.max(0, Date.now() - heartbeatMs) : null;
+
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12 }}>
+        {startMs && (
+          <div style={rowStyle}>
+            <span style={labelStyle}>Started</span>
+            <span style={valueStyle}>{formatAbsoluteTime(new Date(startMs))}</span>
+          </div>
+        )}
+        <div style={rowStyle}>
+          <span style={labelStyle}>Ended</span>
+          <span style={valueStyle}>
+            {isActive ? 'In progress...' : endMs ? formatAbsoluteTime(new Date(endMs)) : '\u2014'}
+          </span>
+        </div>
+        <div style={rowStyle}>
+          <span style={labelStyle}>Duration</span>
+          <span style={valueStyle}>{formatDuration(elapsedMs)}</span>
+        </div>
+        {heartbeatMs && (
+          <div style={rowStyle}>
+            <span style={labelStyle}>Heartbeat</span>
+            <span style={valueStyle}>
+              <HeartOutlined style={{ marginRight: 4 }} />
+              {heartbeatAgeMs !== null ? `${formatDuration(heartbeatAgeMs)} ago` : '—'}
+              <span style={{ color: token.colorTextSecondary, marginLeft: 6 }}>
+                {formatAbsoluteTime(new Date(heartbeatMs))}
+              </span>
+            </span>
+          </div>
+        )}
+      </div>
+    );
+  }, [startMs, endMs, isActive, elapsedMs, heartbeatMs, token]);
+
   if (!startMs && fixedDuration === null) {
     return null;
   }
 
   const config = statusConfig[status] || statusConfig.pending;
   const label = config.label ?? formatDuration(elapsedMs);
+
   const tag = (
     <Tag icon={config.icon} color={config.color} style={style}>
       <span style={{ fontFamily: token.fontFamilyCode, lineHeight: 1 }}>{label}</span>
     </Tag>
   );
 
-  return tooltip ? <Tooltip title={tooltip}>{tag}</Tooltip> : tag;
+  return (
+    <Popover content={popoverContent} placement="bottom">
+      {tag}
+    </Popover>
+  );
 };

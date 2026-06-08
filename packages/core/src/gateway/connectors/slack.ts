@@ -22,10 +22,40 @@
  */
 
 import { SocketModeClient } from '@slack/socket-mode';
+import type { KnownBlock, RawTextElement, SectionBlock, TableBlock } from '@slack/types';
 import { WebClient } from '@slack/web-api';
+import { slackifyMarkdown } from 'slackify-markdown';
 
 import type { ChannelType } from '../../types/gateway';
-import type { GatewayConnector, InboundMessage } from '../connector';
+import type { GatewayConnector, InboundMessage, OutboundPayload } from '../connector';
+
+// Block Kit table block limits (Slack docs, native block introduced Aug 2025).
+const TABLE_MAX_ROWS = 100;
+const TABLE_MAX_COLS = 20;
+// No explicit per-cell limit is documented; this is a conservative local cap
+// matching the section-block text ceiling so the same cell can never overflow
+// either path. Beyond this we drop to monospace, then text-only.
+const TABLE_MAX_CELL_CHARS = 3000;
+const SECTION_MAX_CHARS = 3000;
+// Slack rejects messages with more than one `table` block.
+const MAX_TABLES_PER_MESSAGE = 1;
+// Slack rejects `chat.postMessage` with more than 50 blocks; if we'd exceed
+// this we drop the blocks payload entirely and let `text` carry the message.
+const MAX_BLOCKS_PER_MESSAGE = 50;
+// Slack error codes that indicate the `blocks` payload was malformed/rejected,
+// where retrying with text-only is the right fallback.
+const BLOCK_PAYLOAD_ERRORS = new Set([
+  'invalid_blocks',
+  'invalid_blocks_format',
+  'message_blocks_too_long',
+]);
+
+// GFM scanner regexes — hoisted so both `segmentMarkdown` and helpers share
+// the same definitions (DRY) and they're cheap to test against.
+const FENCE_LINE_RE = /^(`{3,}|~{3,})/;
+const PIPE_LINE_RE = /^\s*\|/;
+const TABLE_SEPARATOR_LINE_RE = /^\s*\|[\s:]*-[\s:-]*\|/;
+const TABLE_SEPARATOR_BLOCK_RE = /^\|[\s:]*-[\s:-]*\|/m;
 
 interface SlackConfig {
   bot_token: string;
@@ -89,24 +119,324 @@ function hasActiveMention(text: string, mentionPattern: RegExp): boolean {
   return mentionPattern.test(stripped);
 }
 
+interface Segment {
+  kind: 'text' | 'table';
+  lines: string[];
+}
+
 /**
- * Convert markdown to Slack mrkdwn format
+ * Split markdown into alternating text and GFM-table segments.
  *
- * Handles basic conversions:
- * - **bold** → *bold*
- * - _italic_ stays as _italic_
- * - ```code blocks``` stay as-is (Slack supports triple backtick)
- * - `inline code` stays as-is
- * - [text](url) → <url|text>
+ * Single source of truth for GFM table detection inside this connector;
+ * {@link wrapTablesInCodeBlocks} and {@link markdownToSlackPayload} both
+ * build on top of it. Tables are only recognized outside fenced code
+ * blocks and require a GFM separator row (`|---|`). Pipe lines without a
+ * separator are folded back into the surrounding text segment.
+ *
+ * CRLF input is normalized — splitting on `\r?\n` so downstream consumers
+ * never see trailing `\r` in line buffers.
  */
-function markdownToMrkdwn(markdown: string): string {
-  return (
-    markdown
-      // Bold: **text** → *text*
-      .replace(/\*\*(.+?)\*\*/g, '*$1*')
-      // Links: [text](url) → <url|text>
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<$2|$1>')
-  );
+function segmentMarkdown(md: string): Segment[] {
+  const lines = md.split(/\r?\n/);
+  const segments: Segment[] = [];
+  let textBuf: string[] = [];
+  let tableBuf: string[] = [];
+  let inCodeBlock = false;
+
+  const flushText = (): void => {
+    if (textBuf.length > 0) {
+      segments.push({ kind: 'text', lines: textBuf });
+      textBuf = [];
+    }
+  };
+  const flushTable = (): void => {
+    if (tableBuf.length === 0) return;
+    if (TABLE_SEPARATOR_BLOCK_RE.test(tableBuf.join('\n'))) {
+      flushText();
+      segments.push({ kind: 'table', lines: tableBuf });
+    } else {
+      // No separator row → not a real GFM table; treat as text.
+      textBuf.push(...tableBuf);
+    }
+    tableBuf = [];
+  };
+
+  for (const line of lines) {
+    if (FENCE_LINE_RE.test(line)) {
+      flushTable();
+      inCodeBlock = !inCodeBlock;
+      textBuf.push(line);
+      continue;
+    }
+    if (inCodeBlock) {
+      textBuf.push(line);
+      continue;
+    }
+    if (PIPE_LINE_RE.test(line)) {
+      tableBuf.push(line);
+    } else {
+      flushTable();
+      textBuf.push(line);
+    }
+  }
+  flushTable();
+  flushText();
+
+  return segments;
+}
+
+/**
+ * Wrap GFM tables in code fences so Slack renders them monospace.
+ *
+ * Re-assembles the output of {@link segmentMarkdown}, surrounding each table
+ * segment with triple-backtick fences. Used by {@link markdownToMrkdwn} for
+ * the plain-text/notification fallback path and by tests.
+ */
+export function wrapTablesInCodeBlocks(md: string): string {
+  const result: string[] = [];
+  for (const seg of segmentMarkdown(md)) {
+    if (seg.kind === 'table') {
+      result.push('```', ...seg.lines, '```');
+    } else {
+      result.push(...seg.lines);
+    }
+  }
+  return result.join('\n');
+}
+
+/**
+ * Convert GitHub-flavored markdown to Slack mrkdwn format.
+ *
+ * Delegates to `slackify-markdown` which uses `unified`/`remark` with
+ * custom Slack handlers. Handles bold, italic, strikethrough, links,
+ * headings (→ bold), images (→ links), code blocks (strips lang),
+ * lists, blockquotes, tables (→ code blocks), and Slack character escaping.
+ *
+ * This is the plain-text/notification fallback; for the block-aware payload
+ * (which renders tables as native Block Kit `table` blocks when possible),
+ * see {@link markdownToSlackPayload}.
+ *
+ * @see https://github.com/jsarafajr/slackify-markdown
+ */
+export function markdownToMrkdwn(markdown: string): string {
+  return slackifyMarkdown(wrapTablesInCodeBlocks(markdown)).trim();
+}
+
+/**
+ * Split a single GFM table row body into trimmed cells, honoring escaped
+ * pipes (`\|`) which GFM allows as literal pipe characters inside a cell.
+ */
+function splitCells(rowBody: string): string[] {
+  const cells: string[] = [];
+  let current = '';
+  for (let i = 0; i < rowBody.length; i++) {
+    const ch = rowBody[i];
+    if (ch === '\\' && rowBody[i + 1] === '|') {
+      current += '|';
+      i++;
+      continue;
+    }
+    if (ch === '|') {
+      cells.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  cells.push(current.trim());
+  return cells;
+}
+
+/**
+ * Strip the optional leading/trailing pipes from a GFM table row line and
+ * return the cell-body substring.
+ */
+function rowBody(line: string): string {
+  const trimmed = line.trim();
+  const noLead = trimmed.startsWith('|') ? trimmed.slice(1) : trimmed;
+  return noLead.endsWith('|') ? noLead.slice(0, -1) : noLead;
+}
+
+/**
+ * Parse a GFM separator row (e.g. `|:---|---:|:---:|`) into the per-column
+ * Block Kit alignment values. Returns the same alignment array shape Block
+ * Kit's `column_settings` expects.
+ */
+function parseColumnAlignments(separatorLine: string): ('left' | 'center' | 'right')[] {
+  return splitCells(rowBody(separatorLine)).map((cell) => {
+    const startsWithColon = cell.startsWith(':');
+    const endsWithColon = cell.endsWith(':');
+    if (startsWithColon && endsWithColon) return 'center';
+    if (endsWithColon) return 'right';
+    return 'left';
+  });
+}
+
+/**
+ * Parse the lines of a GFM table into a 2D array of trimmed cell strings.
+ *
+ * Drops the separator row, honors escaped pipes via {@link splitCells}, and
+ * returns each row at the length of the source row — callers normalize widths.
+ */
+function parseTableRows(tableLines: string[]): string[][] {
+  return tableLines
+    .filter((line) => !TABLE_SEPARATOR_LINE_RE.test(line))
+    .map((line) => splitCells(rowBody(line)));
+}
+
+/**
+ * Convert parsed GFM rows into a Block Kit `table` block, or null when the
+ * table can't be rendered natively (oversized, malformed, empty).
+ *
+ * Returning null is the signal to the caller to use the monospace fallback.
+ */
+function tableToBlockKit(tableLines: string[]): TableBlock | null {
+  const rows = parseTableRows(tableLines);
+  if (rows.length === 0) return null;
+
+  // Width is fixed by the header row; the separator (already filtered out)
+  // had previously confirmed the table shape.
+  const cols = rows[0].length;
+  if (cols === 0 || cols > TABLE_MAX_COLS) return null;
+  if (rows.length > TABLE_MAX_ROWS) return null;
+
+  for (const row of rows) {
+    for (const cell of row) {
+      if (cell.length > TABLE_MAX_CELL_CHARS) return null;
+    }
+  }
+
+  const normalized: RawTextElement[][] = rows.map((row) => {
+    const cells: RawTextElement[] = [];
+    for (let i = 0; i < cols; i++) {
+      const raw = row[i] ?? '';
+      // Slack's RawTextElement requires text of length ≥ 1; substitute a
+      // single space for empty cells so the block validates.
+      cells.push({ type: 'raw_text', text: raw === '' ? ' ' : raw });
+    }
+    return cells;
+  });
+
+  // Carry GFM alignment markers (`:---`, `---:`, `:---:`) through to Block
+  // Kit's `column_settings`. Only emit when at least one column is non-default
+  // to keep the JSON minimal for the common case.
+  const separatorLine = tableLines.find((l) => TABLE_SEPARATOR_LINE_RE.test(l));
+  const alignments = separatorLine ? parseColumnAlignments(separatorLine) : [];
+  const block: TableBlock = { type: 'table', rows: normalized };
+  if (alignments.some((a) => a !== 'left')) {
+    block.column_settings = alignments.slice(0, cols).map((align) => ({ align }));
+  }
+  return block;
+}
+
+/**
+ * Slackify a text segment and split it into one or more section blocks,
+ * each respecting the 3000-char section text limit. Returns null if any
+ * resulting block would exceed Slack's section text cap — though the
+ * splitting prevents that by construction; null is reserved for future
+ * stricter validation.
+ */
+function buildTextBlocks(lines: string[]): SectionBlock[] {
+  const mrkdwn = slackifyMarkdown(lines.join('\n')).trim();
+  if (mrkdwn.length === 0) return [];
+
+  const blocks: SectionBlock[] = [];
+  let remaining = mrkdwn;
+  while (remaining.length > 0) {
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: remaining.slice(0, SECTION_MAX_CHARS) },
+    });
+    remaining = remaining.slice(SECTION_MAX_CHARS);
+  }
+  return blocks;
+}
+
+/**
+ * Wrap the original GFM table lines in a triple-backtick code block.
+ *
+ * Returns null when the wrapped content would exceed Slack's section text
+ * cap — the caller is expected to drop `blocks` entirely and rely on the
+ * mrkdwn `text` field (40k char budget) so we never silently truncate.
+ */
+function monospaceFallbackBlock(tableLines: string[]): SectionBlock | null {
+  const wrapped = `\`\`\`\n${tableLines.join('\n')}\n\`\`\``;
+  if (wrapped.length > SECTION_MAX_CHARS) return null;
+  return {
+    type: 'section',
+    text: { type: 'mrkdwn', text: wrapped },
+  };
+}
+
+/**
+ * Build a Slack outbound payload from GitHub-flavored markdown.
+ *
+ * If the message contains GFM tables, emits a `blocks` array that uses
+ * Block Kit's native `table` block (Aug 2025) for the first qualifying
+ * table and falls back to a monospace code block for any table that
+ * exceeds Slack's caps (>{@link TABLE_MAX_ROWS} rows, >{@link TABLE_MAX_COLS}
+ * cols, oversized cell) or for additional tables beyond Slack's
+ * one-table-per-message limit.
+ *
+ * Whenever a fallback table or the assembled block array would exceed
+ * Slack's limits (section text >{@link SECTION_MAX_CHARS}, total blocks
+ * >{@link MAX_BLOCKS_PER_MESSAGE}), the entire `blocks` payload is dropped
+ * and the message is sent text-only — `text` has a 40k-char budget and
+ * never silently truncates.
+ *
+ * If there are no tables, returns `{ text }` only — the same mrkdwn string
+ * the legacy path produced, so non-table messages are unchanged on the wire.
+ */
+export function markdownToSlackPayload(markdown: string): OutboundPayload {
+  const text = markdownToMrkdwn(markdown);
+
+  const segments = segmentMarkdown(markdown);
+  if (!segments.some((s) => s.kind === 'table')) {
+    return { text };
+  }
+
+  const blocks: KnownBlock[] = [];
+  let tablesEmitted = 0;
+  for (const seg of segments) {
+    if (seg.kind === 'text') {
+      blocks.push(...buildTextBlocks(seg.lines));
+      continue;
+    }
+
+    const native = tablesEmitted < MAX_TABLES_PER_MESSAGE ? tableToBlockKit(seg.lines) : null;
+    if (native) {
+      blocks.push(native);
+      tablesEmitted++;
+      continue;
+    }
+
+    const fallback = monospaceFallbackBlock(seg.lines);
+    if (!fallback) {
+      // Can't fit this table even as a monospace section — abandon the
+      // blocks payload entirely; `text` carries the full message.
+      return { text };
+    }
+    blocks.push(fallback);
+  }
+
+  // Slack's chat.postMessage caps total blocks per message; if we'd exceed
+  // it, fall back to text-only rather than have Slack reject the payload.
+  if (blocks.length === 0 || blocks.length > MAX_BLOCKS_PER_MESSAGE) {
+    return { text };
+  }
+
+  return { text, blocks };
+}
+
+/**
+ * Extract a Slack error code from either a non-OK response object
+ * (`{ error: 'invalid_blocks' }`) or a thrown `WebAPIPlatformError`
+ * (`err.data.error === 'invalid_blocks'`).
+ */
+function extractSlackErrorCode(resultOrError: unknown): string | undefined {
+  if (typeof resultOrError !== 'object' || resultOrError === null) return undefined;
+  const candidate = resultOrError as { error?: string; data?: { error?: string } };
+  return candidate.data?.error ?? candidate.error;
 }
 
 export class SlackConnector implements GatewayConnector {
@@ -117,10 +447,30 @@ export class SlackConnector implements GatewayConnector {
   private config: SlackConfig;
   private botUserId: string | null = null;
 
-  /** Cache: Slack user ID → email (or null if unavailable). */
-  private userEmailCache = new Map<string, { email: string | null; expiresAt: number }>();
+  /** Cache: Slack user ID → profile (email + display name, or null if unavailable). */
+  private userProfileCache = new Map<
+    string,
+    { email: string | null; displayName: string | null; expiresAt: number }
+  >();
+
+  /** Cache: Slack channel ID → channel name */
+  private channelNameCache = new Map<string, { name: string | null; expiresAt: number }>();
   private static USER_CACHE_TTL_MS = 15 * 60 * 1000; // 15 min for successful lookups
   private static USER_CACHE_ERROR_TTL_MS = 60 * 1000; // 1 min for errors (transient recovery)
+
+  /**
+   * Cache: Slack channel ID → channel type string (channel/group/mpim/im).
+   *
+   * Populated from:
+   * 1. `message` events (which include reliable `channel_type`)
+   * 2. `conversations.info` API calls (fallback for `app_mention` events)
+   *
+   * This avoids relying on the channel ID prefix (C/G/D) which is unreliable —
+   * Slack private channels can have a `C` prefix.
+   */
+  private channelTypeCache = new Map<string, { type: string; expiresAt: number }>();
+  private static CHANNEL_CACHE_TTL_MS = 30 * 60 * 1000; // 30 min
+  private static CHANNEL_CACHE_ERROR_TTL_MS = 60 * 1000; // 1 min for API errors
 
   constructor(config: Record<string, unknown>) {
     this.config = config as unknown as SlackConfig;
@@ -138,49 +488,109 @@ export class SlackConnector implements GatewayConnector {
   /**
    * Look up a Slack user's email address by their user ID.
    *
+   * Delegates to lookupUserProfile() and returns just the email.
+   */
+  async lookupUserEmail(slackUserId: string): Promise<string | null> {
+    const profile = await this.lookupUserProfile(slackUserId);
+    return profile.email;
+  }
+
+  /**
+   * Look up a Slack user's profile (email + display name) by their user ID.
+   *
    * Caches successful results for 15 minutes and errors for 1 minute
    * (so transient failures recover quickly). Evicts expired entries on
    * each call to prevent unbounded cache growth.
    *
-   * Returns null if the email is unavailable (missing users:read.email scope,
-   * bot user, restricted guest, or API error).
+   * Returns `{ email: null, displayName: null }` if unavailable.
    */
-  async lookupUserEmail(slackUserId: string): Promise<string | null> {
+  async lookupUserProfile(
+    slackUserId: string
+  ): Promise<{ email: string | null; displayName: string | null }> {
     const now = Date.now();
 
     // Evict expired entries to prevent unbounded growth
-    for (const [key, entry] of this.userEmailCache) {
-      if (entry.expiresAt <= now) this.userEmailCache.delete(key);
+    for (const [key, entry] of this.userProfileCache) {
+      if (entry.expiresAt <= now) this.userProfileCache.delete(key);
     }
 
-    const cached = this.userEmailCache.get(slackUserId);
+    const cached = this.userProfileCache.get(slackUserId);
     if (cached && cached.expiresAt > now) {
-      return cached.email;
+      return { email: cached.email, displayName: cached.displayName };
     }
 
     try {
       const result = await this.web.users.info({ user: slackUserId });
       const email = result.user?.profile?.email ?? null;
+      const displayName =
+        result.user?.profile?.display_name ||
+        result.user?.profile?.real_name ||
+        result.user?.real_name ||
+        null;
 
-      this.userEmailCache.set(slackUserId, {
+      this.userProfileCache.set(slackUserId, {
         email,
+        displayName,
         expiresAt: now + SlackConnector.USER_CACHE_TTL_MS,
       });
 
       if (email) {
-        console.log(`[slack] Resolved user ${slackUserId} → ${email}`);
+        console.log(
+          `[slack] Resolved user ${slackUserId} → ${displayName ?? '(no name)'} <${email}>`
+        );
       } else {
         console.log(
           `[slack] User ${slackUserId} has no email (missing users:read.email scope or restricted account)`
         );
       }
 
-      return email;
+      return { email, displayName };
     } catch (error) {
-      console.warn(`[slack] Failed to look up email for user ${slackUserId}:`, error);
+      console.warn(`[slack] Failed to look up profile for user ${slackUserId}:`, error);
       // Short TTL for errors so transient failures (rate limits, network) recover quickly
-      this.userEmailCache.set(slackUserId, {
+      this.userProfileCache.set(slackUserId, {
         email: null,
+        displayName: null,
+        expiresAt: now + SlackConnector.USER_CACHE_ERROR_TTL_MS,
+      });
+      return { email: null, displayName: null };
+    }
+  }
+
+  /**
+   * Look up a Slack channel's name by its ID.
+   *
+   * Often a cache hit because resolveChannelType() populates the
+   * channelNameCache when it calls conversations.info.
+   * Falls back to its own conversations.info call if not cached.
+   */
+  async lookupChannelName(channelId: string): Promise<string | null> {
+    const now = Date.now();
+
+    // Evict expired entries
+    for (const [key, entry] of this.channelNameCache) {
+      if (entry.expiresAt <= now) this.channelNameCache.delete(key);
+    }
+
+    const cached = this.channelNameCache.get(channelId);
+    if (cached && cached.expiresAt > now) {
+      return cached.name;
+    }
+
+    try {
+      const result = await this.web.conversations.info({ channel: channelId });
+      const name = result.channel?.name ?? null;
+
+      this.channelNameCache.set(channelId, {
+        name,
+        expiresAt: now + SlackConnector.CHANNEL_CACHE_TTL_MS,
+      });
+
+      return name;
+    } catch (error) {
+      console.warn(`[slack] Failed to look up channel name for ${channelId}:`, error);
+      this.channelNameCache.set(channelId, {
+        name: null,
         expiresAt: now + SlackConnector.USER_CACHE_ERROR_TTL_MS,
       });
       return null;
@@ -188,24 +598,160 @@ export class SlackConnector implements GatewayConnector {
   }
 
   /**
-   * Send a message to a Slack thread
+   * Cache a known channel type from a trusted source (e.g. `message` event with explicit `channel_type`).
+   */
+  private cacheChannelType(channelId: string, type: string): void {
+    this.channelTypeCache.set(channelId, {
+      type,
+      expiresAt: Date.now() + SlackConnector.CHANNEL_CACHE_TTL_MS,
+    });
+  }
+
+  /**
+   * Resolve the Slack channel type for a given channel ID.
+   *
+   * Resolution order:
+   * 1. Explicit `channel_type` from the event (trusted, used by `message` events)
+   * 2. In-memory cache (populated from prior `message` events or API calls)
+   * 3. `conversations.info` API call (cached on success)
+   * 4. Channel ID prefix inference (last resort, unreliable for private channels)
+   */
+  private async resolveChannelType(
+    channelId: string,
+    eventChannelType: string | undefined
+  ): Promise<string | undefined> {
+    // 1. Explicit channel_type from event — always trust it and cache for later
+    if (eventChannelType) {
+      this.cacheChannelType(channelId, eventChannelType);
+      return eventChannelType;
+    }
+
+    // 2. Check cache (populated from message events or prior API calls)
+    const now = Date.now();
+
+    // Evict expired entries to prevent unbounded growth
+    for (const [key, entry] of this.channelTypeCache) {
+      if (entry.expiresAt <= now) this.channelTypeCache.delete(key);
+    }
+
+    const cached = this.channelTypeCache.get(channelId);
+    if (cached) {
+      return cached.type;
+    }
+
+    // 3. Call conversations.info API
+    try {
+      const result = await this.web.conversations.info({ channel: channelId });
+      if (result.ok && result.channel) {
+        const ch = result.channel;
+        let resolvedType: string;
+        if (ch.is_im) {
+          resolvedType = 'im';
+        } else if (ch.is_mpim) {
+          resolvedType = 'mpim';
+        } else if (ch.is_private || ch.is_group) {
+          resolvedType = 'group';
+        } else {
+          resolvedType = 'channel';
+        }
+        console.log(`[slack] conversations.info resolved channel ${channelId} → ${resolvedType}`);
+        this.cacheChannelType(channelId, resolvedType);
+
+        // Also cache channel name to avoid a second conversations.info call
+        // from lookupChannelName() later in the same message path.
+        if (ch.name) {
+          this.channelNameCache.set(channelId, {
+            name: ch.name,
+            expiresAt: now + SlackConnector.CHANNEL_CACHE_TTL_MS,
+          });
+        }
+
+        return resolvedType;
+      }
+    } catch (error) {
+      console.warn(`[slack] conversations.info failed for ${channelId}:`, error);
+      // Cache the error briefly so we don't hammer the API
+      // Fall through to prefix inference
+    }
+
+    // 4. Last resort: prefix inference for unambiguous prefixes only.
+    // IMPORTANT: C-prefix is NOT used — private channels can have C-prefix,
+    // and misclassifying them as public would recreate the original bug (#826).
+    // G → group and D → DM are reliable inferences.
+    const prefix = channelId.charAt(0);
+    let inferredType: string | undefined;
+    if (prefix === 'G') {
+      inferredType = 'group';
+    } else if (prefix === 'D') {
+      inferredType = 'im';
+    }
+    if (inferredType) {
+      console.warn(`[slack] Using prefix inference for channel ${channelId} → ${inferredType}`);
+      // Short TTL for prefix-inferred types
+      this.channelTypeCache.set(channelId, {
+        type: inferredType,
+        expiresAt: now + SlackConnector.CHANNEL_CACHE_ERROR_TTL_MS,
+      });
+    } else {
+      console.warn(
+        `[slack] Cannot determine channel type for ${channelId} (API failed, prefix ambiguous)`
+      );
+    }
+    return inferredType;
+  }
+
+  /**
+   * Send a message to a Slack thread.
+   *
+   * If `blocks` is provided (produced by {@link formatMessage}), it is sent as
+   * the rich payload and `text` becomes the notification/fallback string. If
+   * Slack rejects the blocks payload with a known block-validation error
+   * (e.g. `invalid_blocks`), the call retries once as text-only so a
+   * structural quirk in the generated blocks never drops the agent's
+   * response on the floor.
    */
   async sendMessage(req: {
     threadId: string;
     text: string;
+    blocks?: unknown[];
     metadata?: Record<string, unknown>;
   }): Promise<string> {
     const { channel, thread_ts } = parseThreadId(req.threadId);
+    const blocks = req.blocks && req.blocks.length > 0 ? (req.blocks as KnownBlock[]) : undefined;
 
-    const result = await this.web.chat.postMessage({
-      channel,
-      thread_ts,
-      text: this.formatMessage(req.text),
-      unfurl_links: false,
-      unfurl_media: false,
-    });
+    const post = (withBlocks: boolean) =>
+      this.web.chat.postMessage({
+        channel,
+        thread_ts,
+        text: req.text,
+        ...(withBlocks && blocks ? { blocks } : {}),
+        unfurl_links: false,
+        unfurl_media: false,
+      });
+
+    let result: Awaited<ReturnType<typeof post>>;
+    try {
+      result = await post(true);
+    } catch (err) {
+      const code = extractSlackErrorCode(err);
+      if (blocks && code && BLOCK_PAYLOAD_ERRORS.has(code)) {
+        console.warn(`[slack] Block payload rejected (${code}); retrying as text-only`);
+        result = await post(false);
+      } else {
+        throw err;
+      }
+    }
 
     if (!result.ok || !result.ts) {
+      const code = extractSlackErrorCode(result);
+      if (blocks && code && BLOCK_PAYLOAD_ERRORS.has(code)) {
+        console.warn(`[slack] Block payload rejected (${code}); retrying as text-only`);
+        const retry = await post(false);
+        if (!retry.ok || !retry.ts) {
+          throw new Error(`Slack API error: ${retry.error ?? 'unknown error'}`);
+        }
+        return retry.ts;
+      }
       console.error(`[slack] Message send failed: ${result.error}`);
       throw new Error(`Slack API error: ${result.error ?? 'unknown error'}`);
     }
@@ -328,6 +874,14 @@ export class SlackConnector implements GatewayConnector {
         return;
       }
 
+      // Resolve channel type early — needed for both dedup and filtering.
+      // Uses cache (populated from prior message events) + conversations.info fallback.
+      // This replaces the unreliable channel ID prefix inference that misclassified
+      // private channels with C-prefix as public channels.
+      const channelType = event.channel
+        ? await this.resolveChannelType(event.channel, event.channel_type)
+        : undefined;
+
       // IMPORTANT: Prevent duplicate processing
       // When a bot is mentioned, Slack sends BOTH 'app_mention' and 'message' events.
       // This happens for top-level messages AND thread replies.
@@ -339,18 +893,7 @@ export class SlackConnector implements GatewayConnector {
       // - Skip 'app_mention' events where the mention is only inside code blocks
       //   (those are not "real" mentions and should be handled as plain messages)
       const isThreadReply = !!event.thread_ts;
-      // Determine if this is a channel/group message for dedup purposes.
-      // app_mention events often lack channel_type, so infer from channel ID prefix.
-      // IMPORTANT: Only use prefix inference for app_mention events. For message events,
-      // rely on the explicit channel_type to avoid misclassifying MPIMs (which also
-      // use G* prefix) and accidentally dropping messages.
-      const channelPrefix = (event.channel as string | undefined)?.charAt(0);
-      const isChannelMessage =
-        event.channel_type === 'channel' ||
-        event.channel_type === 'group' ||
-        (eventType === 'app_mention' &&
-          !event.channel_type &&
-          (channelPrefix === 'C' || channelPrefix === 'G'));
+      const isChannelMessage = channelType === 'channel' || channelType === 'group';
 
       // CRITICAL: Prevent duplicates in channels/groups when bot ID unavailable
       // Strategy depends on require_mention setting:
@@ -387,21 +930,6 @@ export class SlackConnector implements GatewayConnector {
           // Skip — the parallel message event will handle it as a non-mention
           // (correctly rejected or routed via thread reply exception).
           return;
-        }
-      }
-
-      // Resolve channel type. app_mention events don't include channel_type,
-      // so infer it from the channel ID prefix when missing:
-      //   C = public channel, G = private channel/group DM, D = DM
-      let channelType: string | undefined = event.channel_type;
-      if (!channelType && event.channel) {
-        const prefix = (event.channel as string).charAt(0);
-        if (prefix === 'C') {
-          channelType = 'channel';
-        } else if (prefix === 'G') {
-          channelType = 'group';
-        } else if (prefix === 'D') {
-          channelType = 'im';
         }
       }
 
@@ -489,10 +1017,21 @@ export class SlackConnector implements GatewayConnector {
         `[slack] Inbound message: thread=${threadId} channel_type=${channelType} user=${event.user}`
       );
 
-      // Resolve Slack user email if align_slack_users is enabled
+      // Resolve Slack user profile (email + display name)
       let slackUserEmail: string | null = null;
-      if (this.config.align_slack_users && event.user) {
-        slackUserEmail = await this.lookupUserEmail(event.user);
+      let slackUserDisplayName: string | null = null;
+      if (event.user) {
+        // Always look up profile for context injection; email is needed
+        // for user alignment but display name is useful regardless.
+        const profile = await this.lookupUserProfile(event.user);
+        slackUserEmail = profile.email;
+        slackUserDisplayName = profile.displayName;
+      }
+
+      // Resolve channel name for context injection
+      let slackChannelName: string | null = null;
+      if (event.channel && channelType !== 'im') {
+        slackChannelName = await this.lookupChannelName(event.channel);
       }
 
       callback({
@@ -502,9 +1041,11 @@ export class SlackConnector implements GatewayConnector {
         timestamp: event.ts ?? new Date().toISOString(),
         metadata: {
           channel: event.channel,
-          channel_type: event.channel_type,
+          channel_type: channelType,
           requires_mapping_verification: allowedViaThreadReplyException,
           ...(slackUserEmail ? { slack_user_email: slackUserEmail } : {}),
+          ...(slackUserDisplayName ? { slack_user_name: slackUserDisplayName } : {}),
+          ...(slackChannelName ? { slack_channel_name: slackChannelName } : {}),
           // Signal that user alignment was attempted so the gateway can
           // reject (instead of silently falling back to channel owner)
           // when the email couldn't be resolved.
@@ -529,9 +1070,14 @@ export class SlackConnector implements GatewayConnector {
   }
 
   /**
-   * Convert markdown to Slack mrkdwn
+   * Convert markdown to a Slack outbound payload.
+   *
+   * Returns `{ text, blocks? }`. `text` is the mrkdwn fallback used for
+   * notifications and clients that don't render Block Kit; `blocks` is set
+   * when the message contains a GFM table that we can emit as a native
+   * Block Kit `table` block (or a monospace section fallback alongside one).
    */
-  formatMessage(markdown: string): string {
-    return markdownToMrkdwn(markdown);
+  formatMessage(markdown: string): OutboundPayload {
+    return markdownToSlackPayload(markdown);
   }
 }

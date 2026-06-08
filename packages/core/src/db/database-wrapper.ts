@@ -24,6 +24,18 @@ import type * as postgresSchema from './schema.postgres';
 import type * as sqliteSchema from './schema.sqlite';
 
 /**
+ * Cast a Drizzle transaction handle to the unified Database type.
+ *
+ * Drizzle transaction callbacks receive dialect-specific types (LibSQLTransaction / PostgresJsTransaction)
+ * that aren't assignable to `Database` (LibSQLDatabase | PostgresJsDatabase). The wrapper functions
+ * in this module (`select`, `update`, `lockRowForUpdate`, etc.) accept `Database`, so this helper
+ * centralizes the unavoidable double-cast instead of repeating `tx as unknown as Database` everywhere.
+ */
+export function txAsDb(tx: unknown): Database {
+  return tx as unknown as Database;
+}
+
+/**
  * Result of a mutation query (INSERT/UPDATE/DELETE)
  */
 export interface MutationResult {
@@ -104,6 +116,153 @@ export function jsonExtract(db: Database, column: SQL.Aliased | SQL | any, path:
       return sql`${column}${sql.join(objectParts, sql``)}${sql.raw(`->>'${lastPart}'`)}`;
     }
   }
+}
+
+/**
+ * Supported bucket granularities for {@link dateTruncUtc}.
+ */
+export type DateBucket = 'hour' | 'day' | 'week' | 'month';
+
+/**
+ * Truncate a timestamp column to a bucket boundary in UTC and return an ISO 8601 string.
+ *
+ * Produces stable bucket keys that can be grouped and ordered chronologically in both
+ * SQLite and PostgreSQL. Week buckets use ISO-8601 semantics (Monday as start of week).
+ *
+ * - SQLite: `created_at` is stored as integer ms since epoch (`mode: 'timestamp_ms'`),
+ *   so the column value is divided by 1000 to feed into `strftime` via the `unixepoch` modifier.
+ * - PostgreSQL: uses `date_trunc` on a `timestamp with time zone` column, cast to text in
+ *   `YYYY-MM-DDTHH24:MI:SS.MSZ` so the output matches SQLite's.
+ *
+ * @param db - Database instance (for dialect detection)
+ * @param column - Timestamp column to truncate
+ * @param bucket - Granularity
+ * @returns SQL expression producing an ISO-8601 UTC timestamp string
+ *
+ * @example
+ * // SELECT ... dateTruncUtc(db, tasks.created_at, 'day') AS bucket
+ * // → '2026-04-17T00:00:00.000Z'
+ */
+// biome-ignore lint/suspicious/noExplicitAny: Drizzle columns have complex union types
+export function dateTruncUtc(db: Database, column: SQL | any, bucket: DateBucket): SQL {
+  if (isSQLiteDatabase(db)) {
+    // SQLite columns with timestamp_ms mode store integer ms — convert to unix seconds.
+    const unixSeconds = sql`${column} / 1000`;
+    switch (bucket) {
+      case 'hour':
+        return sql`strftime('%Y-%m-%dT%H:00:00.000Z', ${unixSeconds}, 'unixepoch')`;
+      case 'day':
+        return sql`strftime('%Y-%m-%dT00:00:00.000Z', ${unixSeconds}, 'unixepoch')`;
+      case 'month':
+        return sql`strftime('%Y-%m-01T00:00:00.000Z', ${unixSeconds}, 'unixepoch')`;
+      case 'week':
+        // Shift to the Monday of the same ISO week, then emit midnight UTC.
+        // %w returns 0 (Sun) … 6 (Sat); (wd + 6) mod 7 = days since Monday.
+        return sql`strftime(
+          '%Y-%m-%dT00:00:00.000Z',
+          ${unixSeconds},
+          'unixepoch',
+          '-' || ((strftime('%w', ${unixSeconds}, 'unixepoch') + 6) % 7) || ' days'
+        )`;
+    }
+  } else {
+    // PostgreSQL date_trunc accepts 'hour'|'day'|'week'|'month'; week is already ISO (Monday).
+    // IMPORTANT: `date_trunc(unit, timestamptz)` truncates in the session's timezone, so we
+    // convert to a UTC wall-clock timestamp *first* (`column AT TIME ZONE 'UTC'`) and truncate
+    // that. Otherwise day/week/month buckets misalign for any session not set to UTC.
+    return sql`to_char(
+      date_trunc(${bucket}, ${column} AT TIME ZONE 'UTC'),
+      'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+    )`;
+  }
+}
+
+/**
+ * Acquire a row-level lock within a transaction (PostgreSQL FOR UPDATE).
+ *
+ * On PostgreSQL, executes `SELECT 1 FROM <table> WHERE <pk> = <id> FOR UPDATE`
+ * so that concurrent transactions block until this one commits.
+ * On SQLite, this is a no-op — SQLite's transaction model provides implicit locking.
+ *
+ * @param tx - Transaction context (from db.transaction callback)
+ * @param db - Database instance (used for dialect detection only)
+ * @param table - The Drizzle table to lock
+ * @param where - WHERE clause identifying the row (e.g., eq(sessions.session_id, id))
+ */
+export async function lockRowForUpdate(
+  tx: Database,
+  db: Database,
+  table: SQLiteTable | PgTable,
+  where: SQL
+): Promise<void> {
+  if (isPostgresDatabase(db)) {
+    // biome-ignore lint/suspicious/noExplicitAny: Transaction context requires type assertion for raw SQL execution
+    await (tx as any).execute(sql`SELECT 1 FROM ${table} WHERE ${where} FOR UPDATE`);
+  }
+  // SQLite: no-op — implicit locking via transaction
+}
+
+/**
+ * Try to acquire a per-key Postgres transaction-scoped advisory lock.
+ *
+ * Used by the scheduler (and other multi-daemon work-distribution code)
+ * to ensure that two daemons don't both spawn a session for the same
+ * schedule on the same tick. The lock is automatically released at
+ * transaction commit/rollback.
+ *
+ * - PostgreSQL: executes `SELECT pg_try_advisory_xact_lock($1)`. Returns
+ *   `true` if this transaction won the lock, `false` otherwise (the
+ *   caller should skip whatever it was about to do).
+ * - SQLite: returns `true`. SQLite is single-node by definition — no
+ *   cross-process coordination needed.
+ *
+ * Must be called from inside a transaction (`db.transaction(...)`) on
+ * Postgres; on SQLite it's safe to call outside a transaction.
+ *
+ * @param tx - Transaction context (or db on SQLite)
+ * @param db - Database instance (used for dialect detection only)
+ * @param key - 64-bit signed integer key derived from the resource ID.
+ *   See `advisoryLockKeyForUuid` for a stable UUID→bigint hash.
+ */
+export async function tryAdvisoryXactLock(
+  tx: Database,
+  db: Database,
+  key: bigint
+): Promise<boolean> {
+  if (!isPostgresDatabase(db)) return true;
+  // biome-ignore lint/suspicious/noExplicitAny: Transaction context requires type assertion for raw SQL execution
+  const result = (await (tx as any).execute(
+    sql`SELECT pg_try_advisory_xact_lock(${key.toString()}::bigint) AS acquired`
+  )) as { rows?: Array<{ acquired: boolean }> } | Array<{ acquired: boolean }>;
+  // postgres.js returns an array; pg returns { rows: [...] }. Handle both.
+  const row = Array.isArray(result) ? result[0] : result.rows?.[0];
+  return row?.acquired === true;
+}
+
+/**
+ * Stable 64-bit hash of a UUID string for use as a Postgres advisory
+ * lock key. Postgres advisory keys are bigint (signed 64-bit), so we
+ * fold the UUID's 128 bits down with a simple FNV-1a-style mix and
+ * clamp into the signed range.
+ *
+ * Deterministic per UUID, so a schedule's lock key is stable across
+ * processes and restarts. Hash quality is not load-bearing — we only
+ * need "low collision rate across the modest number of schedules
+ * actually due in the same tick"; any two-bigint cell of the hash
+ * space is fine.
+ */
+export function advisoryLockKeyForUuid(uuid: string): bigint {
+  // FNV-1a 64-bit
+  const FNV_OFFSET = 0xcbf29ce484222325n;
+  const FNV_PRIME = 0x100000001b3n;
+  const MASK_64 = 0xffffffffffffffffn;
+  let hash = FNV_OFFSET;
+  for (let i = 0; i < uuid.length; i++) {
+    hash ^= BigInt(uuid.charCodeAt(i));
+    hash = (hash * FNV_PRIME) & MASK_64;
+  }
+  // Convert unsigned 64-bit to signed (Postgres bigint is signed).
+  return hash > 0x7fffffffffffffffn ? hash - 0x10000000000000000n : hash;
 }
 
 /**
@@ -247,6 +406,8 @@ function wrapQuery(query: DrizzleQuery, db: Database): any {
     // biome-ignore lint/suspicious/noExplicitAny: These methods accept varying argument types from Drizzle
     orderBy: (...args: unknown[]) => wrapQuery((query as any).orderBy(...args), db),
     // biome-ignore lint/suspicious/noExplicitAny: These methods accept varying argument types from Drizzle
+    groupBy: (...args: unknown[]) => wrapQuery((query as any).groupBy(...args), db),
+    // biome-ignore lint/suspicious/noExplicitAny: These methods accept varying argument types from Drizzle
     set: (...args: unknown[]) => wrapQuery((query as any).set(...args), db),
     // biome-ignore lint/suspicious/noExplicitAny: These methods accept varying argument types from Drizzle
     values: (...args: unknown[]) => wrapQuery((query as any).values(...args), db),
@@ -254,6 +415,9 @@ function wrapQuery(query: DrizzleQuery, db: Database): any {
     innerJoin: (...args: unknown[]) => wrapQuery((query as any).innerJoin(...args), db),
     // biome-ignore lint/suspicious/noExplicitAny: These methods accept varying argument types from Drizzle
     leftJoin: (...args: unknown[]) => wrapQuery((query as any).leftJoin(...args), db),
+    onConflictDoNothing: (...args: unknown[]) =>
+      // biome-ignore lint/suspicious/noExplicitAny: Drizzle exposes onConflictDoNothing on both dialects after .values()
+      wrapQuery((query as any).onConflictDoNothing(...args), db),
   };
 }
 

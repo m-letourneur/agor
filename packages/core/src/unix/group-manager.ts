@@ -1,43 +1,42 @@
 /**
- * Unix Group Management for Worktree and Repo Isolation
+ * Unix Group Management for Branch and Repo Isolation
  *
  * Provides utilities for managing:
- * - Worktree Unix groups (agor_wt_<short-id>) - for worktree directory access
- * - Repo Unix groups (agor_rp_<short-id>) - for .git/ directory access
+ * - Branch Unix groups (agor_wt_<short-id>) - for branch directory access
+ * - Repo Unix groups (agor_rp_<short-id>) - for repo-root traversal and .git access
  *
  * These functions are designed to be called via `sudo agor admin` commands
  * to perform privileged operations safely.
  *
- * @see context/explorations/unix-user-modes.md
- * @see context/explorations/rbac.md
+ * @see context/guides/rbac-and-unix-isolation.md
  */
 
-import { formatShortId } from '../lib/ids.js';
-import type { RepoID, UUID, WorktreeID } from '../types/index.js';
+import { toShortId } from '../lib/ids.js';
+import type { BranchID, RepoID, UUID } from '../types/index.js';
+import { UNIX_NAME_SHORT_ID_LENGTH } from './short-id-naming.js';
 
 /**
- * Generate Unix group name for a worktree
+ * Generate Unix group name for a branch
  *
  * Format: agor_wt_<short-id>
  * Example: agor_wt_03b62447
  *
- * @param worktreeId - Full worktree UUID
+ * @param branchId - Full branch UUID
  * @returns Unix group name (e.g., 'agor_wt_03b62447')
  */
-export function generateWorktreeGroupName(worktreeId: WorktreeID): string {
-  const shortId = formatShortId(worktreeId as UUID);
-  return `agor_wt_${shortId}`;
+export function generateBranchGroupName(branchId: BranchID): string {
+  return `agor_wt_${toShortId(branchId as UUID, UNIX_NAME_SHORT_ID_LENGTH)}`;
 }
 
 /**
- * Parse worktree ID from Unix group name
+ * Parse branch ID from Unix group name
  *
  * Extracts the short ID from a group name like 'agor_wt_03b62447'
  *
  * @param groupName - Unix group name
- * @returns Short worktree ID (8 chars) or null if invalid format
+ * @returns Short branch ID (8 chars) or null if invalid format
  */
-export function parseWorktreeGroupName(groupName: string): string | null {
+export function parseBranchGroupName(groupName: string): string | null {
   const match = groupName.match(/^agor_wt_([0-9a-f]{8})$/);
   return match ? match[1] : null;
 }
@@ -46,9 +45,9 @@ export function parseWorktreeGroupName(groupName: string): string | null {
  * Validate Unix group name format
  *
  * @param groupName - Group name to validate
- * @returns true if valid worktree group name
+ * @returns true if valid branch group name
  */
-export function isValidWorktreeGroupName(groupName: string): boolean {
+export function isValidBranchGroupName(groupName: string): boolean {
   return /^agor_wt_[0-9a-f]{8}$/.test(groupName);
 }
 
@@ -62,15 +61,14 @@ export function isValidWorktreeGroupName(groupName: string): boolean {
  * Format: agor_rp_<short-id>
  * Example: agor_rp_03b62447
  *
- * This group controls access to the repo's .git/ directory,
- * which is shared across all worktrees.
+ * This group controls access to repo Unix-group-managed paths:
+ * repo-root traversal and the shared .git/ directory.
  *
  * @param repoId - Full repo UUID
  * @returns Unix group name (e.g., 'agor_rp_03b62447')
  */
 export function generateRepoGroupName(repoId: RepoID): string {
-  const shortId = formatShortId(repoId as UUID);
-  return `agor_rp_${shortId}`;
+  return `agor_rp_${toShortId(repoId as UUID, UNIX_NAME_SHORT_ID_LENGTH)}`;
 }
 
 /**
@@ -217,11 +215,13 @@ export const UnixGroupCommands = {
 
     return [
       // Set primary group ownership (visible in ls -la)
+      // IMPORTANT: chgrp invalidates the kernel's ACL permission cache for files
+      // owned by other users, breaking subsequent non-root access even when ACLs
+      // are correct. All commands after chgrp must use sudo for reliable access.
       `sudo -n chgrp -R ${groupName} "${path}"`,
-      // Set setgid bit on directories only (new files inherit group ownership)
-      // Note: find runs without sudo (just traversing), chmod inside -exec uses sudo
-      `find "${path}" -type d -exec sudo -n chmod g+s {} +`,
-      // ACL: owner gets full access
+      // ACL: set permissions BEFORE setgid traversal
+      // Order matters: ACLs must be set first so the filesystem is accessible
+      // for any subsequent operations, even though we use sudo throughout.
       `sudo -n setfacl -R -m u::rwX "${path}"`,
       // ACL: group gets full access (rwX = rw for files, rwx for dirs)
       `sudo -n setfacl -R -m g:${groupName}:rwX "${path}"`,
@@ -232,12 +232,83 @@ export const UnixGroupCommands = {
       // DEFAULT ACLs for new files/dirs (inherit these permissions)
       // IMPORTANT: Include m::rwX to ensure mask allows group access on new files
       `sudo -n setfacl -R -d -m u::rwX,g:${groupName}:rwX,${othersAcl},m::rwX "${path}"`,
+      // Set setgid bit on directories only (new files inherit group ownership)
+      // Uses sudo for find traversal since chgrp can invalidate ACL cache
+      `sudo -n find "${path}" -type d -exec chmod g+s {} +`,
     ];
   },
+
+  /**
+   * Set group ownership and ACL on a single directory (non-recursive)
+   *
+   * Use this when only directory traversal/group on the root itself is needed
+   * and child files/directories should not be recursively rewritten.
+   *
+   * @param path - Directory path
+   * @param groupName - Group to own the directory
+   * @param permissions - Permissions mode (e.g., '2770' for no others access)
+   * @returns Array of command strings with sudo to execute sequentially
+   */
+  setDirectoryGroupShallow: (path: string, groupName: string, permissions: string): string[] => {
+    const othersDigit = permissions.charAt(3);
+    let othersAcl: string;
+    switch (othersDigit) {
+      case '7':
+        othersAcl = 'o::rwX';
+        break;
+      case '5':
+        othersAcl = 'o::rX';
+        break;
+      default:
+        othersAcl = 'o::---';
+    }
+
+    return [
+      `sudo -n chgrp ${groupName} "${path}"`,
+      `sudo -n setfacl -m u::rwX "${path}"`,
+      `sudo -n setfacl -m g:${groupName}:rwX "${path}"`,
+      `sudo -n setfacl -m ${othersAcl} "${path}"`,
+      `sudo -n setfacl -m m::rwX "${path}"`,
+      `sudo -n chmod g+s "${path}"`,
+    ];
+  },
+
+  /**
+   * Set explicit user ACL on a directory (recursive with defaults)
+   *
+   * Grants a specific user rwX access to all existing files/dirs and sets
+   * default ACLs so new files inherit the same access. This is used to
+   * ensure the daemon user can always access branch files, even when
+   * the daemon process has stale supplementary groups (groups added after
+   * process startup are not picked up by the running process).
+   *
+   * @param path - Directory path
+   * @param username - Unix username to grant access to
+   * @returns Array of command strings with sudo to execute sequentially
+   */
+  setUserAcl: (path: string, username: string): string[] => [
+    // Set ACL on all existing files and directories
+    `sudo -n setfacl -R -m u:${username}:rwX "${path}"`,
+    // Set default ACL so new files/dirs inherit the same access
+    `sudo -n setfacl -R -d -m u:${username}:rwX "${path}"`,
+  ],
+
+  /**
+   * Set explicit user ACL on a single directory (non-recursive)
+   *
+   * Useful when only root-level traversal/access is required.
+   *
+   * @param path - Directory path
+   * @param username - Unix username to grant access to
+   * @returns Array of command strings with sudo to execute sequentially
+   */
+  setUserAclShallow: (path: string, username: string): string[] => [
+    `sudo -n setfacl -m u:${username}:rwX "${path}"`,
+  ],
 } as const;
 
 /**
- * Permission modes for worktree directories
+ * Permission modes for branch directories
  *
  * These map to the 'others_fs_access' RBAC setting.
  *
@@ -250,7 +321,7 @@ export const UnixGroupCommands = {
  *
  * The setgid bit (2) ensures new files inherit the group.
  */
-export const WorktreePermissionModes = {
+export const BranchPermissionModes = {
   /** No access for non-owners (permission denied) */
   none: '2770', // drwxrws--- (owner + group full access, others nothing, setgid)
 
@@ -262,23 +333,21 @@ export const WorktreePermissionModes = {
 } as const;
 
 /**
- * Get permission mode for a worktree based on others_fs_access setting
+ * Get permission mode for a branch based on others_fs_access setting
  *
  * @param othersAccess - Access level ('none' | 'read' | 'write')
  * @returns Permission mode string (e.g., '2775')
  */
-export function getWorktreePermissionMode(
-  othersAccess: 'none' | 'read' | 'write' = 'read'
-): string {
-  return WorktreePermissionModes[othersAccess];
+export function getBranchPermissionMode(othersAccess: 'none' | 'read' | 'write' = 'read'): string {
+  return BranchPermissionModes[othersAccess];
 }
 
 /**
- * Permission mode for repo .git directories
+ * Permission mode for repo directories
  *
- * The .git directory is shared across all worktrees in a repo.
- * Users who have access to ANY worktree in the repo get added
- * to the repo group to enable git operations (commit, push, etc).
+ * Applied to repo Unix-group-managed paths (repo root traversal and `.git`).
+ * Users who have access to ANY branch in the repo get added to the repo
+ * group to enable git operations (commit, push, etc).
  *
  * Mode: 2770 (drwxrws---)
  * - Owner: full access (rwx)

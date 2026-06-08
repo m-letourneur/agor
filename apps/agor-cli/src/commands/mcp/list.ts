@@ -2,7 +2,7 @@
  * List all MCP servers
  */
 
-import type { MCPServer } from '@agor/core/types';
+import { shortId } from '@agor-live/client';
 import { Flags } from '@oclif/core';
 import chalk from 'chalk';
 import Table from 'cli-table3';
@@ -46,8 +46,7 @@ export default class McpList extends BaseCommand {
       if (flags.enabled) query.enabled = true;
 
       // Fetch MCP servers
-      const result = await client.service('mcp-servers').find({ query });
-      const servers = (Array.isArray(result) ? result : result.data) as MCPServer[];
+      const servers = await client.service('mcp-servers').findAll({ query });
 
       if (servers.length === 0) {
         this.log(chalk.yellow('No MCP servers found.'));
@@ -72,7 +71,7 @@ export default class McpList extends BaseCommand {
       // Add rows
       for (const server of servers) {
         table.push([
-          String(server.mcp_server_id).substring(0, 8),
+          shortId(String(server.mcp_server_id)),
           server.display_name || server.name,
           server.transport,
           server.scope,

@@ -2,10 +2,12 @@
  * About Tab - Display version, connection info, and system details
  */
 
-import type { AgorClient } from '@agor/core/api';
-import { Card, Descriptions, Space, Typography } from 'antd';
+import type { AgorClient, UnixUserMode } from '@agor-live/client';
+import { Button, Card, Descriptions, Space, Tag, Tooltip, Typography } from 'antd';
 import { lazy, Suspense, useEffect, useState } from 'react';
 import { getDaemonUrl } from '../../config/daemon';
+import { useConnectionState } from '../../contexts/ConnectionContext';
+import { isOutOfSync } from '../../hooks/useServerVersion';
 
 // Lazy load particles
 const ParticleBackground = lazy(() =>
@@ -25,8 +27,25 @@ interface WindowWithAgorConfig extends Window {
   AGOR_DAEMON_URL?: string;
 }
 
+// Renders nothing — just throws on mount. Used by the admin Crash Test
+// button to verify the global ErrorBoundary catches render-phase crashes
+// and renders the friendly crash screen. React error boundaries do NOT
+// catch errors thrown from event handlers, which is why we flip a state
+// flag and let this component throw during the next render instead of
+// throwing from the button's onClick directly.
+function CrashTestBomb(): never {
+  throw new Error(
+    'Crash test: this is a synthetic render-phase error from About → Crash Test. ' +
+      "If you're seeing the friendly crash screen, the global ErrorBoundary works."
+  );
+}
+
 interface HealthInfo {
   version?: string;
+  /** Build SHA from /health (canonical version signal — see setup/build-info.ts). */
+  buildSha?: string;
+  /** ISO timestamp from /health, may be null when SHA came from env or git. */
+  builtAt?: string | null;
   database?:
     | string
     | {
@@ -36,11 +55,28 @@ interface HealthInfo {
       };
   auth?: {
     requireAuth: boolean;
-    allowAnonymous: boolean;
   };
   encryption?: {
     enabled: boolean;
     method: string | null;
+  };
+  execution?: {
+    branchRbac: boolean;
+    unixUserMode: UnixUserMode;
+  };
+  security?: {
+    csp: {
+      enabled: boolean;
+      reportOnly: boolean;
+      reportUri?: string;
+      header: string;
+    };
+    cors: {
+      mode: 'list' | 'wildcard' | 'reflect' | 'null-origin';
+      credentials: boolean;
+      originCount: number;
+      allowSandpack: boolean;
+    };
   };
 }
 
@@ -53,6 +89,12 @@ export const AboutTab: React.FC<AboutTabProps> = ({
   const daemonUrl = getDaemonUrl();
   const [detectionMethod, setDetectionMethod] = useState<string>('');
   const [healthInfo, setHealthInfo] = useState<HealthInfo | null>(null);
+  // Admin-only crash-test toggle: flipping this true makes <CrashTestBomb />
+  // mount and throw on the next render, which trips the global ErrorBoundary.
+  const [crashTest, setCrashTest] = useState(false);
+  // SHA captured at tab-load time (resets on hard reload). Provider-owned in
+  // App.tsx via useServerVersion so this and the banner stay in lockstep.
+  const { capturedSha } = useConnectionState();
 
   useEffect(() => {
     // Determine which detection method was used
@@ -89,7 +131,7 @@ export const AboutTab: React.FC<AboutTabProps> = ({
 
       {/* Content */}
       <div style={{ position: 'relative', zIndex: 1 }}>
-        <Space direction="vertical" size="large" style={{ width: '100%' }}>
+        <Space orientation="vertical" size="large" style={{ width: '100%' }}>
           {/* Connection Info */}
           <Card
             title="Connection Info"
@@ -111,6 +153,26 @@ export const AboutTab: React.FC<AboutTabProps> = ({
               )}
               {healthInfo?.version && (
                 <Descriptions.Item label="Version">{healthInfo.version}</Descriptions.Item>
+              )}
+              {healthInfo?.buildSha && (
+                <Descriptions.Item label="Daemon Build">
+                  <code>{healthInfo.buildSha}</code>
+                  {healthInfo.builtAt && (
+                    <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
+                      built {healthInfo.builtAt}
+                    </Typography.Text>
+                  )}
+                </Descriptions.Item>
+              )}
+              {capturedSha && (
+                <Descriptions.Item label="Tab Captured">
+                  <code>{capturedSha}</code>
+                  {isOutOfSync(capturedSha, healthInfo?.buildSha) && (
+                    <Typography.Text type="warning" style={{ marginLeft: 8 }}>
+                      ⚠️ out of sync — refresh to load the latest UI
+                    </Typography.Text>
+                  )}
+                </Descriptions.Item>
               )}
               {healthInfo?.encryption && (
                 <Descriptions.Item label="Encryption">
@@ -168,17 +230,125 @@ export const AboutTab: React.FC<AboutTabProps> = ({
                       </>
                     ))}
                   {healthInfo?.auth && (
+                    <Descriptions.Item label="Authentication">🔐 Required</Descriptions.Item>
+                  )}
+                  {healthInfo?.execution && (
                     <>
-                      <Descriptions.Item label="Authentication">
-                        {healthInfo.auth.requireAuth ? '🔐 Required' : '🔓 Optional'}
+                      <Descriptions.Item label="Branch RBAC">
+                        {healthInfo.execution.branchRbac ? (
+                          <span style={{ color: '#52c41a' }}>🛡️ Enabled</span>
+                        ) : (
+                          <span style={{ color: '#faad14' }}>⚠️ Disabled (open access)</span>
+                        )}
                       </Descriptions.Item>
-                      <Descriptions.Item label="Anonymous Access">
-                        {healthInfo.auth.allowAnonymous ? '✓ Enabled' : '✗ Disabled'}
+                      <Descriptions.Item label="Unix User Mode">
+                        <code>{healthInfo.execution.unixUserMode}</code>
+                        {healthInfo.execution.unixUserMode === 'simple' && (
+                          <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
+                            (no OS isolation)
+                          </Typography.Text>
+                        )}
+                        {healthInfo.execution.unixUserMode === 'insulated' && (
+                          <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
+                            (branch groups)
+                          </Typography.Text>
+                        )}
+                        {healthInfo.execution.unixUserMode === 'strict' && (
+                          <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
+                            (per-user impersonation)
+                          </Typography.Text>
+                        )}
                       </Descriptions.Item>
                     </>
                   )}
                 </Descriptions>
               </Card>
+
+              {/* Security Headers (CSP + CORS posture) */}
+              {healthInfo?.security && (
+                <Card
+                  title="Security Headers (Admin Only)"
+                  variant="borderless"
+                  style={{ maxWidth: 800, margin: '0 auto' }}
+                >
+                  <Descriptions column={1} bordered size="small">
+                    <Descriptions.Item label="CSP">
+                      {healthInfo.security.csp.enabled ? (
+                        healthInfo.security.csp.reportOnly ? (
+                          <Tag color="warning">Report-Only</Tag>
+                        ) : (
+                          <Tag color="success">Enforced</Tag>
+                        )
+                      ) : (
+                        <Tag color="error">Disabled</Tag>
+                      )}
+                      {healthInfo.security.csp.reportUri && (
+                        <Typography.Text type="secondary" style={{ marginLeft: 8 }}>
+                          Reports → <code>{healthInfo.security.csp.reportUri}</code>
+                        </Typography.Text>
+                      )}
+                    </Descriptions.Item>
+                    <Descriptions.Item label="CSP Header">
+                      <Tooltip title="Full Content-Security-Policy header the daemon is emitting. If a resource is blocked, check which directive matches.">
+                        <Typography.Paragraph
+                          copyable={{ text: healthInfo.security.csp.header }}
+                          style={{
+                            margin: 0,
+                            fontFamily: 'monospace',
+                            fontSize: 12,
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-all',
+                          }}
+                        >
+                          {healthInfo.security.csp.header}
+                        </Typography.Paragraph>
+                      </Tooltip>
+                    </Descriptions.Item>
+                    <Descriptions.Item label="CORS Mode">
+                      <code>{healthInfo.security.cors.mode}</code>
+                      {healthInfo.security.cors.mode === 'wildcard' && (
+                        <Typography.Text type="danger" style={{ marginLeft: 8 }}>
+                          ⚠️ Any origin accepted
+                        </Typography.Text>
+                      )}
+                      {healthInfo.security.cors.mode === 'reflect' && (
+                        <Typography.Text type="warning" style={{ marginLeft: 8 }}>
+                          ⚠️ Origin header echoed
+                        </Typography.Text>
+                      )}
+                    </Descriptions.Item>
+                    <Descriptions.Item label="CORS Credentials">
+                      {healthInfo.security.cors.credentials ? (
+                        <Tag color="success">Enabled</Tag>
+                      ) : (
+                        <Tag color="default">Disabled</Tag>
+                      )}
+                    </Descriptions.Item>
+                    <Descriptions.Item label="Allowed Origins">
+                      {healthInfo.security.cors.originCount} configured{' '}
+                      <Typography.Text type="secondary">
+                        (+ localhost dev ports
+                        {healthInfo.security.cors.allowSandpack && ', + Sandpack'})
+                      </Typography.Text>
+                    </Descriptions.Item>
+                  </Descriptions>
+                  <Typography.Paragraph
+                    type="secondary"
+                    style={{ marginTop: 12, marginBottom: 0, fontSize: 12 }}
+                  >
+                    Configure via <code>security.csp</code> and <code>security.cors</code> in{' '}
+                    <code>~/.agor/config.yaml</code>. See{' '}
+                    <a
+                      href="https://github.com/preset-io/agor/blob/main/context/concepts/security.md"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      context/concepts/security.md
+                    </a>
+                    .
+                  </Typography.Paragraph>
+                </Card>
+              )}
 
               {/* System Debug Info */}
               <Card
@@ -202,6 +372,17 @@ export const AboutTab: React.FC<AboutTabProps> = ({
                   </Descriptions.Item>
                   <Descriptions.Item label="Path">
                     <code>{window.location.pathname}</code>
+                  </Descriptions.Item>
+                  <Descriptions.Item label="Crash Test">
+                    <Space>
+                      <Button danger size="small" onClick={() => setCrashTest(true)}>
+                        Trigger render crash
+                      </Button>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        Throws during render to verify the global error boundary. Reload to recover.
+                      </Typography.Text>
+                    </Space>
+                    {crashTest && <CrashTestBomb />}
                   </Descriptions.Item>
                 </Descriptions>
               </Card>

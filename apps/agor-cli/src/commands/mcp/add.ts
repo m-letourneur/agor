@@ -2,7 +2,7 @@
  * `agor mcp add` - Add a new MCP server
  */
 
-import type { MCPServer } from '@agor/core/types';
+import { shortId } from '@agor-live/client';
 import { Args, Flags } from '@oclif/core';
 import chalk from 'chalk';
 import { BaseCommand } from '../../base-command';
@@ -126,12 +126,12 @@ export default class McpAdd extends BaseCommand {
       if (flags['session-id']) data.session_id = flags['session-id'];
 
       // Call daemon API
-      const server = (await client.service('mcp-servers').create(data)) as MCPServer;
+      const server = await client.service('mcp-servers').create(data);
 
       this.log(`${chalk.green('✓')} MCP server added`);
       this.log('');
       this.log(chalk.bold('Server Details:'));
-      this.log(`  ${chalk.cyan('ID')}: ${String(server.mcp_server_id).substring(0, 8)}`);
+      this.log(`  ${chalk.cyan('ID')}: ${shortId(String(server.mcp_server_id))}`);
       this.log(`  ${chalk.cyan('Name')}: ${server.name}`);
       this.log(`  ${chalk.cyan('Transport')}: ${server.transport}`);
       this.log(`  ${chalk.cyan('Scope')}: ${server.scope}`);

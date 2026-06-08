@@ -8,8 +8,10 @@
  */
 
 import { execSync } from 'node:child_process';
-import { formatShortId } from '../lib/ids.js';
+import type { UnixUserMode } from '../config/types.js';
+import { toShortId } from '../lib/ids.js';
 import type { UserID, UUID } from '../types/index.js';
+import { UNIX_NAME_SHORT_ID_LENGTH } from './short-id-naming.js';
 
 /**
  * Default home directory base for Agor users
@@ -22,9 +24,14 @@ export const AGOR_HOME_BASE = '/home';
 export const AGOR_DEFAULT_SHELL = '/bin/bash';
 
 /**
- * Agor worktrees directory name within user home
+ * Per-user symlink directory for Agor branches, relative to the user's home.
+ *
+ * The on-disk path stays `agor/worktrees/` for backwards compatibility with
+ * existing installs (renaming would orphan every symlink in every Agor user's
+ * home dir). The conceptual name is "branches"; the dir name on disk is a
+ * legacy artifact.
  */
-export const AGOR_WORKTREES_DIR = 'agor/worktrees';
+export const AGOR_BRANCHES_DIR = 'agor/worktrees';
 
 /**
  * Generate a default Unix username for an Agor user
@@ -36,8 +43,7 @@ export const AGOR_WORKTREES_DIR = 'agor/worktrees';
  * @returns Unix username (e.g., 'agor_03b62447')
  */
 export function generateUnixUsername(userId: UserID): string {
-  const shortId = formatShortId(userId as UUID);
-  return `agor_${shortId}`;
+  return `agor_${toShortId(userId as UUID, UNIX_NAME_SHORT_ID_LENGTH)}`;
 }
 
 /**
@@ -77,6 +83,36 @@ export function isValidUnixUsername(username: string): boolean {
 }
 
 /**
+ * Validate that a username/password pair is safe to feed to chpasswd via stdin.
+ *
+ * chpasswd parses input as `username:password\n` records. Newlines in the
+ * password would break into new records, and a colon in the username would be
+ * interpreted as the username/password separator — both allowing an attacker
+ * to change other users' passwords.
+ *
+ * @throws Error if username or password would corrupt chpasswd's parser.
+ */
+export function assertChpasswdInputSafe(username: string, password: string): void {
+  if (typeof username !== 'string' || username.length === 0) {
+    throw new Error('Refusing to sync password: unix_username is empty');
+  }
+  if (username.includes(':')) {
+    throw new Error(
+      'Refusing to sync password: unix_username contains ":" (chpasswd field separator)'
+    );
+  }
+  if (/[\r\n\0]/.test(username)) {
+    throw new Error('Refusing to sync password: unix_username contains newline or NUL byte');
+  }
+  if (typeof password !== 'string' || password.length === 0) {
+    throw new Error('Refusing to sync password: password is empty');
+  }
+  if (/[\r\n\0]/.test(password)) {
+    throw new Error('Refusing to sync password: password contains newline or NUL byte');
+  }
+}
+
+/**
  * Get home directory path for a Unix user
  *
  * @param username - Unix username
@@ -88,14 +124,14 @@ export function getUserHomeDir(username: string, homeBase: string = AGOR_HOME_BA
 }
 
 /**
- * Get Agor worktrees directory path for a user
+ * Get Agor branches directory path for a user
  *
  * @param username - Unix username
  * @param homeBase - Base directory for homes (default: /home)
  * @returns Full path to ~/agor/worktrees
  */
-export function getUserWorktreesDir(username: string, homeBase: string = AGOR_HOME_BASE): string {
-  return `${homeBase}/${username}/${AGOR_WORKTREES_DIR}`;
+export function getUserBranchesDir(username: string, homeBase: string = AGOR_HOME_BASE): string {
+  return `${homeBase}/${username}/${AGOR_BRANCHES_DIR}`;
 }
 
 /**
@@ -181,11 +217,16 @@ export const UnixUserCommands = {
   /**
    * Format stdin input for chpasswd command
    *
+   * Validates inputs via {@link assertChpasswdInputSafe} to prevent a caller
+   * from injecting extra `username:password` records into chpasswd's stdin.
+   *
    * @param username - Unix username
    * @param password - Plaintext password to set
    * @returns Formatted stdin input: "username:password\n"
+   * @throws Error if username or password contain chpasswd-unsafe characters
    */
   formatPasswordInput: (username: string, password: string): string => {
+    assertChpasswdInputSafe(username, password);
     return `${username}:${password}\n`;
   },
 
@@ -264,7 +305,7 @@ export const UnixUserCommands = {
   },
 
   /**
-   * Setup Agor worktrees directory structure for a user
+   * Setup Agor branches directory structure for a user
    *
    * Creates ~/agor/worktrees with proper ownership.
    * Returns an array of commands to be executed sequentially.
@@ -273,10 +314,10 @@ export const UnixUserCommands = {
    * @param homeBase - Home directory base
    * @returns Array of command strings to execute sequentially
    */
-  setupWorktreesDir: (username: string, homeBase: string = AGOR_HOME_BASE): string[] => {
-    const worktreesDir = `${homeBase}/${username}/${AGOR_WORKTREES_DIR}`;
+  setupBranchesDir: (username: string, homeBase: string = AGOR_HOME_BASE): string[] => {
+    const branchesDir = `${homeBase}/${username}/${AGOR_BRANCHES_DIR}`;
     return [
-      `sudo -n mkdir -p "${worktreesDir}"`,
+      `sudo -n mkdir -p "${branchesDir}"`,
       `sudo -n chown -R "${username}:${username}" "${homeBase}/${username}/agor"`,
     ];
   },
@@ -311,9 +352,12 @@ export function unixUserExists(username: string): boolean {
 }
 
 /**
- * Unix user mode types
+ * Re-export of {@link UnixUserMode} for existing `@agor/core/unix` consumers.
+ * Canonical definition lives in `@agor/core/config/types` so browser-safe
+ * surfaces (e.g. `@agor/core/client`) can use it without pulling in this
+ * Node-only module.
  */
-export type UnixUserMode = 'simple' | 'insulated' | 'strict';
+export type { UnixUserMode };
 
 /**
  * Result of resolving which Unix user to impersonate

@@ -1,47 +1,48 @@
 /**
- * Copy text to clipboard with error handling
+ * Clipboard utilities
  *
- * NOTE: This utility is now deprecated in favor of the built-in copy functionality
- * in the themed message utility (utils/message.tsx). All messages now have
- * copy-to-clipboard built-in.
- *
- * @param text - Text to copy to clipboard
- * @param options - Optional configuration
- * @param options.showSuccess - Whether to show success message (default: false)
- * @param options.successMessage - Custom success message
- * @param options.showError - Whether to show error message (default: true)
- * @param options.errorMessage - Custom error message
- * @returns Promise that resolves to true if successful, false otherwise
+ * Core clipboard primitive with Clipboard API + execCommand fallback.
+ * Used by all clipboard functionality in the app:
+ * - `useCopyToClipboard()` hook — for buttons needing a "copied" icon state
+ * - `CopyableContent` component — for hoverable content blocks
+ * - Direct callers — for simple copy-on-click with toast feedback
  */
-export async function copyToClipboard(
-  text: string,
-  options?: {
-    showSuccess?: boolean;
-    successMessage?: string;
-    showError?: boolean;
-    errorMessage?: string;
+
+import React from 'react';
+
+/**
+ * Copy text to clipboard with Clipboard API + execCommand fallback.
+ *
+ * @returns true if copy succeeded, false otherwise
+ */
+export async function copyToClipboard(text: string): Promise<boolean> {
+  // On HTTP/local-network dev URLs, `navigator.clipboard.writeText` may exist
+  // but reject because the page is not a secure context. If we await that
+  // rejection first, browsers can consume the click's transient user activation
+  // and make the execCommand fallback fail too. Prefer the synchronous fallback
+  // immediately in known-insecure contexts.
+  if (globalThis.isSecureContext === false && copyWithExecCommand(text)) {
+    return true;
   }
-): Promise<boolean> {
-  const {
-    showSuccess = false,
-    successMessage = 'Copied to clipboard',
-    showError = true,
-    errorMessage = 'Failed to copy to clipboard',
-  } = options || {};
 
-  try {
-    // Try modern Clipboard API first (requires HTTPS)
-    if (navigator.clipboard?.writeText) {
+  // Try modern Clipboard API first (requires HTTPS / secure context)
+  if (navigator.clipboard?.writeText) {
+    try {
       await navigator.clipboard.writeText(text);
-      if (showSuccess) {
-        // Note: For new code, use the themed message utility instead
-        console.log(successMessage);
-      }
       return true;
+    } catch {
+      // Clipboard API exists but failed (e.g. non-secure context) — fall through to execCommand
     }
+  }
 
-    // Fallback to execCommand for HTTP/dev mode
-    const textArea = document.createElement('textarea');
+  // Fallback to execCommand for HTTP/dev mode
+  return copyWithExecCommand(text);
+}
+
+function copyWithExecCommand(text: string): boolean {
+  let textArea: HTMLTextAreaElement | undefined;
+  try {
+    textArea = document.createElement('textarea');
     textArea.value = text;
     textArea.style.position = 'fixed';
     textArea.style.left = '-999999px';
@@ -51,23 +52,17 @@ export async function copyToClipboard(
     textArea.select();
 
     const successful = document.execCommand('copy');
-    document.body.removeChild(textArea);
 
     if (successful) {
-      if (showSuccess) {
-        console.log(successMessage);
-      }
       return true;
-    } else {
-      throw new Error('execCommand copy failed');
     }
   } catch (error) {
     console.error('Failed to copy to clipboard:', error);
-    if (showError) {
-      console.error(errorMessage);
-    }
-    return false;
+  } finally {
+    textArea?.remove();
   }
+
+  return false;
 }
 
 /**
@@ -81,20 +76,17 @@ export async function copyToClipboard(
  */
 export function useCopyToClipboard(
   resetDelay = 2000
-): [boolean, (text: string, showFeedback?: boolean) => Promise<boolean>] {
+): [boolean, (text: string) => Promise<boolean>] {
   const [copied, setCopied] = React.useState(false);
   const timeoutRef = React.useRef<NodeJS.Timeout>();
 
-  const copy = async (text: string, showFeedback = false): Promise<boolean> => {
+  const copy = async (text: string): Promise<boolean> => {
     // Clear any existing timeout
     if (timeoutRef.current) {
       clearTimeout(timeoutRef.current);
     }
 
-    const success = await copyToClipboard(text, {
-      showSuccess: showFeedback,
-      showError: showFeedback,
-    });
+    const success = await copyToClipboard(text);
 
     if (success) {
       setCopied(true);
@@ -117,6 +109,3 @@ export function useCopyToClipboard(
 
   return [copied, copy];
 }
-
-// Import React for the hook
-import React from 'react';

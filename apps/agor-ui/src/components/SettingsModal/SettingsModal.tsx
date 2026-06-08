@@ -1,23 +1,30 @@
-import type { AgorClient } from '@agor/core/api';
 import type {
+  AgorClient,
+  Artifact,
   Board,
   BoardEntityObject,
+  Branch,
+  CardType,
+  CardWithType,
+  CreateLocalRepoRequest,
   CreateMCPServerInput,
+  CreateRepoRequest,
   CreateUserInput,
   GatewayChannel,
   MCPServer,
   Repo,
   Session,
-  UpdateMCPServerInput,
   UpdateUserInput,
   User,
-  Worktree,
-} from '@agor/core/types';
+} from '@agor-live/client';
+import { hasMinimumRole, ROLES } from '@agor-live/client';
 import {
   ApiOutlined,
   AppstoreOutlined,
   BranchesOutlined,
   CloseOutlined,
+  CreditCardOutlined,
+  ExperimentOutlined,
   FolderOutlined,
   InfoCircleOutlined,
   MessageOutlined,
@@ -27,53 +34,63 @@ import {
 } from '@ant-design/icons';
 import type { MenuProps } from 'antd';
 import { Layout, Menu, Modal, theme } from 'antd';
-import { useState } from 'react';
-import { WorktreeModal } from '../WorktreeModal';
-import type { WorktreeUpdate } from '../WorktreeModal/tabs/GeneralTab';
+import { useMemo, useState } from 'react';
+import type { BranchStorageConfig } from '@/utils/branchStorage';
+import { useServiceEnabled } from '../../hooks/useServicesConfig';
+import { SETTINGS_SECTIONS, type SettingsSection } from '../../hooks/useSettingsRoute';
+import { BranchModal } from '../BranchModal';
+import type { BranchUpdate } from '../BranchModal/tabs/GeneralTab';
 import { AboutTab } from './AboutTab';
 import { AgenticToolsSection } from './AgenticToolsSection';
-import { AgentsTable } from './AgentsTable';
+import { ArtifactsTable } from './ArtifactsTable';
+import { AssistantsTable } from './AssistantsTable';
 import { BoardsTable } from './BoardsTable';
+import { BranchesTable } from './BranchesTable';
+import { CardsTable } from './CardsTable';
 import { GatewayChannelsTable } from './GatewayChannelsTable';
+import { GroupsTable } from './GroupsTable';
 import { MCPServersTable } from './MCPServersTable';
 import { ReposTable } from './ReposTable';
 import { UsersTable } from './UsersTable';
-import { WorktreesTable } from './WorktreesTable';
 
 const { Sider, Content } = Layout;
 
 export interface SettingsModalProps {
   open: boolean;
   onClose: () => void;
-  client: AgorClient | null; // Still needed for WorktreeModal
+  client: AgorClient | null; // Still needed for BranchModal
   currentUser?: User | null; // Current logged-in user
   boardById: Map<string, Board>;
   boardObjects: BoardEntityObject[];
   repoById: Map<string, Repo>;
-  worktreeById: Map<string, Worktree>;
+  branchById: Map<string, Branch>;
   sessionById: Map<string, Session>; // O(1) ID lookups - efficient, stable references
-  sessionsByWorktree: Map<string, Session[]>; // O(1) worktree filtering
+  sessionsByBranch: Map<string, Session[]>; // O(1) branch filtering
   userById: Map<string, User>;
   mcpServerById: Map<string, MCPServer>;
+  cardById?: Map<string, CardWithType>;
+  cardTypeById?: Map<string, CardType>;
   activeTab?: string; // Control which tab is shown when modal opens
   onTabChange?: (tabKey: string) => void;
   onCreateBoard?: (board: Partial<Board>) => void;
   onUpdateBoard?: (boardId: string, updates: Partial<Board>) => void;
   onDeleteBoard?: (boardId: string) => void;
-  onCreateRepo?: (data: { url: string; slug: string; default_branch: string }) => void;
-  onCreateLocalRepo?: (data: { path: string; slug?: string }) => void;
+  onArchiveBoard?: (boardId: string) => void;
+  onUnarchiveBoard?: (boardId: string) => void;
+  onCreateRepo?: (data: CreateRepoRequest) => void | Promise<void>;
+  onCreateLocalRepo?: (data: CreateLocalRepoRequest) => void | Promise<void>;
   onUpdateRepo?: (repoId: string, updates: Partial<Repo>) => void;
   onDeleteRepo?: (repoId: string, cleanup: boolean) => void;
-  onArchiveOrDeleteWorktree?: (
-    worktreeId: string,
+  onArchiveOrDeleteBranch?: (
+    branchId: string,
     options: {
       metadataAction: 'archive' | 'delete';
       filesystemAction: 'preserved' | 'cleaned' | 'deleted';
     }
   ) => void;
-  onUnarchiveWorktree?: (worktreeId: string, options?: { boardId?: string }) => void;
-  onUpdateWorktree?: (worktreeId: string, updates: WorktreeUpdate) => void;
-  onCreateWorktree?: (
+  onUnarchiveBranch?: (branchId: string, options?: { boardId?: string }) => void;
+  onUpdateBranch?: (branchId: string, updates: BranchUpdate) => void;
+  onCreateBranch?: (
     repoId: string,
     data: {
       name: string;
@@ -83,20 +100,25 @@ export interface SettingsModalProps {
       pullLatest: boolean;
       issue_url?: string;
       pull_request_url?: string;
+      storage_mode?: 'worktree' | 'clone';
+      clone_depth?: number;
     }
-  ) => Promise<Worktree | null>;
-  onStartEnvironment?: (worktreeId: string) => void;
-  onStopEnvironment?: (worktreeId: string) => void;
+  ) => Promise<Branch | null>;
+  onStartEnvironment?: (branchId: string) => void;
+  onStopEnvironment?: (branchId: string) => void;
   onCreateUser?: (data: CreateUserInput) => void;
   onUpdateUser?: (userId: string, updates: UpdateUserInput) => void;
   onDeleteUser?: (userId: string) => void;
   onCreateMCPServer?: (data: CreateMCPServerInput) => void;
-  onUpdateMCPServer?: (serverId: string, updates: UpdateMCPServerInput) => void;
   onDeleteMCPServer?: (serverId: string) => void;
   gatewayChannelById?: Map<string, GatewayChannel>;
   onCreateGatewayChannel?: (data: Partial<GatewayChannel>) => void;
   onUpdateGatewayChannel?: (channelId: string, updates: Partial<GatewayChannel>) => void;
   onDeleteGatewayChannel?: (channelId: string) => void;
+  artifactById?: Map<string, Artifact>;
+  onUpdateArtifact?: (artifactId: string, updates: Partial<Artifact>) => void;
+  onDeleteArtifact?: (artifactId: string) => void;
+  branchStorageConfig?: BranchStorageConfig;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -107,147 +129,224 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   boardById,
   boardObjects,
   repoById,
-  worktreeById,
-  sessionsByWorktree,
+  branchById,
+  sessionsByBranch,
   userById,
   mcpServerById,
+  cardById = new Map(),
+  cardTypeById = new Map(),
   activeTab = 'boards',
   onTabChange,
   onCreateBoard,
   onUpdateBoard,
   onDeleteBoard,
+  onArchiveBoard,
+  onUnarchiveBoard,
   onCreateRepo,
   onCreateLocalRepo,
   onUpdateRepo,
   onDeleteRepo,
-  onArchiveOrDeleteWorktree,
-  onUnarchiveWorktree,
-  onUpdateWorktree,
-  onCreateWorktree,
+  onArchiveOrDeleteBranch,
+  onUnarchiveBranch,
+  onUpdateBranch,
+  onCreateBranch,
   onStartEnvironment,
   onStopEnvironment,
   onCreateUser,
   onUpdateUser,
   onDeleteUser,
   onCreateMCPServer,
-  onUpdateMCPServer,
   onDeleteMCPServer,
   gatewayChannelById = new Map(),
   onCreateGatewayChannel,
   onUpdateGatewayChannel,
   onDeleteGatewayChannel,
+  artifactById = new Map(),
+  onUpdateArtifact,
+  onDeleteArtifact,
+  branchStorageConfig,
 }) => {
-  const [selectedWorktree, setSelectedWorktree] = useState<Worktree | null>(null);
+  const [selectedBranch, setSelectedBranch] = useState<Branch | null>(null);
   const [selectedRepo, setSelectedRepo] = useState<Repo | null>(null);
-  const [worktreeSessions, setWorktreeSessions] = useState<Session[]>([]);
-  const [worktreeModalOpen, setWorktreeModalOpen] = useState(false);
+  const [branchSessions, setBranchSessions] = useState<Session[]>([]);
+  const [branchModalOpen, setBranchModalOpen] = useState(false);
 
-  const handleWorktreeRowClick = (worktree: Worktree) => {
+  const handleBranchRowClick = (branch: Branch) => {
     // Snapshot the data when opening modal
-    setSelectedWorktree(worktree);
-    setSelectedRepo(repoById.get(worktree.repo_id) || null);
-    setWorktreeSessions(sessionsByWorktree.get(worktree.worktree_id) || []);
-    setWorktreeModalOpen(true);
+    setSelectedBranch(branch);
+    setSelectedRepo(repoById.get(branch.repo_id) || null);
+    setBranchSessions(sessionsByBranch.get(branch.branch_id) || []);
+    setBranchModalOpen(true);
   };
 
-  const handleWorktreeModalClose = () => {
-    setWorktreeModalOpen(false);
+  const handleBranchModalClose = () => {
+    setBranchModalOpen(false);
     // Clear after modal closes
-    setSelectedWorktree(null);
+    setSelectedBranch(null);
     setSelectedRepo(null);
-    setWorktreeSessions([]);
+    setBranchSessions([]);
   };
 
   // Wrapper to close modal after archive/delete
-  const handleArchiveOrDeleteWorktreeWithClose = async (
-    worktreeId: string,
+  const handleArchiveOrDeleteBranchWithClose = async (
+    branchId: string,
     options: {
       metadataAction: 'archive' | 'delete';
       filesystemAction: 'preserved' | 'cleaned' | 'deleted';
     }
   ) => {
-    await onArchiveOrDeleteWorktree?.(worktreeId, options);
-    handleWorktreeModalClose();
+    await onArchiveOrDeleteBranch?.(branchId, options);
+    handleBranchModalClose();
   };
 
   const { token } = theme.useToken();
+  const settingsSectionKeys = useMemo(() => new Set<string>(SETTINGS_SECTIONS), []);
+
+  // Service tier gates — hide tabs for disabled services
+  const gatewayEnabled = useServiceEnabled('gateway');
+  const mcpEnabled = useServiceEnabled('mcp_servers');
+  const artifactsEnabled = useServiceEnabled('artifacts');
+  const cardsEnabled = useServiceEnabled('cards');
+
+  // Role gate — MCP Servers and Gateway Channels are global admin-managed
+  // configuration (credentials, webhook URLs, env vars). The daemon enforces
+  // ADMIN role on writes for both services (see register-hooks.ts); hiding
+  // the menu entries here avoids showing members a tab where every action
+  // would 403.
+  const isAdmin = hasMinimumRole(currentUser?.role, ROLES.ADMIN);
 
   // Menu items for left sidebar navigation
-  const menuItems: MenuProps['items'] = [
-    {
-      key: 'workspace',
-      label: 'Workspace',
-      type: 'group',
-      children: [
-        {
-          key: 'boards',
-          label: 'Boards',
-          icon: <AppstoreOutlined />,
-        },
-        {
-          key: 'repos',
-          label: 'Repositories',
-          icon: <FolderOutlined />,
-        },
-        {
-          key: 'worktrees',
-          label: 'Worktrees',
-          icon: <BranchesOutlined />,
-        },
-        {
-          key: 'agents',
-          label: 'Agents',
-          icon: <RobotOutlined />,
-        },
-      ],
-    },
-    {
-      key: 'integrations',
-      label: 'Integrations',
-      type: 'group',
-      children: [
-        {
-          key: 'mcp',
-          label: 'MCP Servers',
-          icon: <ApiOutlined />,
-        },
-        {
-          key: 'agentic-tools',
-          label: 'Agentic Tools',
-          icon: <ThunderboltOutlined />,
-        },
-        {
-          key: 'gateway',
-          label: 'Gateway Channels',
-          icon: <MessageOutlined />,
-        },
-      ],
-    },
-    {
-      key: 'admin',
-      label: 'Admin',
-      type: 'group',
-      children: [
-        {
-          key: 'users',
-          label: 'Users',
-          icon: <TeamOutlined />,
-        },
-      ],
-    },
-    {
-      key: 'system',
-      label: 'System',
-      type: 'group',
-      children: [
-        {
-          key: 'about',
-          label: 'About',
-          icon: <InfoCircleOutlined />,
-        },
-      ],
-    },
-  ];
+  const menuItems: MenuProps['items'] = useMemo(
+    () => [
+      {
+        key: 'workspace',
+        label: 'Workspace',
+        type: 'group' as const,
+        children: [
+          {
+            key: 'boards',
+            label: 'Boards',
+            icon: <AppstoreOutlined />,
+          },
+          {
+            key: 'repos',
+            label: 'Repositories',
+            icon: <FolderOutlined />,
+          },
+          {
+            key: 'branches',
+            label: 'Branches',
+            icon: <BranchesOutlined />,
+          },
+          {
+            key: 'assistants',
+            label: 'Assistants',
+            icon: <RobotOutlined />,
+          },
+          ...(cardsEnabled
+            ? [
+                {
+                  key: 'cards',
+                  label: (
+                    <span>
+                      Cards{' '}
+                      <span
+                        style={{
+                          fontSize: 10,
+                          fontWeight: 600,
+                          padding: '0 4px',
+                          borderRadius: 3,
+                          background: token.colorWarningBg,
+                          color: token.colorWarningText,
+                          border: `1px solid ${token.colorWarningBorder}`,
+                          marginLeft: 4,
+                        }}
+                      >
+                        Beta
+                      </span>
+                    </span>
+                  ),
+                  icon: <CreditCardOutlined />,
+                },
+              ]
+            : []),
+          ...(artifactsEnabled
+            ? [
+                {
+                  key: 'artifacts',
+                  label: 'Artifacts',
+                  icon: <ExperimentOutlined />,
+                },
+              ]
+            : []),
+        ],
+      },
+      {
+        key: 'integrations',
+        label: 'Integrations',
+        type: 'group' as const,
+        children: [
+          ...(mcpEnabled && isAdmin
+            ? [
+                {
+                  key: 'mcp',
+                  label: 'MCP Servers',
+                  icon: <ApiOutlined />,
+                },
+              ]
+            : []),
+          {
+            key: 'agentic-tools',
+            label: 'Agentic Tools',
+            icon: <ThunderboltOutlined />,
+          },
+          ...(gatewayEnabled && isAdmin
+            ? [
+                {
+                  key: 'gateway',
+                  label: 'Gateway Channels',
+                  icon: <MessageOutlined />,
+                },
+              ]
+            : []),
+        ],
+      },
+      {
+        key: 'admin',
+        label: 'Admin',
+        type: 'group' as const,
+        children: [
+          ...(isAdmin
+            ? [
+                {
+                  key: 'groups',
+                  label: 'Groups',
+                  icon: <TeamOutlined />,
+                },
+              ]
+            : []),
+          {
+            key: 'users',
+            label: 'Users',
+            icon: <TeamOutlined />,
+          },
+        ],
+      },
+      {
+        key: 'system',
+        label: 'System',
+        type: 'group' as const,
+        children: [
+          {
+            key: 'about',
+            label: 'About',
+            icon: <InfoCircleOutlined />,
+          },
+        ],
+      },
+    ],
+    [gatewayEnabled, mcpEnabled, artifactsEnabled, cardsEnabled, isAdmin, token]
+  );
 
   // Render content based on active section
   const renderContent = () => {
@@ -257,11 +356,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           <BoardsTable
             client={client}
             boardById={boardById}
-            sessionsByWorktree={sessionsByWorktree}
-            worktreeById={worktreeById}
+            sessionsByBranch={sessionsByBranch}
+            branchById={branchById}
             onCreate={onCreateBoard}
             onUpdate={onUpdateBoard}
             onDelete={onDeleteBoard}
+            onArchive={onArchiveBoard}
+            onUnarchive={onUnarchiveBoard}
           />
         );
       case 'repos':
@@ -274,35 +375,60 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             onDelete={onDeleteRepo}
           />
         );
-      case 'worktrees':
+      case 'branches':
         return (
-          <WorktreesTable
-            worktreeById={worktreeById}
+          <BranchesTable
+            client={client}
+            branchById={branchById}
             repoById={repoById}
             boardById={boardById}
-            sessionsByWorktree={sessionsByWorktree}
-            onArchiveOrDelete={onArchiveOrDeleteWorktree}
-            onUnarchive={onUnarchiveWorktree}
-            onCreate={onCreateWorktree}
-            onRowClick={handleWorktreeRowClick}
+            sessionsByBranch={sessionsByBranch}
+            onArchiveOrDelete={onArchiveOrDeleteBranch}
+            onUnarchive={onUnarchiveBranch}
+            onCreate={onCreateBranch}
+            onRowClick={handleBranchRowClick}
             onStartEnvironment={onStartEnvironment}
             onStopEnvironment={onStopEnvironment}
+            onClose={onClose}
+            branchStorageConfig={branchStorageConfig}
           />
         );
-      case 'agents':
+      case 'assistants':
         return (
-          <AgentsTable
-            worktreeById={worktreeById}
+          <AssistantsTable
+            branchById={branchById}
             repoById={repoById}
             boardById={boardById}
-            sessionsByWorktree={sessionsByWorktree}
+            sessionsByBranch={sessionsByBranch}
+            userById={userById}
             client={client}
-            onArchiveOrDelete={onArchiveOrDeleteWorktree}
-            onRowClick={handleWorktreeRowClick}
-            onCreateWorktree={onCreateWorktree}
-            onUpdateWorktree={onUpdateWorktree}
-            onStartEnvironment={onStartEnvironment}
-            onStopEnvironment={onStopEnvironment}
+            onArchiveOrDelete={onArchiveOrDeleteBranch}
+            onRowClick={handleBranchRowClick}
+            onCreateBranch={onCreateBranch}
+            onUpdateBranch={onUpdateBranch}
+            onCreateRepo={onCreateRepo}
+            onClose={onClose}
+          />
+        );
+      case 'cards':
+        return (
+          <CardsTable
+            client={client}
+            cardById={cardById}
+            cardTypeById={cardTypeById}
+            boardById={boardById}
+            boardObjects={boardObjects}
+          />
+        );
+      case 'artifacts':
+        return (
+          <ArtifactsTable
+            artifactById={artifactById}
+            branchById={branchById}
+            boardById={boardById}
+            onUpdate={onUpdateArtifact}
+            onDelete={onDeleteArtifact}
+            onClose={onClose}
           />
         );
       case 'mcp':
@@ -311,7 +437,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             mcpServerById={mcpServerById}
             client={client}
             onCreate={onCreateMCPServer}
-            onUpdate={onUpdateMCPServer}
             onDelete={onDeleteMCPServer}
           />
         );
@@ -322,7 +447,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           <GatewayChannelsTable
             client={client}
             gatewayChannelById={gatewayChannelById}
-            worktreeById={worktreeById}
+            branchById={branchById}
             userById={userById}
             mcpServerById={mcpServerById}
             currentUser={currentUser}
@@ -331,11 +456,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             onDelete={onDeleteGatewayChannel}
           />
         );
+      case 'groups':
+        return <GroupsTable client={client} currentUser={currentUser} userById={userById} />;
       case 'users':
         return (
           <UsersTable
             userById={userById}
             mcpServerById={mcpServerById}
+            client={client}
             currentUser={currentUser}
             onCreate={onCreateUser}
             onUpdate={onUpdateUser}
@@ -348,7 +476,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             client={client}
             connected={client?.io?.connected ?? false}
             connectionError={undefined}
-            isAdmin={currentUser?.role === 'admin'}
+            isAdmin={hasMinimumRole(currentUser?.role, ROLES.ADMIN)}
           />
         );
       default:
@@ -410,7 +538,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           <Menu
             mode="inline"
             selectedKeys={[activeTab]}
-            onClick={({ key }) => onTabChange?.(key)}
+            onClick={({ key }) => {
+              if (settingsSectionKeys.has(key)) {
+                onTabChange?.(key as SettingsSection);
+              }
+            }}
             items={menuItems}
             style={{
               border: 'none',
@@ -420,21 +552,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         </Sider>
         <Content style={{ padding: '40px 32px 32px', overflow: 'auto' }}>{renderContent()}</Content>
       </Layout>
-      <WorktreeModal
-        open={worktreeModalOpen}
-        onClose={handleWorktreeModalClose}
-        worktree={selectedWorktree}
+      <BranchModal
+        open={branchModalOpen}
+        onClose={handleBranchModalClose}
+        branch={selectedBranch}
         repo={selectedRepo}
-        sessions={worktreeSessions}
+        sessions={branchSessions}
         boardById={boardById}
         boardObjects={boardObjects}
         mcpServerById={mcpServerById}
         client={client}
         currentUser={currentUser}
-        onUpdateWorktree={onUpdateWorktree}
+        onUpdateBranch={onUpdateBranch}
         onUpdateRepo={onUpdateRepo}
-        onArchiveOrDelete={handleArchiveOrDeleteWorktreeWithClose}
-        onOpenSettings={onClose} // Close worktree modal and keep settings modal open
+        onArchiveOrDelete={handleArchiveOrDeleteBranchWithClose}
+        onOpenSettings={onClose} // Close branch modal and keep settings modal open
       />
     </Modal>
   );

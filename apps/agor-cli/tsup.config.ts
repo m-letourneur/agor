@@ -18,9 +18,9 @@ const entries = Object.fromEntries(
 export default defineConfig({
   entry: entries,
   format: ['esm'],
-  dts: true,
+  dts: false,
   clean: true,
   splitting: false,
   outDir: 'dist',
-  external: [/^@agor\/core/],
+  external: [/^@agor\/core/, /^@agor\/daemon/, /^@agor-live\/client/],
 });

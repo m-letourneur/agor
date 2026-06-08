@@ -89,8 +89,11 @@ async function _bootstrapMigrations(db: Database): Promise<void> {
     }
 
     // Create migrations table (Drizzle's schema)
-    // biome-ignore lint/suspicious/noExplicitAny: SQLite-specific .run() method not available in unified Database type
-    await (db as any).run(sql`
+    // This bootstrap function is only called for SQLite databases
+    if (!isSQLiteDatabase(db)) {
+      throw new MigrationError('Bootstrap is only supported for SQLite databases');
+    }
+    await db.run(sql`
       CREATE TABLE __drizzle_migrations (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         hash TEXT NOT NULL,
@@ -101,8 +104,7 @@ async function _bootstrapMigrations(db: Database): Promise<void> {
     // Mark baseline migration as applied
     // This hash comes from drizzle/meta/_journal.json: "tag": "0000_pretty_mac_gargan"
     const baselineHash = '0000_pretty_mac_gargan';
-    // biome-ignore lint/suspicious/noExplicitAny: SQLite-specific .run() method not available in unified Database type
-    await (db as any).run(sql`
+    await db.run(sql`
       INSERT INTO __drizzle_migrations (hash, created_at)
       VALUES (${baselineHash}, ${Date.now()})
     `);
@@ -281,15 +283,23 @@ export async function initializeDatabase(db: Database): Promise<void> {
 }
 
 /**
- * Seed initial data (default board only)
+ * Seed initial data (default board only).
  *
- * Note: Does NOT create a default admin user.
- * Admin users must be created explicitly via `agor user create-admin` or during `agor init`
+ * The caller may pass `createdBy` to stamp the default board with a real
+ * user_id. When omitted, the board is stamped with `LEGACY_ANONYMOUS_OWNER_ID`
+ * — a sentinel that the first-run admin bootstrap re-attributes to a real
+ * admin on the next daemon start.
+ *
+ * Admin users are NOT created here. They are created either by `agor init`
+ * (interactive) or by `bootstrapFirstRunAdmin` on first daemon start (default
+ * admin with generated password).
  */
-export async function seedInitialData(db: Database): Promise<void> {
+export async function seedInitialData(db: Database, createdBy?: string): Promise<void> {
   try {
     const { generateId } = await import('../lib/ids');
+    const { LEGACY_ANONYMOUS_OWNER_ID } = await import('./first-run-bootstrap');
     const now = new Date();
+    const owner = createdBy ?? LEGACY_ANONYMOUS_OWNER_ID;
 
     // 1. Check if default board exists (by slug to avoid duplicates)
     const existingBoard = await select(db).from(boards).where(eq(boards.slug, 'default')).one();
@@ -305,7 +315,7 @@ export async function seedInitialData(db: Database): Promise<void> {
           slug: 'default',
           created_at: now,
           updated_at: now,
-          created_by: 'anonymous',
+          created_by: owner,
           data: {
             description: 'Main board for all sessions',
             sessions: [],

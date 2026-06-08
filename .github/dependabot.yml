@@ -1,49 +1,91 @@
 version: 2
 updates:
-  # Root workspace (devDependencies only)
   - package-ecosystem: 'npm'
     directory: '/'
     schedule:
       interval: 'weekly'
-
-  # Apps
-  - package-ecosystem: 'npm'
-    directory: '/apps/agor-cli'
-    schedule:
-      interval: 'weekly'
-
-  - package-ecosystem: 'npm'
-    directory: '/apps/agor-daemon'
-    schedule:
-      interval: 'weekly'
-
-  - package-ecosystem: 'npm'
-    directory: '/apps/agor-docs'
-    schedule:
-      interval: 'weekly'
-
-  - package-ecosystem: 'npm'
-    directory: '/apps/agor-ui'
-    schedule:
-      interval: 'weekly'
-
-  # Packages
-  - package-ecosystem: 'npm'
-    directory: '/packages/core'
-    schedule:
-      interval: 'weekly'
-
-  - package-ecosystem: 'npm'
-    directory: '/packages/executor'
-    schedule:
-      interval: 'weekly'
-
-  # packages/agor-live is a meta-package whose dependencies are synced from
-  # other monorepo packages (see scripts/sync-agor-live-deps.mjs). Explicitly
-  # listed here with a wildcard ignore to prevent Dependabot from opening PRs.
-  - package-ecosystem: 'npm'
-    directory: '/packages/agor-live'
-    schedule:
-      interval: 'weekly'
+    open-pull-requests-limit: 6
+    groups:
+      core-runtime:
+        patterns:
+          - '@feathersjs/*'
+          - '@octokit/*'
+          - '@libsql/*'
+          - 'drizzle-*'
+          - 'express'
+          - 'socket.io'
+          - 'socket.io-client'
+          - 'simple-git'
+          - 'postgres'
+          - 'zod'
+        update-types:
+          - 'minor'
+          - 'patch'
+      agent-sdks:
+        patterns:
+          - '@anthropic-ai/*'
+          - '@openai/*'
+          - '@google/*'
+          - '@github/*'
+          - '@opencode-ai/*'
+          - '@modelcontextprotocol/*'
+        update-types:
+          - 'minor'
+          - 'patch'
+      dev-tooling:
+        dependency-type: 'development'
+        update-types:
+          - 'minor'
+          - 'patch'
+      # Catch-all for remaining production minor+patch updates so we get
+      # one batched PR per week instead of one PR per dependency.
+      # Exclude patterns owned by the core-runtime and agent-sdks groups
+      # so that intent is explicit and ordering changes don't reshuffle
+      # which group a package lands in.
+      prod-minor-patch:
+        dependency-type: 'production'
+        update-types:
+          - 'minor'
+          - 'patch'
+        exclude-patterns:
+          - '@feathersjs/*'
+          - '@octokit/*'
+          - '@libsql/*'
+          - 'drizzle-*'
+          - 'express'
+          - 'socket.io'
+          - 'socket.io-client'
+          - 'simple-git'
+          - 'postgres'
+          - 'zod'
+          - '@anthropic-ai/*'
+          - '@openai/*'
+          - '@google/*'
+          - '@github/*'
+          - '@opencode-ai/*'
+          - '@modelcontextprotocol/*'
     ignore:
-      - dependency-name: '*'
+      # agor-live-only deps are managed manually when packaging/releasing
+      - dependency-name: 'md-to-slack'
+      - dependency-name: 'uuidv7'
+      # Hold Next major bumps: agor-docs is on Nextra 3 (pages router) which
+      # calls removed-in-Next-16 internals (`pkg.init()` on
+      # `next/dist/compiled/webpack/webpack.js`). Lifting requires migrating
+      # docs to Nextra 4 + the app router. Until then, stay on 15.x — security
+      # advisories are backported to the 15 line (see Next `backport` dist-tag).
+      - dependency-name: 'next'
+        update-types: ['version-update:semver-major']
+
+  # GitHub Actions workflow dependencies
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns:
+          - '*'
+        update-types:
+          - 'minor'
+          - 'patch'

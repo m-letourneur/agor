@@ -1,15 +1,27 @@
-import type { AgenticToolName, MCPServer, UpdateUserInput, User } from '@agor/core/types';
-import { getDefaultPermissionMode } from '@agor/core/types';
+import type {
+  AgenticToolName,
+  AgorClient,
+  EnvVarMetadata,
+  EnvVarScope,
+  Group,
+  GroupMembership,
+  MCPServer,
+  UpdateUserInput,
+  User,
+} from '@agor-live/client';
+import { hasMinimumRole, ROLE_OPTIONS, ROLES } from '@agor-live/client';
 import {
+  ApiOutlined,
   CloseOutlined,
-  KeyOutlined,
   RobotOutlined,
   SettingOutlined,
   SoundOutlined,
+  TeamOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons';
 import type { MenuProps } from 'antd';
 import {
+  Alert,
   Button,
   Checkbox,
   Flex,
@@ -18,30 +30,55 @@ import {
   Layout,
   Menu,
   Modal,
+  Popconfirm,
   Select,
   Space,
   Switch,
+  Tabs,
   Tag,
   Typography,
   theme,
 } from 'antd';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { DEFAULT_AUDIO_PREFERENCES } from '../../utils/audio';
-import { AgenticToolConfigForm } from '../AgenticToolConfigForm';
-import { ApiKeyFields, type ApiKeyStatus } from '../ApiKeyFields';
+import { searchableSelectProps, toGroupSelectOption } from '../../utils/selectSearch';
+import {
+  AgenticToolConfigForm,
+  buildConfigFromFormValues,
+  getClearedFormValues,
+  getFormValuesFromConfig,
+} from '../AgenticToolConfigForm';
+import { ApiKeyFields, type FieldStatus, TOOL_FIELD_CONFIGS } from '../ApiKeyFields';
 import { FormEmojiPickerInput } from '../EmojiPickerInput';
 import { EnvVarEditor } from '../EnvVarEditor';
 import { AudioSettingsTab } from './AudioSettingsTab';
+import { syncGroupsForUser } from './groupMembershipSync';
+import { PersonalApiKeysTab } from './PersonalApiKeysTab';
 
 const { Sider, Content } = Layout;
+
+const AGENTIC_TOOL_TABS = [
+  'claude-code',
+  'claude-code-cli',
+  'codex',
+  'gemini',
+  'opencode',
+  'copilot',
+  'cursor',
+] as const satisfies readonly AgenticToolName[];
+
+const isAgenticToolTab = (value: string): value is AgenticToolName =>
+  AGENTIC_TOOL_TABS.includes(value as AgenticToolName);
 
 export interface UserSettingsModalProps {
   open: boolean;
   onClose: () => void;
   user: User | null;
   mcpServerById: Map<string, MCPServer>;
+  client: AgorClient | null;
   currentUser?: User | null;
   onUpdate?: (userId: string, updates: UpdateUserInput) => void;
+  onRestartOnboarding?: () => void | Promise<void>;
 }
 
 export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
@@ -49,37 +86,74 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
   onClose,
   user,
   mcpServerById,
+  client,
   currentUser,
   onUpdate,
+  onRestartOnboarding,
 }) => {
   const [form] = Form.useForm();
   const [activeTab, setActiveTab] = useState<string>('general');
+  const isAdmin = hasMinimumRole(currentUser?.role, ROLES.ADMIN);
 
   // Separate forms for each agentic tool tab
   const [claudeForm] = Form.useForm();
+  const [claudeCliForm] = Form.useForm();
   const [codexForm] = Form.useForm();
   const [geminiForm] = Form.useForm();
   const [opencodeForm] = Form.useForm();
+  const [copilotForm] = Form.useForm();
+  const [cursorForm] = Form.useForm();
   const [audioForm] = Form.useForm();
 
-  // API key management state
-  const [userApiKeyStatus, setUserApiKeyStatus] = useState<ApiKeyStatus>({
-    ANTHROPIC_API_KEY: false,
-    OPENAI_API_KEY: false,
-    GEMINI_API_KEY: false,
-  });
-  const [savingApiKeys, setSavingApiKeys] = useState<Record<string, boolean>>({});
+  const agenticFormByTool = useMemo<Record<AgenticToolName, ReturnType<typeof Form.useForm>[0]>>(
+    () => ({
+      'claude-code': claudeForm,
+      'claude-code-cli': claudeCliForm,
+      codex: codexForm,
+      gemini: geminiForm,
+      opencode: opencodeForm,
+      copilot: copilotForm,
+      cursor: cursorForm,
+    }),
+    [claudeCliForm, claudeForm, codexForm, copilotForm, cursorForm, geminiForm, opencodeForm]
+  );
 
-  // Environment variable management state
-  const [userEnvVars, setUserEnvVars] = useState<Record<string, boolean>>({});
+  // Per-tool credential presence state, keyed `${tool}.${field}` for spinner
+  // tracking. The actual presence map is rebuilt from `user.agentic_tools`
+  // each time the modal opens.
+  const [agenticToolStatus, setAgenticToolStatus] = useState<Record<AgenticToolName, FieldStatus>>({
+    'claude-code': {},
+    'claude-code-cli': {},
+    codex: {},
+    gemini: {},
+    opencode: {},
+    copilot: {},
+    cursor: {},
+  });
+  const [savingToolField, setSavingToolField] = useState<Record<string, boolean>>({});
+
+  // Environment variable management state (scope-aware, v0.5 env-var-access)
+  const [userEnvVars, setUserEnvVars] = useState<Record<string, EnvVarMetadata>>({});
   const [savingEnvVars, setSavingEnvVars] = useState<Record<string, boolean>>({});
+  const [availableGroups, setAvailableGroups] = useState<Group[]>([]);
+  const [userGroupIds, setUserGroupIds] = useState<string[]>([]);
+  const [loadingGroups, setLoadingGroups] = useState(false);
+  const [groupsLoaded, setGroupsLoaded] = useState(false);
+  const groupSelectOptions = useMemo(
+    () =>
+      [...availableGroups].sort((a, b) => a.name.localeCompare(b.name)).map(toGroupSelectOption),
+    [availableGroups]
+  );
 
   // Saving state for agentic tool tabs
   const [savingAgenticConfig, setSavingAgenticConfig] = useState<Record<AgenticToolName, boolean>>({
     'claude-code': false,
+    'claude-code-cli': false,
     codex: false,
     gemini: false,
     opencode: false,
+    copilot: false,
+    cursor: false,
   });
 
   // Initialize forms when user changes or modal opens
@@ -93,37 +167,67 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
         emoji: userData.emoji,
         role: userData.role,
         unix_username: userData.unix_username,
+        groupIds: [],
         eventStreamEnabled: userData.preferences?.eventStream?.enabled ?? true,
         must_change_password: userData.must_change_password ?? false,
       });
+    },
+    [form]
+  );
 
-      // Initialize agentic tool forms with user's defaults
-      const defaults = userData.default_agentic_config;
+  const loadUserGroups = useCallback(async () => {
+    if (!client || !user || !isAdmin) {
+      setAvailableGroups([]);
+      setUserGroupIds([]);
+      setGroupsLoaded(false);
+      form.setFieldValue('groupIds', []);
+      return;
+    }
 
-      claudeForm.setFieldsValue({
-        permissionMode:
-          defaults?.['claude-code']?.permissionMode || getDefaultPermissionMode('claude-code'),
-        modelConfig: defaults?.['claude-code']?.modelConfig,
-        mcpServerIds: defaults?.['claude-code']?.mcpServerIds || [],
-      });
+    setLoadingGroups(true);
+    setGroupsLoaded(false);
+    try {
+      const [groups, memberships] = await Promise.all([
+        client.service('groups').findAll({ query: { archived: false } }),
+        client.service('group-memberships').findAll({ query: { user_id: user.user_id } }),
+      ]);
+      const nextGroupIds = (memberships as GroupMembership[]).map(
+        (membership) => membership.group_id
+      );
+      setAvailableGroups(groups as Group[]);
+      setUserGroupIds(nextGroupIds);
+      setGroupsLoaded(true);
+      form.setFieldValue('groupIds', nextGroupIds);
+    } catch (error) {
+      console.error('Failed to load user groups:', error);
+    } finally {
+      setLoadingGroups(false);
+    }
+  }, [client, form, isAdmin, user]);
 
-      codexForm.setFieldsValue({
-        permissionMode: defaults?.codex?.permissionMode || getDefaultPermissionMode('codex'),
-        modelConfig: defaults?.codex?.modelConfig,
-        mcpServerIds: defaults?.codex?.mcpServerIds || [],
-        codexSandboxMode: defaults?.codex?.codexSandboxMode,
-        codexApprovalPolicy: defaults?.codex?.codexApprovalPolicy,
-        codexNetworkAccess: defaults?.codex?.codexNetworkAccess,
-      });
+  // Initialize when modal opens with user data
+  useEffect(() => {
+    if (open && user) {
+      initializeForms(user);
+      void loadUserGroups();
+    }
+  }, [open, user, initializeForms, loadUserGroups]);
 
-      geminiForm.setFieldsValue({
-        permissionMode: defaults?.gemini?.permissionMode || getDefaultPermissionMode('gemini'),
-        modelConfig: defaults?.gemini?.modelConfig,
-        mcpServerIds: defaults?.gemini?.mcpServerIds || [],
-      });
+  // Hydrate tab-specific forms only after that tab has rendered its
+  // corresponding <Form>. Calling setFieldsValue on never-mounted form
+  // instances triggers Ant's "useForm is not connected" console warning.
+  useEffect(() => {
+    if (!open || !user) return;
 
-      // Initialize audio form with user's preferences
-      const audioPrefs = userData.preferences?.audio;
+    if (isAgenticToolTab(activeTab)) {
+      agenticFormByTool[activeTab].setFieldsValue(
+        getFormValuesFromConfig(activeTab, user.default_agentic_config?.[activeTab])
+      );
+      return;
+    }
+
+    if (activeTab === 'audio') {
+      const audioPrefs = user.preferences?.audio;
       audioForm.setFieldsValue({
         enabled: audioPrefs?.enabled ?? DEFAULT_AUDIO_PREFERENCES.enabled,
         chime: audioPrefs?.chime ?? DEFAULT_AUDIO_PREFERENCES.chime,
@@ -131,35 +235,33 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
         minDurationSeconds:
           audioPrefs?.minDurationSeconds ?? DEFAULT_AUDIO_PREFERENCES.minDurationSeconds,
       });
-    },
-    [form, claudeForm, codexForm, geminiForm, audioForm]
-  );
-
-  // Initialize when modal opens with user data
-  useEffect(() => {
-    if (open && user) {
-      initializeForms(user);
     }
-  }, [open, user, initializeForms]);
+  }, [activeTab, audioForm, agenticFormByTool, open, user]);
 
-  // Load user's API key and env var status when modal opens
-  // Include `open` in deps to rehydrate from server state each time modal opens
+  // Rehydrate per-tool credential presence and env-var metadata from the
+  // server every time the modal opens, so flags reflect the latest patch.
   useEffect(() => {
     if (!open) return;
 
-    if (user?.api_keys) {
-      setUserApiKeyStatus({
-        ANTHROPIC_API_KEY: !!user.api_keys.ANTHROPIC_API_KEY,
-        OPENAI_API_KEY: !!user.api_keys.OPENAI_API_KEY,
-        GEMINI_API_KEY: !!user.api_keys.GEMINI_API_KEY,
-      });
-    } else {
-      setUserApiKeyStatus({
-        ANTHROPIC_API_KEY: false,
-        OPENAI_API_KEY: false,
-        GEMINI_API_KEY: false,
-      });
+    const next: Record<AgenticToolName, FieldStatus> = {
+      'claude-code': {},
+      'claude-code-cli': {},
+      codex: {},
+      gemini: {},
+      opencode: {},
+      copilot: {},
+      cursor: {},
+    };
+    const stored = user?.agentic_tools;
+    if (stored) {
+      for (const tool of Object.keys(next) as AgenticToolName[]) {
+        const flags = (stored as Record<string, Record<string, boolean> | undefined>)[tool];
+        if (flags) {
+          next[tool] = { ...flags };
+        }
+      }
     }
+    setAgenticToolStatus(next);
 
     if (user?.env_vars) {
       setUserEnvVars(user.env_vars);
@@ -170,12 +272,17 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
 
   const handleClose = () => {
     form.resetFields();
-    audioForm.resetFields();
-    claudeForm.resetFields();
-    codexForm.resetFields();
-    geminiForm.resetFields();
+    setAvailableGroups([]);
+    setUserGroupIds([]);
+    setGroupsLoaded(false);
     setActiveTab('general');
     onClose();
+  };
+
+  const syncUserGroups = async (nextGroupIds: string[]) => {
+    if (!client || !user || !isAdmin || !groupsLoaded) return;
+    await syncGroupsForUser(client, user.user_id, userGroupIds, nextGroupIds);
+    setUserGroupIds(nextGroupIds);
   };
 
   const handleUpdate = () => {
@@ -183,7 +290,7 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
 
     form
       .validateFields(['email', 'name', 'emoji', 'role', 'unix_username'])
-      .then(() => {
+      .then(async () => {
         const values = form.getFieldsValue();
         const updates: UpdateUserInput = {
           email: values.email,
@@ -202,10 +309,14 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
           updates.password = values.password;
         }
         // Only admins can set must_change_password, and only for other users
-        if (currentUser?.role === 'admin' && user.user_id !== currentUser.user_id) {
+        if (
+          hasMinimumRole(currentUser?.role, ROLES.ADMIN) &&
+          user.user_id !== currentUser?.user_id
+        ) {
           updates.must_change_password = values.must_change_password;
         }
-        onUpdate?.(user.user_id, updates);
+        await onUpdate?.(user.user_id, updates);
+        await syncUserGroups(values.groupIds || []);
         handleClose();
       })
       .catch((err) => {
@@ -213,58 +324,97 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
       });
   };
 
-  // Handle API key save
-  const handleApiKeySave = async (field: keyof ApiKeyStatus, value: string) => {
+  // Persist a per-tool credential field. Patch is shaped as
+  // `{ agentic_tools: { [tool]: { [field]: value | null } } }` — the daemon
+  // service merges only the touched fields and encrypts at rest.
+  const handleToolFieldSave = async (
+    tool: AgenticToolName,
+    field: string,
+    value: string
+  ): Promise<void> => {
     if (!user) return;
+    const spinnerKey = `${tool}.${field}`;
 
     try {
-      setSavingApiKeys((prev) => ({ ...prev, [field]: true }));
+      setSavingToolField((prev) => ({ ...prev, [spinnerKey]: true }));
       await onUpdate?.(user.user_id, {
-        api_keys: {
-          [field]: value,
-        },
+        agentic_tools: {
+          [tool]: { [field]: value },
+        } as UpdateUserInput['agentic_tools'],
       });
-      setUserApiKeyStatus((prev) => ({ ...prev, [field]: true }));
+      setAgenticToolStatus((prev) => ({
+        ...prev,
+        [tool]: { ...(prev[tool] ?? {}), [field]: true },
+      }));
     } catch (err) {
-      console.error(`Failed to save ${field}:`, err);
+      console.error(`Failed to save ${tool}.${field}:`, err);
       throw err;
     } finally {
-      setSavingApiKeys((prev) => ({ ...prev, [field]: false }));
+      setSavingToolField((prev) => ({ ...prev, [spinnerKey]: false }));
     }
   };
 
-  // Handle API key clear
-  const handleApiKeyClear = async (field: keyof ApiKeyStatus) => {
+  // Clear a per-tool credential field by sending `null` in the patch.
+  const handleToolFieldClear = async (tool: AgenticToolName, field: string): Promise<void> => {
     if (!user) return;
+    const spinnerKey = `${tool}.${field}`;
 
     try {
-      setSavingApiKeys((prev) => ({ ...prev, [field]: true }));
+      setSavingToolField((prev) => ({ ...prev, [spinnerKey]: true }));
       await onUpdate?.(user.user_id, {
-        api_keys: {
-          [field]: null,
-        },
+        agentic_tools: {
+          [tool]: { [field]: null },
+        } as UpdateUserInput['agentic_tools'],
       });
-      setUserApiKeyStatus((prev) => ({ ...prev, [field]: false }));
+      setAgenticToolStatus((prev) => {
+        const nextToolFields = { ...(prev[tool] ?? {}) };
+        delete nextToolFields[field];
+        return { ...prev, [tool]: nextToolFields };
+      });
     } catch (err) {
-      console.error(`Failed to clear ${field}:`, err);
+      console.error(`Failed to clear ${tool}.${field}:`, err);
       throw err;
     } finally {
-      setSavingApiKeys((prev) => ({ ...prev, [field]: false }));
+      setSavingToolField((prev) => ({ ...prev, [spinnerKey]: false }));
     }
   };
 
-  // Handle env var save
-  const handleEnvVarSave = async (key: string, value: string) => {
+  // Handle env var save (value + scope). v0.5 env-var-access.
+  const handleEnvVarSave = async (key: string, value: string, scope: EnvVarScope) => {
     if (!user) return;
 
     try {
       setSavingEnvVars((prev) => ({ ...prev, [key]: true }));
       await onUpdate?.(user.user_id, {
         env_vars: { [key]: value },
+        env_var_scopes: { [key]: scope },
       });
-      setUserEnvVars((prev) => ({ ...prev, [key]: true }));
+      setUserEnvVars((prev) => ({
+        ...prev,
+        [key]: { set: true, scope, resource_id: null },
+      }));
     } catch (err) {
       console.error(`Failed to save ${key}:`, err);
+      throw err;
+    } finally {
+      setSavingEnvVars((prev) => ({ ...prev, [key]: false }));
+    }
+  };
+
+  // Handle scope change for an existing env var (no value rotation).
+  const handleEnvVarScopeChange = async (key: string, scope: EnvVarScope) => {
+    if (!user) return;
+    try {
+      setSavingEnvVars((prev) => ({ ...prev, [key]: true }));
+      await onUpdate?.(user.user_id, {
+        env_var_scopes: { [key]: scope },
+      });
+      setUserEnvVars((prev) => ({
+        ...prev,
+        [key]: { ...(prev[key] ?? { set: true }), set: true, scope, resource_id: null },
+      }));
+    } catch (err) {
+      console.error(`Failed to update scope for ${key}:`, err);
       throw err;
     } finally {
       setSavingEnvVars((prev) => ({ ...prev, [key]: false }));
@@ -297,32 +447,15 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
   const handleAgenticConfigSave = async (tool: AgenticToolName) => {
     if (!user) return;
 
-    const formMap = {
-      'claude-code': claudeForm,
-      codex: codexForm,
-      gemini: geminiForm,
-      opencode: opencodeForm,
-    };
-
-    const currentForm = formMap[tool];
-
     try {
       setSavingAgenticConfig((prev) => ({ ...prev, [tool]: true }));
 
-      const values = currentForm.getFieldsValue();
-
+      const values = agenticFormByTool[tool].getFieldsValue() as Parameters<
+        typeof buildConfigFromFormValues
+      >[1];
       const newConfig = {
         ...user.default_agentic_config,
-        [tool]: {
-          modelConfig: values.modelConfig,
-          permissionMode: values.permissionMode,
-          mcpServerIds: values.mcpServerIds,
-          ...(tool === 'codex' && {
-            codexSandboxMode: values.codexSandboxMode,
-            codexApprovalPolicy: values.codexApprovalPolicy,
-            codexNetworkAccess: values.codexNetworkAccess,
-          }),
-        },
+        [tool]: buildConfigFromFormValues(tool, values),
       };
 
       await onUpdate?.(user.user_id, {
@@ -340,25 +473,7 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
 
   // Handle agentic tool config clear
   const handleAgenticConfigClear = (tool: AgenticToolName) => {
-    const formMap = {
-      'claude-code': claudeForm,
-      codex: codexForm,
-      gemini: geminiForm,
-      opencode: opencodeForm,
-    };
-
-    const currentForm = formMap[tool];
-
-    currentForm.setFieldsValue({
-      modelConfig: undefined,
-      permissionMode: getDefaultPermissionMode(tool),
-      mcpServerIds: [],
-      ...(tool === 'codex' && {
-        codexSandboxMode: undefined,
-        codexApprovalPolicy: undefined,
-        codexNetworkAccess: undefined,
-      }),
-    });
+    agenticFormByTool[tool].setFieldsValue(getClearedFormValues(tool));
   };
 
   const handleAudioSave = async () => {
@@ -394,18 +509,25 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
       case 'general':
         handleUpdate();
         break;
-      case 'api-keys':
       case 'env-vars':
+      case 'personal-api-keys':
         // These tabs save individually, just close
+        handleClose();
+        break;
+      case 'groups':
+        await syncUserGroups(form.getFieldValue('groupIds') || []);
         handleClose();
         break;
       case 'audio':
         await handleAudioSave();
         break;
       case 'claude-code':
+      case 'claude-code-cli':
       case 'codex':
       case 'gemini':
       case 'opencode':
+      case 'copilot':
+      case 'cursor':
         await handleAgenticConfigSave(activeTab as AgenticToolName);
         break;
     }
@@ -435,6 +557,20 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
           label: 'Audio',
           icon: <SoundOutlined />,
         },
+        ...(isAdmin
+          ? [
+              {
+                key: 'groups',
+                label: 'Groups',
+                icon: <TeamOutlined />,
+              },
+            ]
+          : []),
+        {
+          key: 'personal-api-keys',
+          label: 'Agor API Tokens',
+          icon: <ApiOutlined />,
+        },
       ],
     },
     {
@@ -442,11 +578,6 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
       label: 'Agentic Tools',
       type: 'group',
       children: [
-        {
-          key: 'api-keys',
-          label: 'API Keys',
-          icon: <KeyOutlined />,
-        },
         {
           key: 'claude-code',
           label: 'Claude Code',
@@ -467,6 +598,16 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
           label: 'OpenCode',
           icon: <RobotOutlined />,
         },
+        {
+          key: 'cursor',
+          label: 'Cursor SDK',
+          icon: <RobotOutlined />,
+        },
+        {
+          key: 'copilot',
+          label: 'GitHub Copilot',
+          icon: <RobotOutlined />,
+        },
       ],
     },
   ];
@@ -476,107 +617,150 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
     switch (activeTab) {
       case 'general':
         return (
-          <Form form={form} layout="vertical">
-            <Form.Item label="Name" style={{ marginBottom: 24 }}>
-              <Flex gap={8}>
-                <Form.Item name="emoji" noStyle>
-                  <FormEmojiPickerInput form={form} fieldName="emoji" defaultEmoji="👤" />
-                </Form.Item>
-                <Form.Item name="name" noStyle style={{ flex: 1 }}>
-                  <Input placeholder="John Doe" style={{ flex: 1 }} />
-                </Form.Item>
-              </Flex>
-            </Form.Item>
-
-            <Form.Item
-              label="Email"
-              name="email"
-              rules={[
-                { required: true, message: 'Please enter an email' },
-                { type: 'email', message: 'Please enter a valid email' },
-              ]}
-            >
-              <Input placeholder="user@example.com" />
-            </Form.Item>
-
-            <Form.Item
-              label="Unix Username"
-              name="unix_username"
-              help={
-                currentUser?.role === 'admin'
-                  ? 'Unix user for process impersonation (alphanumeric, hyphens, underscores only)'
-                  : 'Maintained by administrators'
-              }
-              rules={[
-                {
-                  pattern: /^[a-z0-9_-]+$/,
-                  message: 'Only lowercase letters, numbers, hyphens, and underscores allowed',
-                },
-                { max: 32, message: 'Unix username must be 32 characters or less' },
-              ]}
-            >
-              <Input
-                placeholder="johnsmith"
-                maxLength={32}
-                disabled={currentUser?.role !== 'admin'}
-              />
-            </Form.Item>
-
-            <Form.Item label="Password" name="password" help="Leave blank to keep current password">
-              <Input.Password placeholder="••••••••" />
-            </Form.Item>
-
-            <Form.Item
-              label={
-                <Space size={4}>
-                  Enable Live Event Stream
-                  <Tag color={token.colorPrimary} style={{ fontSize: 10, marginLeft: 4 }}>
-                    BETA
-                  </Tag>
-                </Space>
-              }
-              name="eventStreamEnabled"
-              valuePropName="checked"
-              tooltip="Show/hide the event stream icon in the navbar. When enabled, you can view live WebSocket events for debugging."
-            >
-              <Switch />
-            </Form.Item>
-
-            <Form.Item
-              label="Role"
-              name="role"
-              rules={[{ required: true, message: 'Please select a role' }]}
-              help={currentUser?.role !== 'admin' ? 'Maintained by administrators' : undefined}
-            >
-              <Select disabled={currentUser?.role !== 'admin'}>
-                {/* <Select.Option value="owner">Owner</Select.Option> */}
-                <Select.Option value="admin">Admin</Select.Option>
-                <Select.Option value="member">Member</Select.Option>
-                <Select.Option value="viewer">Viewer</Select.Option>
-              </Select>
-            </Form.Item>
-
-            {/* Only show for admins editing other users */}
-            {currentUser?.role === 'admin' && user && user.user_id !== currentUser.user_id && (
-              <Form.Item name="must_change_password" valuePropName="checked">
-                <Checkbox>Force password change on next login</Checkbox>
-              </Form.Item>
-            )}
-          </Form>
-        );
-      case 'api-keys':
-        return (
           <>
-            <Typography.Paragraph type="secondary" style={{ marginBottom: 16 }}>
-              Per-user API keys take precedence over global settings. These keys are encrypted at
-              rest.
-            </Typography.Paragraph>
-            <ApiKeyFields
-              keyStatus={userApiKeyStatus}
-              onSave={handleApiKeySave}
-              onClear={handleApiKeyClear}
-              saving={savingApiKeys}
-            />
+            <Form form={form} layout="vertical">
+              <Form.Item label="Name" style={{ marginBottom: 24 }}>
+                <Flex gap={8}>
+                  <Form.Item name="emoji" noStyle>
+                    <FormEmojiPickerInput form={form} fieldName="emoji" defaultEmoji="👤" />
+                  </Form.Item>
+                  <Form.Item name="name" noStyle style={{ flex: 1 }}>
+                    <Input placeholder="John Doe" style={{ flex: 1 }} />
+                  </Form.Item>
+                </Flex>
+              </Form.Item>
+
+              <Form.Item
+                label="Email"
+                name="email"
+                rules={[
+                  { required: true, message: 'Please enter an email' },
+                  { type: 'email', message: 'Please enter a valid email' },
+                ]}
+              >
+                <Input placeholder="user@example.com" />
+              </Form.Item>
+
+              <Form.Item
+                label="Unix Username"
+                name="unix_username"
+                help={
+                  hasMinimumRole(currentUser?.role, ROLES.ADMIN)
+                    ? 'Unix user for process impersonation (alphanumeric, hyphens, underscores only)'
+                    : 'Maintained by administrators'
+                }
+                rules={[
+                  {
+                    pattern: /^[a-z0-9_-]+$/,
+                    message: 'Only lowercase letters, numbers, hyphens, and underscores allowed',
+                  },
+                  { max: 32, message: 'Unix username must be 32 characters or less' },
+                ]}
+              >
+                <Input
+                  placeholder="johnsmith"
+                  maxLength={32}
+                  disabled={!hasMinimumRole(currentUser?.role, ROLES.ADMIN)}
+                />
+              </Form.Item>
+
+              <Form.Item
+                label="Password"
+                name="password"
+                help="Leave blank to keep current password"
+              >
+                <Input.Password placeholder="••••••••" />
+              </Form.Item>
+
+              <Form.Item
+                label={
+                  <Space size={4}>
+                    Enable Live Event Stream
+                    <Tag color={token.colorPrimary} style={{ fontSize: 10, marginLeft: 4 }}>
+                      BETA
+                    </Tag>
+                  </Space>
+                }
+                name="eventStreamEnabled"
+                valuePropName="checked"
+                tooltip="Show/hide the event stream icon in the navbar. When enabled, you can view live WebSocket events for debugging."
+              >
+                <Switch />
+              </Form.Item>
+
+              <Form.Item
+                label="Role"
+                name="role"
+                rules={[{ required: true, message: 'Please select a role' }]}
+                help={
+                  !hasMinimumRole(currentUser?.role, ROLES.ADMIN)
+                    ? 'Maintained by administrators'
+                    : undefined
+                }
+              >
+                <Select
+                  disabled={!hasMinimumRole(currentUser?.role, ROLES.ADMIN)}
+                  options={ROLE_OPTIONS.map((opt) => ({
+                    value: opt.value,
+                    label: opt.label,
+                    title: opt.description,
+                  }))}
+                />
+              </Form.Item>
+
+              {isAdmin && (
+                <Form.Item
+                  label="Groups"
+                  name="groupIds"
+                  help="Group memberships affect group-aware branch permissions."
+                >
+                  <Select
+                    mode="multiple"
+                    loading={loadingGroups}
+                    disabled={!groupsLoaded && !loadingGroups}
+                    placeholder="Select groups..."
+                    options={groupSelectOptions}
+                    {...searchableSelectProps}
+                  />
+                </Form.Item>
+              )}
+
+              {/* Only show for admins editing other users */}
+              {hasMinimumRole(currentUser?.role, ROLES.ADMIN) &&
+                user &&
+                user.user_id !== currentUser?.user_id && (
+                  <Form.Item name="must_change_password" valuePropName="checked">
+                    <Checkbox>Force password change on next login</Checkbox>
+                  </Form.Item>
+                )}
+            </Form>
+
+            {onRestartOnboarding && user?.user_id === currentUser?.user_id && (
+              <div
+                style={{
+                  marginTop: 24,
+                  paddingTop: 20,
+                  borderTop: `1px solid ${token.colorBorderSecondary}`,
+                }}
+              >
+                <Typography.Title level={5} style={{ marginTop: 0 }}>
+                  Onboarding
+                </Typography.Title>
+                <Typography.Paragraph type="secondary">
+                  Reopen the assistant setup wizard from the beginning. Existing repos, boards,
+                  branches, and credentials stay in place.
+                </Typography.Paragraph>
+                <Popconfirm
+                  title="Restart onboarding?"
+                  description="This clears saved wizard progress and opens onboarding again."
+                  okText="Restart"
+                  cancelText="Cancel"
+                  onConfirm={onRestartOnboarding}
+                >
+                  <Button>Restart onboarding</Button>
+                </Popconfirm>
+              </div>
+            )}
           </>
         );
       case 'env-vars':
@@ -586,9 +770,24 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
               Environment variables are encrypted at rest and available to all sessions for this
               user.
             </Typography.Paragraph>
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 16 }}
+              title="Looking for SDK credentials?"
+              description={
+                <span>
+                  API keys and SDK config (Anthropic, OpenAI, Gemini, Copilot) live under each
+                  tool's screen in the <strong>Agentic Tools</strong> section. Per-tool config takes
+                  precedence over global env vars and is scoped so credentials never leak across
+                  SDKs.
+                </span>
+              }
+            />
             <EnvVarEditor
               envVars={userEnvVars}
               onSave={handleEnvVarSave}
+              onScopeChange={handleEnvVarScopeChange}
               onDelete={handleEnvVarDelete}
               loading={savingEnvVars}
             />
@@ -596,25 +795,58 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
         );
       case 'audio':
         return <AudioSettingsTab user={user} form={audioForm} />;
+      case 'groups':
+        return (
+          <>
+            <Typography.Paragraph type="secondary" style={{ marginBottom: 16 }}>
+              Add or remove this user from admin-managed groups.
+            </Typography.Paragraph>
+            <Form form={form} layout="vertical">
+              <Form.Item
+                label="Groups"
+                name="groupIds"
+                help="Group memberships affect group-aware branch permissions."
+              >
+                <Select
+                  mode="multiple"
+                  loading={loadingGroups}
+                  disabled={!groupsLoaded && !loadingGroups}
+                  placeholder="Select groups..."
+                  options={groupSelectOptions}
+                  {...searchableSelectProps}
+                />
+              </Form.Item>
+            </Form>
+          </>
+        );
+      case 'personal-api-keys':
+        return <PersonalApiKeysTab client={client} />;
       case 'claude-code':
+      case 'claude-code-cli':
       case 'codex':
       case 'gemini':
-      case 'opencode': {
+      case 'opencode':
+      case 'copilot':
+      case 'cursor': {
         const toolName = activeTab as AgenticToolName;
-        const formMap = {
-          'claude-code': claudeForm,
-          codex: codexForm,
-          gemini: geminiForm,
-          opencode: opencodeForm,
-        };
-        const currentForm = formMap[toolName];
+        const currentForm = agenticFormByTool[toolName];
         const displayNames: Record<AgenticToolName, string> = {
           'claude-code': 'Claude Code',
+          'claude-code-cli': 'Claude Code CLI',
           codex: 'Codex',
           gemini: 'Gemini',
           opencode: 'OpenCode',
+          copilot: 'Copilot',
+          cursor: 'Cursor SDK',
         };
-        return (
+        // Field set is owned by ApiKeyFields' `TOOL_FIELD_CONFIGS`. Per-field
+        // saving spinners are tracked in `savingToolField` keyed by `${tool}.${field}`.
+        const toolFields = TOOL_FIELD_CONFIGS[toolName] ?? [];
+        const fieldStatus: FieldStatus = agenticToolStatus[toolName] ?? {};
+        const savingForTool: Record<string, boolean> = Object.fromEntries(
+          toolFields.map((c) => [c.field, !!savingToolField[`${toolName}.${c.field}`]])
+        );
+        const defaultsPane = (
           <>
             <Typography.Paragraph type="secondary" style={{ marginBottom: 16 }}>
               Configure default settings for {displayNames[toolName]}. These will prepopulate
@@ -632,6 +864,40 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
             </div>
           </>
         );
+
+        // Tools with no auth/config fields (e.g. OpenCode) skip the tab strip entirely.
+        if (toolFields.length === 0) {
+          return defaultsPane;
+        }
+
+        const authPane = (
+          <>
+            <Typography.Paragraph type="secondary" style={{ marginBottom: 16 }}>
+              Per-user credentials and config for {displayNames[toolName]}. Encrypted at rest; take
+              precedence over the daemon's global configuration and your global env vars.
+            </Typography.Paragraph>
+            <ApiKeyFields
+              tool={toolName}
+              fieldStatus={fieldStatus}
+              onSave={(field, value) => handleToolFieldSave(toolName, field, value)}
+              onClear={(field) => handleToolFieldClear(toolName, field)}
+              saving={savingForTool}
+              publicValues={
+                user?.agentic_tools_public_values?.[toolName] as Record<string, string> | undefined
+              }
+            />
+          </>
+        );
+
+        return (
+          <Tabs
+            defaultActiveKey="auth"
+            items={[
+              { key: 'auth', label: 'Authentication', children: authPane },
+              { key: 'defaults', label: 'Defaults', children: defaultsPane },
+            ]}
+          />
+        );
       }
       default:
         return null;
@@ -642,13 +908,16 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
   const getSectionTitle = () => {
     const titles: Record<string, string> = {
       general: 'General',
-      'api-keys': 'API Keys',
       'env-vars': 'Environment Variables',
       audio: 'Audio',
+      groups: 'Groups',
+      'personal-api-keys': 'Agor API Tokens',
       'claude-code': 'Claude Code',
       codex: 'Codex',
       gemini: 'Gemini',
       opencode: 'OpenCode',
+      cursor: 'Cursor SDK',
+      copilot: 'GitHub Copilot',
     };
     return titles[activeTab] || 'User Settings';
   };
@@ -673,15 +942,9 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
             type="primary"
             onClick={handleModalSave}
             loading={
-              activeTab === 'claude-code'
-                ? savingAgenticConfig['claude-code']
-                : activeTab === 'codex'
-                  ? savingAgenticConfig.codex
-                  : activeTab === 'gemini'
-                    ? savingAgenticConfig.gemini
-                    : activeTab === 'opencode'
-                      ? savingAgenticConfig.opencode
-                      : false
+              activeTab in savingAgenticConfig
+                ? savingAgenticConfig[activeTab as AgenticToolName]
+                : false
             }
           >
             Save
@@ -689,7 +952,7 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
         </div>
       }
       closable
-      width={900}
+      width="min(1050px, calc(100vw - 32px))"
       style={{ top: 40 }}
       styles={{
         wrapper: {
@@ -719,6 +982,17 @@ export const UserSettingsModal: React.FC<UserSettingsModalProps> = ({
       }}
       closeIcon={<CloseOutlined />}
     >
+      {/* Keep inactive tab form instances connected to Ant Form. Without these
+          lightweight hidden connectors, calling form methods while switching
+          tabs can produce noisy "useForm is not connected" console warnings. */}
+      <div hidden aria-hidden="true">
+        {activeTab !== 'audio' && <Form component={false} form={audioForm} />}
+        {AGENTIC_TOOL_TABS.map((tool) =>
+          activeTab === tool ? null : (
+            <Form key={tool} component={false} form={agenticFormByTool[tool]} />
+          )
+        )}
+      </div>
       <Layout style={{ height: '100%', background: token.colorBgContainer }}>
         <Sider
           width={200}

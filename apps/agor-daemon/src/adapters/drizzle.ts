@@ -48,7 +48,7 @@ export interface DrizzleAdapterOptions {
   multi?: boolean | string[];
 
   /**
-   * Resource type name for error messages (e.g., 'Worktree', 'Session')
+   * Resource type name for error messages (e.g., 'Branch', 'Session')
    */
   resourceType?: string;
 }
@@ -223,11 +223,11 @@ export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> 
     // Get all data from repository
     let data = await this.repository.findAll();
 
-    // Get total count before filtering
-    const total = data.length;
-
     // Apply filters
     data = this.filterData(data, query);
+
+    // Get total count after filtering (reflects the actual matching records)
+    const total = data.length;
 
     // Apply sorting
     data = this.sortData(data, query.$sort);
@@ -274,7 +274,14 @@ export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> 
   }
 
   /**
-   * Update a record (complete replacement)
+   * Update a record (complete replacement).
+   *
+   * Emits ONLY `'updated'` — per Feathers convention `patch()` emits
+   * `'patched'`. The previous implementation emitted both for "consistency",
+   * but that doubles up live-event delivery for any subscriber listening
+   * to both (e.g. UI hooks that want to catch any mutation). Subscribers
+   * that need to react to a complete-replacement should listen to
+   * `'updated'` directly.
    */
   async update(id: Id, data: D, params?: P): Promise<T> {
     // Verify record exists (throws NotFoundError if not found)
@@ -282,7 +289,6 @@ export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> 
 
     const result = await this.repository.update(String(id), data as Partial<T>);
     this.emit?.('updated', result, params);
-    this.emit?.('patched', result, params); // Also emit patched for consistency
     return result;
   }
 

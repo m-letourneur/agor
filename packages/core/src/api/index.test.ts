@@ -5,11 +5,13 @@
  * Does NOT test FeathersJS internals, Socket.io, or HTTP libraries.
  */
 
+import type { AuthenticationResult, Session } from '@agor/core/types';
 import authClient from '@feathersjs/authentication-client';
 import type { Socket } from 'socket.io-client';
 import io from 'socket.io-client';
 import { beforeEach, describe, expect, it, type MockedFunction, vi } from 'vitest';
-import { createClient, isDaemonRunning } from './index';
+import type { AgorService, UpdatePayload } from './index';
+import { createClient, isDaemonRunning, normalizeFindResult } from './index';
 
 // Mock socket.io-client
 vi.mock('socket.io-client', () => ({
@@ -18,12 +20,37 @@ vi.mock('socket.io-client', () => ({
 
 // Mock @feathersjs/feathers
 vi.mock('@feathersjs/feathers', () => ({
-  feathers: vi.fn(() => ({
-    configure: vi.fn(function (this: any, plugin: any) {
-      plugin.call(this);
-      return this;
-    }),
-  })),
+  feathers: vi.fn(() => {
+    const services = new Map<string, any>();
+
+    const createService = () => ({
+      find: vi.fn(),
+      get: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
+      patch: vi.fn(),
+      remove: vi.fn(),
+      on: vi.fn(),
+      off: vi.fn(),
+      removeListener: vi.fn(),
+      emit: vi.fn(),
+      methods: vi.fn(),
+    });
+
+    return {
+      configure: vi.fn(function (this: any, plugin: any) {
+        plugin.call(this);
+        return this;
+      }),
+      service: vi.fn((path: string) => {
+        const existing = services.get(path);
+        if (existing) return existing;
+        const created = createService();
+        services.set(path, created);
+        return created;
+      }),
+    };
+  }),
 }));
 
 // Mock @feathersjs/socketio-client
@@ -137,7 +164,7 @@ describe('createClient', () => {
         expect.objectContaining({
           reconnection: true,
           reconnectionDelay: 1000,
-          reconnectionDelayMax: 2000,
+          reconnectionDelayMax: 5000,
           reconnectionAttempts: 2,
         })
       );
@@ -149,7 +176,7 @@ describe('createClient', () => {
       expect(ioMock).toHaveBeenCalledWith(
         expect.any(String),
         expect.objectContaining({
-          timeout: 2000,
+          timeout: 20000,
         })
       );
     });
@@ -203,7 +230,7 @@ describe('createClient', () => {
 
       // Get the connect_error handler
       const errorHandler = (mockSocket.on as MockedFunction<any>).mock.calls.find(
-        ([event]) => event === 'connect_error'
+        (call: unknown[]) => call[0] === 'connect_error'
       )?.[1];
 
       expect(errorHandler).toBeDefined();
@@ -228,7 +255,7 @@ describe('createClient', () => {
       createClient('http://localhost:3030', true, { verbose: true });
 
       const errorHandler = (mockSocket.on as MockedFunction<any>).mock.calls.find(
-        ([event]) => event === 'connect_error'
+        (call: unknown[]) => call[0] === 'connect_error'
       )?.[1];
 
       // Simulate two connection errors
@@ -249,10 +276,10 @@ describe('createClient', () => {
       createClient('http://localhost:3030', true, { verbose: true });
 
       const errorHandler = (mockSocket.on as MockedFunction<any>).mock.calls.find(
-        ([event]) => event === 'connect_error'
+        (call: unknown[]) => call[0] === 'connect_error'
       )?.[1];
       const connectHandler = (mockSocket.on as MockedFunction<any>).mock.calls.find(
-        ([event]) => event === 'connect'
+        (call: unknown[]) => call[0] === 'connect'
       )?.[1];
 
       // Simulate error then successful connection
@@ -274,7 +301,7 @@ describe('createClient', () => {
       createClient('http://localhost:3030', true, { verbose: true });
 
       const connectHandler = (mockSocket.on as MockedFunction<any>).mock.calls.find(
-        ([event]) => event === 'connect'
+        (call: unknown[]) => call[0] === 'connect'
       )?.[1];
 
       // Simulate successful first connection (no prior errors)
@@ -331,6 +358,54 @@ describe('createClient', () => {
       Object.setPrototypeOf(mockGlobalThis, Object.getPrototypeOf(globalThis));
 
       expect(() => createClient()).not.toThrow();
+    });
+
+    // Regression coverage for Node 25 compat: it exposes `globalThis.localStorage`
+    // but the object lacks `setItem`, so the Feathers auth client throws
+    // `_a.setItem is not a function` on first authenticate(). createClient()
+    // must treat that as "no storage" rather than passing it straight through.
+    it('should reject a localStorage stub without setItem (Node 25)', () => {
+      const brokenLocalStorage = {
+        getItem: vi.fn(),
+        // setItem intentionally absent — this is what Node 25 ships
+        removeItem: vi.fn(),
+        clear: vi.fn(),
+        length: 0,
+        key: vi.fn(),
+      };
+
+      (globalThis as any).localStorage = brokenLocalStorage;
+
+      const authMock = authClient as unknown as MockedFunction<any>;
+
+      createClient();
+
+      expect(authMock).toHaveBeenCalledWith({ storage: undefined });
+
+      delete (globalThis as any).localStorage;
+    });
+
+    it('should reject a localStorage stub whose setItem is not a function', () => {
+      // Defensive sibling case: anything truthy at .setItem that isn't
+      // callable would otherwise pass `'setItem' in storage` style checks.
+      const oddLocalStorage = {
+        getItem: vi.fn(),
+        setItem: 'not-a-function' as unknown as Storage['setItem'],
+        removeItem: vi.fn(),
+        clear: vi.fn(),
+        length: 0,
+        key: vi.fn(),
+      };
+
+      (globalThis as any).localStorage = oddLocalStorage;
+
+      const authMock = authClient as unknown as MockedFunction<any>;
+
+      createClient();
+
+      expect(authMock).toHaveBeenCalledWith({ storage: undefined });
+
+      delete (globalThis as any).localStorage;
     });
   });
 
@@ -411,6 +486,229 @@ describe('createClient', () => {
         expect.objectContaining({ autoConnect: false })
       );
     });
+  });
+
+  describe('service helpers', () => {
+    it('should normalize paginated find results via findAll()', async () => {
+      const client = createClient();
+      const sessionsService = client.service('sessions');
+
+      const findMock = sessionsService.find as unknown as MockedFunction<any>;
+      findMock.mockResolvedValue({
+        total: 2,
+        limit: 10,
+        skip: 0,
+        data: [{ session_id: 's1' }, { session_id: 's2' }],
+      });
+
+      const results = await sessionsService.findAll();
+
+      expect(results).toEqual([{ session_id: 's1' }, { session_id: 's2' }]);
+      expect(findMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('should return array find results unchanged via findAll()', async () => {
+      const client = createClient();
+      const sessionsService = client.service('sessions');
+
+      const findMock = sessionsService.find as unknown as MockedFunction<any>;
+      findMock.mockResolvedValue([{ session_id: 's1' }]);
+
+      const results = await sessionsService.findAll();
+
+      expect(results).toEqual([{ session_id: 's1' }]);
+      expect(findMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('should auto-paginate and return all rows via findAll()', async () => {
+      const client = createClient();
+      const sessionsService = client.service('sessions');
+
+      const findMock = sessionsService.find as unknown as MockedFunction<any>;
+      findMock
+        .mockResolvedValueOnce({
+          total: 3,
+          limit: 2,
+          skip: 0,
+          data: [{ session_id: 's1' }, { session_id: 's2' }],
+        })
+        .mockResolvedValueOnce({
+          total: 3,
+          limit: 2,
+          skip: 2,
+          data: [{ session_id: 's3' }],
+        });
+
+      const results = await sessionsService.findAll();
+
+      expect(results).toEqual([{ session_id: 's1' }, { session_id: 's2' }, { session_id: 's3' }]);
+      expect(findMock).toHaveBeenCalledTimes(2);
+      expect(findMock).toHaveBeenNthCalledWith(2, {
+        query: {
+          $skip: 2,
+          $limit: 2,
+        },
+      });
+    });
+
+    // Regression: PR #1088 added users.getGitEnvironment + repos/branches.initializeUnixGroup
+    // server-side via `app.use(path, service, { methods })`, but the Feathers Socket.io
+    // client only wires standard CRUD at construction time. Without an explicit
+    // service.methods(...) call on the client, calling these threw
+    // "client.service(...).<method> is not a function" — observed during prod branch
+    // creation. These assertions guard the client-side mirror of the daemon's methods list.
+    it('registers users.getGitEnvironment custom method on client', () => {
+      const client = createClient();
+      const usersService = client.service('users') as unknown as {
+        methods: MockedFunction<(...names: string[]) => unknown>;
+      };
+      expect(usersService.methods).toHaveBeenCalledWith('getGitEnvironment');
+    });
+
+    it('registers repos.initializeUnixGroup custom method on client', () => {
+      const client = createClient();
+      const reposService = client.service('repos') as unknown as {
+        methods: MockedFunction<(...names: string[]) => unknown>;
+      };
+      expect(reposService.methods).toHaveBeenCalledWith('initializeUnixGroup');
+    });
+
+    it('registers branches.initializeUnixGroup custom method on client', () => {
+      const client = createClient();
+      const branchesService = client.service('branches') as unknown as {
+        methods: MockedFunction<(...names: string[]) => unknown>;
+      };
+      expect(branchesService.methods).toHaveBeenCalledWith('initializeUnixGroup');
+    });
+
+    it('does not register custom methods on services without any', () => {
+      const client = createClient();
+      const sessionsService = client.service('sessions') as unknown as {
+        methods: MockedFunction<(...names: string[]) => unknown>;
+      };
+      // sessions has no extend*Service helper, so .methods() should not be called
+      expect(sessionsService.methods).not.toHaveBeenCalled();
+    });
+
+    it('should expose sessions.prompt helper that calls /sessions/:id/prompt route', async () => {
+      const client = createClient();
+      const routeService = client.service('sessions/session-123/prompt');
+      const createMock = routeService.create as unknown as MockedFunction<any>;
+
+      createMock.mockResolvedValue({
+        success: true,
+        taskId: 'task-123',
+        status: 'running',
+        streaming: true,
+      });
+
+      const result = await client.sessions.prompt('session-123', 'Fix failing tests', {
+        permissionMode: 'auto',
+        stream: true,
+      });
+
+      expect(createMock).toHaveBeenCalledWith(
+        {
+          prompt: 'Fix failing tests',
+          permissionMode: 'auto',
+          stream: true,
+        },
+        undefined
+      );
+      expect(result).toEqual({
+        success: true,
+        taskId: 'task-123',
+        status: 'running',
+        streaming: true,
+      });
+    });
+
+    // The pure-REST counterpart to client.sessions.prompt() — a thin wrapper
+    // around POST /tasks/:id/run, the explicit executor-trigger route added
+    // for harnesses that don't speak MCP. See issue #1118.
+    it('should expose tasks.run helper that calls /tasks/:id/run route', async () => {
+      const client = createClient();
+      const routeService = client.service('tasks/task-456/run');
+      const createMock = routeService.create as unknown as MockedFunction<any>;
+
+      createMock.mockResolvedValue({
+        task_id: 'task-456',
+        session_id: 'session-123',
+        status: 'running',
+      });
+
+      const result = await client.tasks.run('task-456', {
+        permissionMode: 'auto',
+        stream: true,
+      });
+
+      expect(createMock).toHaveBeenCalledWith(
+        {
+          permissionMode: 'auto',
+          stream: true,
+        },
+        undefined
+      );
+      expect(result).toEqual({
+        task_id: 'task-456',
+        session_id: 'session-123',
+        status: 'running',
+      });
+    });
+
+    it('should call tasks.run with empty body when no options provided', async () => {
+      const client = createClient();
+      const routeService = client.service('tasks/task-789/run');
+      const createMock = routeService.create as unknown as MockedFunction<any>;
+
+      createMock.mockResolvedValue({ task_id: 'task-789', status: 'running' });
+
+      await client.tasks.run('task-789');
+
+      expect(createMock).toHaveBeenCalledWith({}, undefined);
+    });
+  });
+});
+
+describe('normalizeFindResult', () => {
+  it('returns paginated data array', () => {
+    const result = normalizeFindResult({
+      total: 1,
+      limit: 10,
+      skip: 0,
+      data: [{ id: 1 }],
+    });
+
+    expect(result).toEqual([{ id: 1 }]);
+  });
+
+  it('returns plain array result unchanged', () => {
+    const result = normalizeFindResult([{ id: 1 }]);
+    expect(result).toEqual([{ id: 1 }]);
+  });
+});
+
+describe('type-level API ergonomics', () => {
+  it('accepts plain string IDs for create/patch/update payloads', () => {
+    type SessionCreateInput = Parameters<AgorService<Session>['create']>[0];
+    type SessionPatchInput = Exclude<Parameters<AgorService<Session>['patch']>[1], null>;
+    type SessionIdUpdateInput = UpdatePayload<Session>['session_id'];
+
+    const createPayload: SessionCreateInput = {
+      branch_id: '01933e4a-7b89-7c35-a8f3-9d2e1c4b5a6f',
+    };
+    const patchPayload: SessionPatchInput = { branch_id: '01933e4a-7b89-7c35-a8f3-9d2e1c4b5a6f' };
+    const updateId: SessionIdUpdateInput = '01933e4a-7b89-7c35-a8f3-9d2e1c4b5a6f';
+
+    expect(createPayload.branch_id).toBeDefined();
+    expect(patchPayload.branch_id).toBeDefined();
+    expect(typeof updateId).toBe('string');
+  });
+
+  it('uses concrete user typing for AuthenticationResult.user', () => {
+    type AuthUser = NonNullable<AuthenticationResult['user']>;
+    const getEmail = (user: AuthUser): string => user.email;
+    expect(typeof getEmail).toBe('function');
   });
 });
 

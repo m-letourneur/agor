@@ -48,7 +48,7 @@ export async function createExecutorClient(
   // Create client with custom storage (don't auto-connect, we'll connect manually)
   const client = createClient(daemonUrl, false, {
     verbose: true, // Log connection status for debugging
-    reconnectionAttempts: 2, // Fail fast if daemon is down
+    reconnectionAttempts: 5, // Allow more retries for transient network hiccups during long-running tasks
   });
 
   // Re-configure authentication with memory storage
@@ -71,7 +71,7 @@ export async function createExecutorClient(
       resolve();
     });
 
-    client.io.once('connect_error', (error) => {
+    client.io.once('connect_error', (error: Error) => {
       clearTimeout(timeout);
       reject(error);
     });
@@ -88,6 +88,33 @@ export async function createExecutorClient(
   });
 
   console.log('[executor] Authenticated with session token (JWT)');
+
+  // Re-authenticate automatically on socket reconnect
+  // When socket.io reconnects after a transport error, the new socket is unauthenticated.
+  // Without this, all subsequent API calls fail with "NotAuthenticated" and the executor crashes.
+  // This is critical for long-running SDK turns (Codex, Gemini) where transient network hiccups
+  // can cause socket disconnects mid-execution.
+  // NOTE: 'reconnect' is a Manager event, not a Socket event.
+  // client.io is the Socket; client.io.io is the Manager.
+  client.io.io.on('reconnect', async (attemptNumber: number) => {
+    console.log(`[executor] Socket reconnected (attempt ${attemptNumber}), re-authenticating...`);
+    try {
+      // Try reAuthenticate first — uses stored credentials from MemoryStorage
+      await client.reAuthenticate(true);
+      console.log('[executor] Re-authenticated successfully after reconnect');
+    } catch {
+      // Fallback: authenticate with raw JWT if storage-based re-auth fails
+      try {
+        await client.authenticate({
+          strategy: 'jwt',
+          accessToken: sessionToken,
+        });
+        console.log('[executor] Re-authenticated with JWT fallback after reconnect');
+      } catch (error) {
+        console.error('[executor] Re-authentication failed after reconnect:', error);
+      }
+    }
+  });
 
   return client;
 }

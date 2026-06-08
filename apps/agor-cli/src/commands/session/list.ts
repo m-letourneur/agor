@@ -4,22 +4,12 @@
  * Displays sessions in a beautiful table with filters.
  */
 
-import { PAGINATION } from '@agor/core/config';
-import { formatShortId } from '@agor/core/db';
-import type { Session } from '@agor/core/types';
-import { SessionStatus } from '@agor/core/types';
+import type { PaginatedResult, Session } from '@agor-live/client';
+import { PAGINATION, SessionStatus, shortId } from '@agor-live/client';
 import { Flags } from '@oclif/core';
 import chalk from 'chalk';
 import Table from 'cli-table3';
 import { BaseCommand } from '../../base-command';
-
-// Type for paginated responses
-interface Paginated<T> {
-  total: number;
-  limit: number;
-  skip: number;
-  data: T[];
-}
 
 export default class SessionList extends BaseCommand {
   static description = 'List all sessions';
@@ -45,7 +35,7 @@ export default class SessionList extends BaseCommand {
     agent: Flags.string({
       char: 'a',
       description: 'Filter by agent',
-      options: ['claude-code', 'codex', 'gemini'],
+      options: ['claude-code', 'codex', 'gemini', 'opencode', 'copilot'],
     }),
     board: Flags.string({
       char: 'b',
@@ -85,6 +75,8 @@ export default class SessionList extends BaseCommand {
       running: chalk.blue('●'),
       stopping: chalk.yellow('◐'),
       awaiting_permission: chalk.yellow('⏸'),
+      awaiting_input: chalk.blue('❓'),
+      timed_out: chalk.yellow('⏰'),
       completed: chalk.green('✓'),
       failed: chalk.red('✗'),
       idle: chalk.gray('○'),
@@ -94,6 +86,8 @@ export default class SessionList extends BaseCommand {
       running: chalk.blue('Running'),
       stopping: chalk.yellow('Stopping'),
       awaiting_permission: chalk.yellow('Awaiting Permission'),
+      awaiting_input: chalk.blue('Awaiting Input'),
+      timed_out: chalk.yellow('Timed Out'),
       completed: chalk.green('Done'),
       failed: chalk.red('Failed'),
       idle: chalk.gray('Idle'),
@@ -139,8 +133,8 @@ export default class SessionList extends BaseCommand {
       const sessionsService = client.service('sessions');
       const result = await sessionsService.find({ query });
       const isPaginated = !Array.isArray(result);
-      const sessions = Array.isArray(result) ? result : (result as Paginated<Session>).data;
-      const total = isPaginated ? (result as Paginated<Session>).total : sessions.length;
+      const sessions = Array.isArray(result) ? result : (result as PaginatedResult<Session>).data;
+      const total = isPaginated ? (result as PaginatedResult<Session>).total : sessions.length;
 
       if (!Array.isArray(sessions) || sessions.length === 0) {
         this.log(chalk.dim('No sessions found.'));
@@ -157,7 +151,7 @@ export default class SessionList extends BaseCommand {
           chalk.cyan('Agent'),
           chalk.cyan('Status'),
           chalk.cyan('Tasks'),
-          chalk.cyan('Worktree'),
+          chalk.cyan('Branch'),
           chalk.cyan('Git Ref'),
           chalk.cyan('Modified'),
         ],
@@ -170,7 +164,7 @@ export default class SessionList extends BaseCommand {
 
       // Add rows
       for (const session of sessions) {
-        const shortId = formatShortId(session.session_id);
+        const localShortId = shortId(session.session_id);
         const _firstTask =
           Array.isArray(session.tasks) && session.tasks.length > 0 ? session.tasks[0] : null;
         const description = this.truncate(session.description || '(no description)', 28);
@@ -178,19 +172,19 @@ export default class SessionList extends BaseCommand {
         // Note: session.tasks are TaskID arrays, not full Task objects in list view
         // Task completion stats would require joining with tasks table
         const completedTasks = 0;
-        // Note: Session now uses worktree_id, not nested repo object
-        // For now, show worktree_id if available, otherwise '-'
-        const worktree = session.worktree_id ? session.worktree_id.substring(0, 8) : '-';
+        // Note: Session now uses branch_id, not nested repo object
+        // For now, show branch_id if available, otherwise '-'
+        const branch = session.branch_id ? shortId(session.branch_id) : '-';
         const gitRef = session.git_state?.ref || '-';
         const modified = this.formatRelativeTime(session.last_updated || session.created_at);
 
         table.push([
-          chalk.dim(shortId),
+          chalk.dim(localShortId),
           description,
           session.agentic_tool,
           this.formatStatus(session.status),
           `${completedTasks}/${taskCount}`,
-          chalk.dim(worktree),
+          chalk.dim(branch),
           chalk.dim(gitRef),
           chalk.dim(modified),
         ]);

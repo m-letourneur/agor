@@ -54,23 +54,37 @@ export function getDaemonPath(): string | null {
   const cliDistIndex = dirname.indexOf(`${path.sep}dist${path.sep}cli`);
   if (cliDistIndex === -1) {
     // Fallback: couldn't find dist/cli, use relative path
-    return path.resolve(dirname, '../../daemon/index.js');
+    return path.resolve(dirname, '../../daemon/main.js');
   }
 
   // Get package root (everything before /dist/cli)
   const packageRoot = dirname.substring(0, cliDistIndex);
 
   // Construct daemon path from package root
-  return path.join(packageRoot, 'dist', 'daemon', 'index.js');
+  return path.join(packageRoot, 'dist', 'daemon', 'main.js');
 }
 
 /**
- * Check if running in GitHub Codespaces
+ * Get path to bundled daemon module (library entrypoint for startDaemon import)
  *
- * @returns true if running in Codespaces
+ * @returns path to daemon module, or null if in development
  */
-export function isCodespaces(): boolean {
-  return !!process.env.CODESPACE_NAME && !!process.env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN;
+export function getDaemonModulePath(): string | null {
+  if (!isInstalledPackage()) {
+    // Development mode: use workspace package import
+    return null;
+  }
+
+  const dirname =
+    typeof __dirname !== 'undefined' ? __dirname : path.dirname(fileURLToPath(import.meta.url));
+
+  const cliDistIndex = dirname.indexOf(`${path.sep}dist${path.sep}cli`);
+  if (cliDistIndex === -1) {
+    return path.resolve(dirname, '../../daemon/index.js');
+  }
+
+  const packageRoot = dirname.substring(0, cliDistIndex);
+  return path.join(packageRoot, 'dist', 'daemon', 'index.js');
 }
 
 /**
@@ -79,21 +93,6 @@ export function isCodespaces(): boolean {
  * @returns UI URL for current context
  */
 export function getUIUrl(): string {
-  // Codespaces: use port forwarding URL
-  if (isCodespaces()) {
-    const codespaceName = process.env.CODESPACE_NAME;
-    const domain = process.env.GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN;
-
-    if (isInstalledPackage()) {
-      // Production in Codespaces: daemon serves UI at /ui
-      return `https://${codespaceName}-3030.${domain}/ui`;
-    } else {
-      // Development in Codespaces: Vite dev server
-      return `https://${codespaceName}-5173.${domain}`;
-    }
-  }
-
-  // Local environment
   if (isInstalledPackage()) {
     // Production: UI served by daemon at /ui
     return 'http://localhost:3030/ui';

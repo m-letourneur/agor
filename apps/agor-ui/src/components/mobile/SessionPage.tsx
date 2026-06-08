@@ -1,6 +1,13 @@
-import type { AgorClient } from '@agor/core/api';
-import type { PermissionMode, Repo, Session, SessionID, User, Worktree } from '@agor/core/types';
-import { PermissionScope } from '@agor/core/types';
+import type {
+  AgorClient,
+  Branch,
+  PermissionMode,
+  Repo,
+  Session,
+  SessionID,
+  User,
+} from '@agor-live/client';
+import { getAssistantConfig, isAssistant, PermissionScope } from '@agor-live/client';
 import { Alert, Spin } from 'antd';
 import { useParams } from 'react-router-dom';
 import { getSessionDisplayTitle } from '../../utils/sessionTitle';
@@ -11,7 +18,7 @@ import { MobilePromptInput } from './MobilePromptInput';
 interface SessionPageProps {
   client: AgorClient | null;
   sessionById: Map<string, Session>; // O(1) ID lookups
-  worktreeById: Map<string, Worktree>;
+  branchById: Map<string, Branch>;
   repoById: Map<string, Repo>;
   userById: Map<string, User>;
   currentUser?: User | null;
@@ -24,7 +31,7 @@ interface SessionPageProps {
 export const SessionPage: React.FC<SessionPageProps> = ({
   client,
   sessionById,
-  worktreeById,
+  branchById,
   repoById,
   userById,
   currentUser,
@@ -36,12 +43,12 @@ export const SessionPage: React.FC<SessionPageProps> = ({
   const { sessionId } = useParams<{ sessionId: string }>();
 
   const session = sessionId ? sessionById.get(sessionId) : undefined;
-  const worktree = session?.worktree_id ? worktreeById.get(session.worktree_id) || null : null;
+  const branch = session?.branch_id ? branchById.get(session.branch_id) || null : null;
 
   if (!sessionId) {
     return (
       <div style={{ padding: 16 }}>
-        <Alert type="error" message="No session ID provided" />
+        <Alert type="error" title="No session ID provided" />
       </div>
     );
   }
@@ -82,7 +89,7 @@ export const SessionPage: React.FC<SessionPageProps> = ({
         reason: allow ? 'Approved by user' : 'Denied by user',
         remember: scope !== PermissionScope.ONCE,
         scope,
-        decidedBy: currentUser?.user_id || 'anonymous',
+        decidedBy: currentUser?.user_id || 'unknown',
       });
     } catch (error) {
       console.error('Failed to send permission decision:', error);
@@ -93,7 +100,7 @@ export const SessionPage: React.FC<SessionPageProps> = ({
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
       <MobileHeader
         title={
-          worktree?.name ||
+          branch?.name ||
           getSessionDisplayTitle(session, { fallbackChars: 30, includeIdFallback: true })
         }
         showMenu
@@ -115,10 +122,13 @@ export const SessionPage: React.FC<SessionPageProps> = ({
           userById={userById}
           currentUserId={currentUser?.user_id}
           onPermissionDecision={handlePermissionDecision}
-          scheduledFromWorktree={session.scheduled_from_worktree}
+          scheduledFromBranch={session.scheduled_from_branch}
           scheduledRunAt={session.scheduled_run_at}
           genealogy={session.genealogy}
           emptyStateMessage="Tap the menu icon to browse boards and sessions"
+          assistantEmoji={
+            branch && isAssistant(branch) ? getAssistantConfig(branch)?.emoji : undefined
+          }
         />
       </div>
       <MobilePromptInput

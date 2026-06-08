@@ -10,27 +10,45 @@
  */
 
 import {
+  type AgorClient,
   type ContentBlock as CoreContentBlock,
+  type DiffEnrichment,
   type Message,
   type PermissionRequestContent,
   PermissionScope,
   PermissionStatus,
+  shortId,
   type User,
-} from '@agor/core/types';
-import { RobotOutlined } from '@ant-design/icons';
+} from '@agor-live/client';
+import { RobotOutlined, SyncOutlined, WarningOutlined } from '@ant-design/icons';
 import { Bubble } from '@ant-design/x';
 import { Tooltip, theme } from 'antd';
 
-import type React from 'react';
+import React from 'react';
 import { formatTimestampWithRelative } from '../../utils/time';
+import { getToolDisplayName } from '../../utils/toolDisplayName';
+import { toolResultToDisplayText } from '../../utils/toolResultToDisplayText';
 import { AgorAvatar } from '../AgorAvatar';
 import { CollapsibleMarkdown } from '../CollapsibleText/CollapsibleMarkdown';
 import { CopyableContent } from '../CopyableContent';
 import { MarkdownRenderer } from '../MarkdownRenderer';
 import { PermissionRequestBlock } from '../PermissionRequestBlock';
+import { SystemMessage } from '../SystemMessage';
 import { ThinkingBlock } from '../ThinkingBlock';
+import {
+  buildBashDescriptionNode,
+  deriveToolStatus,
+  IMPLICIT_RESULT_TOOLS,
+  renderToolStatusIcon,
+  shouldExpandToolByDefault,
+  ToolBlock,
+} from '../ToolBlock';
 import { ToolIcon } from '../ToolIcon';
 import { ToolUseRenderer } from '../ToolUseRenderer';
+// Side-effect import: registers every built-in widget component with the
+// `WidgetBlock` dispatcher (e.g. `env_vars`).
+import '../Widgets';
+import { WidgetBlock } from './WidgetBlock';
 
 interface ToolUseBlock {
   type: 'tool_use';
@@ -44,6 +62,7 @@ interface ToolResultBlock {
   tool_use_id: string;
   content: string | CoreContentBlock[];
   is_error?: boolean;
+  diff?: DiffEnrichment;
 }
 
 interface TextBlock {
@@ -69,7 +88,9 @@ interface MessageBlockProps {
   taskId?: string;
   isFirstPendingPermission?: boolean; // For sequencing permission requests
   isLatestMessage?: boolean; // Whether this is the most recent message (don't collapse by default)
-  allMessages?: Message[]; // All messages for aggregation (e.g., finding matching compaction events)
+  assistantEmoji?: string; // Emoji override for assistant avatar (replaces tool icon)
+  /** Authenticated Feathers client, forwarded to WidgetBlock for inline-form submission. */
+  client?: AgorClient | null;
   onPermissionDecision?: (
     sessionId: string,
     requestId: string,
@@ -77,6 +98,64 @@ interface MessageBlockProps {
     allow: boolean,
     scope: PermissionScope
   ) => void;
+}
+
+/** Get short description for a tool call (file path, pattern, command, etc.) */
+function getToolDescription(toolUse: ToolUseBlock): string | undefined {
+  const { name, input } = toolUse;
+  if (typeof input.description === 'string') return input.description;
+  switch (name) {
+    case 'Read':
+    case 'Write':
+    case 'Edit':
+    case 'NotebookEdit':
+      return input.file_path ? String(input.file_path) : undefined;
+    case 'Bash':
+      return input.description
+        ? String(input.description)
+        : input.command
+          ? String(input.command)
+          : undefined;
+    case 'Grep':
+    case 'Glob':
+      return input.pattern ? String(input.pattern) : undefined;
+    case 'ToolSearch':
+    case 'WebSearch':
+    case 'web_search':
+      return input.query ? String(input.query) : undefined;
+    case 'WebFetch':
+      return input.url ? String(input.url) : undefined;
+    case 'Agent':
+      return input.description ? String(input.description) : undefined;
+    case 'Skill':
+    case 'SlashCommand':
+      return input.skill ? String(input.skill) : input.name ? String(input.name) : undefined;
+    case 'Task': {
+      if (!input.prompt) return undefined;
+      const firstLine = String(input.prompt).trim().split('\n')[0];
+      return firstLine.length > 100 ? `${firstLine.slice(0, 100)}…` : firstLine;
+    }
+    case 'TodoWrite': {
+      const todos = Array.isArray(input.todos) ? input.todos : [];
+      if (todos.length === 0) return undefined;
+      const done = todos.filter((t: { status?: string }) => t.status === 'completed').length;
+      const inProg = todos.filter((t: { status?: string }) => t.status === 'in_progress').length;
+      const parts = [`${done}/${todos.length} done`];
+      if (inProg > 0) parts.push(`${inProg} in progress`);
+      return parts.join(', ');
+    }
+    case 'edit_files': {
+      const changes = Array.isArray(input.changes) ? input.changes : [];
+      if (changes.length === 0) return undefined;
+      if (changes.length === 1) {
+        const c = changes[0] as { path?: string; kind?: string };
+        return `${c.kind || 'update'} ${c.path || ''}`;
+      }
+      return `${changes.length} files`;
+    }
+    default:
+      return undefined;
+  }
 }
 
 /**
@@ -118,7 +197,54 @@ function isTaskToolResult(message: Message): boolean {
   return hasToolResult;
 }
 
-export const MessageBlock: React.FC<MessageBlockProps> = ({
+/**
+ * Compute the avatar element for an agent/assistant message.
+ * Centralizes the priority: callback logo > assistant emoji > agentic tool icon > robot fallback.
+ */
+function getAgentAvatar({
+  assistantEmoji,
+  agentic_tool,
+  isCallback,
+  token,
+}: {
+  assistantEmoji?: string;
+  agentic_tool?: string;
+  isCallback?: boolean;
+  token: ReturnType<typeof theme.useToken>['token'];
+}): React.ReactNode {
+  if (isCallback) {
+    return (
+      <img
+        src={`${import.meta.env.BASE_URL}favicon.png`}
+        alt="Agor"
+        style={{ width: 32, height: 32, borderRadius: '50%' }}
+      />
+    );
+  }
+  if (assistantEmoji) {
+    return <AgorAvatar>{assistantEmoji}</AgorAvatar>;
+  }
+  if (agentic_tool) {
+    return <ToolIcon tool={agentic_tool} size={32} />;
+  }
+  return (
+    <AgorAvatar icon={<RobotOutlined />} style={{ backgroundColor: token.colorBgContainer }} />
+  );
+}
+
+// Memoized: every text block / tool block of every message in the conversation
+// re-rendered on every streaming chunk because TaskBlock's `messages` array
+// gets a fresh reference each tick. Default shallow compare is sufficient
+// here because callers pass:
+//   - `message`: stable per message_id (only the actively streaming message
+//     gets a new ref each chunk — correct: it should re-render)
+//   - `userById`: from AppUserDataContext (stable across session patches)
+//   - `currentUserId`, `agentic_tool`, `sessionId`, `taskId`, `assistantEmoji`,
+//     `isTaskRunning`, `isLatestMessage`, `isFirstPending*`: primitives or
+//     stable derived values
+//   - `onPermissionDecision`, `onInputResponse`: useCallback-wrapped in App.tsx
+//     and passed through useMemo'd AppActionsContext
+const MessageBlockInner: React.FC<MessageBlockProps> = ({
   message,
   userById = new Map(),
   currentUserId,
@@ -128,8 +254,9 @@ export const MessageBlock: React.FC<MessageBlockProps> = ({
   taskId,
   isFirstPendingPermission = false,
   isLatestMessage = false,
-  allMessages = [],
   onPermissionDecision,
+  assistantEmoji,
+  client = null,
 }) => {
   const { token } = theme.useToken();
 
@@ -147,6 +274,7 @@ export const MessageBlock: React.FC<MessageBlockProps> = ({
           message={message}
           content={content}
           isActive={canInteract}
+          agenticTool={agentic_tool}
           onApprove={
             canInteract && onPermissionDecision && sessionId && taskId
               ? (messageId, scope) => {
@@ -169,6 +297,25 @@ export const MessageBlock: React.FC<MessageBlockProps> = ({
           }
           isWaiting={isPending && !isFirstPendingPermission}
         />
+      </div>
+    );
+  }
+
+  // Legacy `input_request` messages (from before AskUserQuestion was disallowed
+  // in #1177) are skipped — the interactive widget no longer ships, and the
+  // surrounding agent text already carries the question/answer context.
+  if (message.type === 'input_request') {
+    return null;
+  }
+
+  // In-conversation interactive widgets. WidgetBlock looks up the registered
+  // component by `metadata.widget.widget_type` and falls back to an
+  // "Unknown widget type" placeholder for forward-compat with newer
+  // daemons. See `docs/internal/in-conversation-widgets-design-2026-05-19.md`.
+  if (message.type === 'widget_request') {
+    return (
+      <div style={{ margin: `${token.sizeUnit * 1.5}px 0` }}>
+        <WidgetBlock message={message} client={client} />
       </div>
     );
   }
@@ -212,10 +359,97 @@ export const MessageBlock: React.FC<MessageBlockProps> = ({
 
   // Special handling for system messages
   // Note: Compaction events are now handled by CompactionBlock in TaskBlock grouping
-  // This section can be used for other system message types in the future
+  if (isSystem && message.metadata?.is_btw_result) {
+    const btwResponse =
+      typeof message.content === 'string'
+        ? message.content
+        : Array.isArray(message.content)
+          ? message.content
+              // biome-ignore lint/suspicious/noExplicitAny: Content block types vary
+              .filter((b: any) => b.type === 'text')
+              // biome-ignore lint/suspicious/noExplicitAny: Content block types vary
+              .map((b: any) => b.text)
+              .join('\n\n')
+          : '';
+    const btwPrompt = message.metadata?.btw_prompt as string | undefined;
+    const btwSessionId = message.metadata?.btw_session_id as string | undefined;
+    const btwShortId = btwSessionId ? shortId(btwSessionId) : undefined;
+    const callerSessionId = message.metadata?.btw_caller_session_id as string | undefined;
+    const callerTitle = message.metadata?.btw_caller_title as string | undefined;
+    const callerShortId = callerSessionId ? shortId(callerSessionId) : undefined;
+    const isRemote = !!callerSessionId;
+
+    // Build markdown content
+    const lines: string[] = [];
+    if (isRemote) {
+      const callerLink = callerTitle
+        ? `[${callerTitle} (${callerShortId})](#session/${callerSessionId})`
+        : `[${callerShortId}](#session/${callerSessionId})`;
+      const forkLink = `[btw (${btwShortId})](#session/${btwSessionId})`;
+      lines.push(`From ${callerLink} · ${forkLink}`);
+    }
+    if (btwPrompt) {
+      lines.push(`> ${btwPrompt.replace(/\n/g, '\n> ')}`);
+      lines.push('');
+    }
+    lines.push(btwResponse);
+    const markdownContent = lines.join('\n');
+
+    return (
+      <div
+        style={{
+          border: `1px solid ${token.colorWarning}`,
+          borderRadius: token.borderRadiusLG,
+          padding: '8px 12px',
+          margin: '8px 0',
+          background: token.colorWarningBg,
+        }}
+      >
+        <div
+          style={{
+            fontSize: 11,
+            fontWeight: 600,
+            color: token.colorWarning,
+            marginBottom: 4,
+          }}
+        >
+          btw
+        </div>
+        <MarkdownRenderer content={markdownContent} />
+      </div>
+    );
+  }
+
+  // Daemon restart / crash notice — injected by startup reconciliation.
+  // Intentionally low-frequency and user-meaningful; contrast with PR #1116
+  // which filtered high-frequency SDK lifecycle noise.
+  if (message.type === 'daemon_restart' || message.type === 'daemon_crash') {
+    const isGraceful = message.type === 'daemon_restart';
+    const text = typeof message.content === 'string' ? message.content : '';
+    return (
+      <SystemMessage
+        content={
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+            <span
+              style={{
+                color: isGraceful ? token.colorInfo : token.colorWarning,
+                flexShrink: 0,
+                marginTop: 2,
+              }}
+            >
+              {isGraceful ? <SyncOutlined /> : <WarningOutlined />}
+            </span>
+            <div style={{ fontSize: 13 }}>
+              <MarkdownRenderer content={text} />
+            </div>
+          </div>
+        }
+      />
+    );
+  }
+
   if (isSystem && Array.isArray(message.content)) {
-    // Future: Handle other system message types here
-    // For now, compaction is the only system message type, and it's handled elsewhere
+    // Other system message types handled elsewhere (e.g., compaction in TaskBlock)
   }
 
   // Parse content blocks from message, preserving order
@@ -286,15 +520,7 @@ export const MessageBlock: React.FC<MessageBlockProps> = ({
           // Special handling: If this is a Task tool result (user message rendered as agent),
           // extract text content and display it
           if (isTaskResult) {
-            let resultText = '';
-            if (typeof toolResult.content === 'string') {
-              resultText = toolResult.content;
-            } else if (Array.isArray(toolResult.content)) {
-              resultText = toolResult.content
-                .filter((b) => b.type === 'text')
-                .map((b) => (b as unknown as { text: string }).text)
-                .join('\n');
-            }
+            const resultText = toolResultToDisplayText(toolResult.content);
 
             if (resultText.trim()) {
               textBeforeTools.push(resultText);
@@ -365,19 +591,8 @@ export const MessageBlock: React.FC<MessageBlockProps> = ({
         (() => {
           const avatar = isUser ? (
             <AgorAvatar>{userEmoji}</AgorAvatar>
-          ) : isCallback ? (
-            <img
-              src={`${import.meta.env.BASE_URL}favicon.png`}
-              alt="Agor"
-              style={{ width: 32, height: 32, borderRadius: '50%' }}
-            />
-          ) : agentic_tool ? (
-            <ToolIcon tool={agentic_tool} size={32} />
           ) : (
-            <AgorAvatar
-              icon={<RobotOutlined />}
-              style={{ backgroundColor: token.colorBgContainer }}
-            />
+            getAgentAvatar({ assistantEmoji, agentic_tool, isCallback, token })
           );
 
           return (
@@ -412,12 +627,12 @@ export const MessageBlock: React.FC<MessageBlockProps> = ({
                         gap: token.sizeUnit,
                       }}
                     >
-                      {textBeforeTools.map((text, idx) => {
+                      {textBeforeTools.map((text) => {
                         // Use CollapsibleMarkdown for long text blocks (15+ lines)
                         const shouldTruncate = text.split('\n').length > 15;
 
                         return (
-                          <div key={`text-${idx}-${text.substring(0, 20)}`}>
+                          <div key={`text-${text.length}-${text.substring(0, 32)}`}>
                             {shouldTruncate ? (
                               <CollapsibleMarkdown
                                 maxLines={10}
@@ -453,30 +668,68 @@ export const MessageBlock: React.FC<MessageBlockProps> = ({
 
       {/* Tools (compact, no bubble) */}
       {hasTools && (
-        <div style={{ margin: `${token.sizeUnit * 1.5}px 0` }}>
-          {toolBlocks.map(({ toolUse, toolResult }) => (
-            <ToolUseRenderer key={toolUse.id} toolUse={toolUse} toolResult={toolResult} />
-          ))}
+        <div
+          style={{
+            margin: `${token.sizeUnit * 1.5}px 0`,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 2,
+          }}
+        >
+          {/* Index of last tool with a result — tools after this are potentially running */}
+          {(() => {
+            let lastResultIndex = -1;
+            for (let i = toolBlocks.length - 1; i >= 0; i--) {
+              if (toolBlocks[i].toolResult) {
+                lastResultIndex = i;
+                break;
+              }
+            }
+            return toolBlocks.map(({ toolUse, toolResult }, toolIndex) => {
+              const displayName = getToolDisplayName(toolUse.name, toolUse.input);
+              const hasImplicitResult = IMPLICIT_RESULT_TOOLS.has(toolUse.name);
+
+              // A tool is potentially still running when no subsequent tool in
+              // this message has a result AND this is the latest message.
+              // This correctly handles concurrent tool calls (e.g. multiple
+              // WebSearch calls) — they all show as "pending" simultaneously.
+              const isPotentiallyRunning = toolIndex > lastResultIndex && isLatestMessage;
+
+              const status = deriveToolStatus({
+                hasResult: !!toolResult || hasImplicitResult,
+                isError: !!toolResult?.is_error,
+                isPotentiallyRunning,
+                isTaskRunning,
+              });
+              const icon = renderToolStatusIcon(status);
+
+              const bashNode =
+                toolUse.name === 'Bash'
+                  ? buildBashDescriptionNode(toolUse.input, token)
+                  : undefined;
+
+              return (
+                <ToolBlock
+                  key={toolUse.id}
+                  icon={icon}
+                  name={displayName}
+                  description={bashNode ? undefined : getToolDescription(toolUse)}
+                  descriptionNode={bashNode}
+                  status={status}
+                  expandedByDefault={shouldExpandToolByDefault(toolUse.name)}
+                >
+                  <ToolUseRenderer toolUse={toolUse} toolResult={toolResult} />
+                </ToolBlock>
+              );
+            });
+          })()}
         </div>
       )}
 
       {/* Response text after tools */}
       {hasTextAfter &&
         (() => {
-          const avatar = isCallback ? (
-            <img
-              src={`${import.meta.env.BASE_URL}favicon.png`}
-              alt="Agor"
-              style={{ width: 32, height: 32, borderRadius: '50%' }}
-            />
-          ) : agentic_tool ? (
-            <ToolIcon tool={agentic_tool} size={32} />
-          ) : (
-            <AgorAvatar
-              icon={<RobotOutlined />}
-              style={{ backgroundColor: token.colorBgContainer }}
-            />
-          );
+          const avatar = getAgentAvatar({ assistantEmoji, agentic_tool, isCallback, token });
 
           return (
             <div style={{ margin: `${token.sizeUnit}px 0` }}>
@@ -543,3 +796,6 @@ export const MessageBlock: React.FC<MessageBlockProps> = ({
     </>
   );
 };
+
+export const MessageBlock = React.memo(MessageBlockInner);
+MessageBlock.displayName = 'MessageBlock';

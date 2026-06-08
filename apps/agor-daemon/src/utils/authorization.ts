@@ -2,31 +2,12 @@
  * Authorization utilities for Feathers services and custom routes.
  */
 
+import type { ManagedEnvsMinimumRole } from '@agor/core/config';
 import { Forbidden, NotAuthenticated } from '@agor/core/feathers';
-import type { AuthenticatedParams, HookContext } from '@agor/core/types';
+import type { AuthenticatedParams, HookContext, UserRole } from '@agor/core/types';
+import { hasMinimumRole, ROLES } from '@agor/core/types';
 
-export type Role = 'owner' | 'admin' | 'member' | 'viewer';
-
-const ROLE_RANK: Record<Role, number> = {
-  viewer: 0,
-  member: 1,
-  admin: 2,
-  owner: 3,
-};
-
-/**
- * Determine whether a role meets or exceeds the minimum role requirement.
- */
-function hasMinimumRole(userRole: string | undefined, minimumRole: Role): boolean {
-  if (!userRole) {
-    return minimumRole === 'viewer';
-  }
-
-  const normalizedRole = (userRole.toLowerCase() as Role) || 'viewer';
-  const userRank = ROLE_RANK[normalizedRole] ?? ROLE_RANK.viewer;
-  const requiredRank = ROLE_RANK[minimumRole];
-  return userRank >= requiredRank;
-}
+export type Role = UserRole;
 
 /**
  * Ensure the request is authenticated and has the minimum required role.
@@ -70,6 +51,94 @@ export function requireMinimumRole(minimumRole: Role, action?: string) {
 }
 
 /**
+ * Default minimum role for triggering managed environment commands.
+ * Keep in sync with `AgorExecutionSettings.managed_envs_minimum_role`.
+ */
+const DEFAULT_MANAGED_ENVS_MINIMUM_ROLE: UserRole = ROLES.MEMBER;
+
+/**
+ * Enforce the `execution.managed_envs_minimum_role` config on managed
+ * environment triggers (start/stop/nuke/logs).
+ *
+ * - `'none'` is a kill switch: throws Forbidden regardless of caller role.
+ * - Otherwise delegates to `ensureMinimumRole`, so internal calls and service
+ *   accounts bypass (same semantics as other role gates).
+ *
+ * Canonical enforcement point — called from the service layer so that REST,
+ * WebSocket, *and* MCP tool invocations all pass through the same gate.
+ */
+export function ensureCanTriggerManagedEnv(
+  minimumRole: ManagedEnvsMinimumRole | undefined,
+  params: AuthenticatedParams | undefined,
+  action: string
+): void {
+  const value = minimumRole ?? DEFAULT_MANAGED_ENVS_MINIMUM_ROLE;
+
+  if (value === 'none') {
+    // Internal calls still bypass (daemon-initiated health loops, etc.)
+    if (!params?.provider) return;
+    throw new Forbidden(
+      `Managed environments are disabled (execution.managed_envs_minimum_role: 'none'); cannot ${action}`
+    );
+  }
+
+  ensureMinimumRole(params, value, action);
+}
+
+/**
+ * Fields that contain executable commands or environment configuration.
+ *
+ * Repos store templates in `environment` (v2 source of truth) or the legacy
+ * `environment_config` view; branches store resolved values as top-level
+ * fields plus the currently-rendered `environment_variant` name. All of these
+ * execute as (or select) commands that run as the system user, so only admins
+ * may write them.
+ */
+const ENV_COMMAND_FIELDS = [
+  'environment', // Repo-level: v2 named variants (source of truth)
+  'environment_config', // Repo-level: legacy v1 view (still guarded)
+  'environment_variant', // Branch-level: selected variant name
+  'start_command', // Branch-level: resolved commands
+  'stop_command',
+  'nuke_command',
+  'logs_command',
+  'health_check_url',
+  'app_url',
+];
+
+/**
+ * Feathers hook that requires admin role when environment command fields are being modified.
+ *
+ * Environment commands execute as the system user, so only admins/superadmins
+ * may set or change them. Works for both repo-level (environment_config) and
+ * branch-level (start_command, stop_command, etc.) fields.
+ */
+export function requireAdminForEnvConfig() {
+  return (context: HookContext) => {
+    // biome-ignore lint/suspicious/noExplicitAny: context.data shape varies per service
+    const data = context.data as any;
+
+    // Check both single objects and array payloads (bulk create)
+    const items = Array.isArray(data) ? data : [data];
+    const hasEnvConfig = items.some((item: Record<string, unknown>) =>
+      ENV_COMMAND_FIELDS.some((field) => item?.[field] != null)
+    );
+    if (!hasEnvConfig) {
+      return context;
+    }
+
+    // Internal calls and service accounts bypass (handled by ensureMinimumRole)
+    ensureMinimumRole(
+      context.params,
+      ROLES.ADMIN,
+      'modify environment commands (up_command, down_command, etc.)'
+    );
+
+    return context;
+  };
+}
+
+/**
  * Helper to register authenticated custom routes with hooks.
  *
  * This utility reduces boilerplate when creating custom Feathers routes that require authentication.
@@ -91,7 +160,7 @@ export function requireMinimumRole(minimumRole: Role, action?: string) {
  *     }
  *   },
  *   {
- *     create: { role: 'member', action: 'spawn sessions' }
+ *     create: { role: ROLES.MEMBER, action: 'spawn sessions' }
  *   },
  *   requireAuth
  * );

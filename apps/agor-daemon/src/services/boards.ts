@@ -6,8 +6,13 @@
  */
 
 import { PAGINATION } from '@agor/core/config';
-import { BoardRepository, type Database } from '@agor/core/db';
+import { BoardObjectRepository, BoardRepository, type Database } from '@agor/core/db';
+import {
+  ASSISTANT_WELCOME_NOTE_OBJECT_ID,
+  buildAssistantWelcomeNoteObject,
+} from '@agor/core/templates/assistant-welcome-note';
 import type {
+  AssistantWelcomeNoteRequest,
   AuthenticatedParams,
   Board,
   BoardExportBlob,
@@ -16,6 +21,10 @@ import type {
 } from '@agor/core/types';
 import { NotFoundError } from '@agor/core/utils/errors';
 import { DrizzleService } from '../adapters/drizzle';
+import {
+  type BoardObjectPatchedEventPayload,
+  toBoardObjectPatchedEventPayload,
+} from './board-objects.js';
 
 /**
  * Board service params
@@ -26,6 +35,8 @@ export interface BoardParams
     name?: string;
   }> {
   user?: AuthenticatedParams['user'];
+  /** Internal hook signal; set only when ensureAssistantWelcomeNote writes. */
+  assistantWelcomeNoteMutated?: boolean;
 }
 
 /**
@@ -33,8 +44,13 @@ export interface BoardParams
  */
 export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardParams> {
   private boardRepo: BoardRepository;
+  private boardObjectRepo: BoardObjectRepository;
+  private emitBoardObjectPatched?: (boardObject: BoardObjectPatchedEventPayload) => void;
 
-  constructor(db: Database) {
+  constructor(
+    db: Database,
+    emitBoardObjectPatched?: (boardObject: BoardObjectPatchedEventPayload) => void
+  ) {
     const boardRepo = new BoardRepository(db);
     super(boardRepo, {
       id: 'board_id',
@@ -46,6 +62,8 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
     });
 
     this.boardRepo = boardRepo;
+    this.boardObjectRepo = new BoardObjectRepository(db);
+    this.emitBoardObjectPatched = emitBoardObjectPatched;
   }
 
   /**
@@ -98,7 +116,83 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
     objectId: string,
     _params?: BoardParams
   ): Promise<Board> {
+    const board = await this.boardRepo.findBySlugOrId(boardId);
+    const object = board?.objects?.[objectId];
+
+    // A generic removeObject path can remove zones too (e.g. MCP
+    // agor_boards_update.removeObjects). Clear entity zone references first so
+    // future board renders do not construct React Flow children with a missing
+    // parent. Convert zone-relative positions to absolute while the zone origin
+    // is still available.
+    if (board && object?.type === 'zone') {
+      const cleared = await this.boardObjectRepo.clearZoneReferences(board.board_id, objectId, {
+        x: object.x,
+        y: object.y,
+      });
+
+      for (const boardObject of cleared) {
+        this.emitBoardObjectPatched?.(toBoardObjectPatchedEventPayload(boardObject));
+      }
+    }
+
     return this.boardRepo.removeBoardObject(boardId, objectId);
+  }
+
+  /**
+   * Custom method: Create the bundled assistant welcome note when missing.
+   *
+   * Rendering is intentionally server-side from a static Handlebars template so
+   * the browser bundle does not import Handlebars (blocked by CSP unsafe-eval),
+   * and callers never provide template source for this path.
+   */
+  async ensureAssistantWelcomeNote(
+    data: AssistantWelcomeNoteRequest,
+    params?: BoardParams
+  ): Promise<Board> {
+    const boardIdentifier = data.boardId ?? data.id;
+    if (!boardIdentifier) throw new Error('Board ID required');
+
+    const board = await this.boardRepo.findBySlugOrId(String(boardIdentifier));
+    if (!board) {
+      throw new NotFoundError('Board', String(boardIdentifier));
+    }
+
+    const objectData = buildAssistantWelcomeNoteObject({
+      assistantName: typeof data.assistantName === 'string' ? data.assistantName : '',
+      assistantEmoji: typeof data.assistantEmoji === 'string' ? data.assistantEmoji : null,
+    });
+
+    const existing = board.objects?.[ASSISTANT_WELCOME_NOTE_OBJECT_ID];
+    if (existing) return board;
+
+    if (params) params.assistantWelcomeNoteMutated = true;
+    return this.boardRepo.upsertBoardObject(
+      board.board_id,
+      ASSISTANT_WELCOME_NOTE_OBJECT_ID,
+      objectData
+    );
+  }
+
+  /**
+   * Custom method: Set the board's primary assistant branch.
+   */
+  async setPrimaryAssistant(
+    data: { boardId?: string; id?: string; branchId?: string } | string,
+    branchIdOrParams?: string | BoardParams,
+    _maybeParams?: BoardParams
+  ): Promise<Board> {
+    const boardId = typeof data === 'string' ? data : (data.boardId ?? data.id);
+    const branchId = typeof data === 'string' ? branchIdOrParams : data.branchId;
+    if (!boardId) throw new Error('Board ID required');
+    if (!branchId || typeof branchId !== 'string') throw new Error('Branch ID required');
+    return this.boardRepo.setPrimaryAssistant(boardId, branchId);
+  }
+
+  /**
+   * Custom method: Clear the board's primary assistant branch.
+   */
+  async clearPrimaryAssistant(boardId: string, _params?: BoardParams): Promise<Board> {
+    return this.boardRepo.clearPrimaryAssistant(boardId);
   }
 
   /**
@@ -118,10 +212,14 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
   async deleteZone(
     boardId: string,
     objectId: string,
-    deleteAssociatedSessions: boolean,
+    _deleteAssociatedSessions: boolean,
     _params?: BoardParams
   ): Promise<{ board: Board; affectedSessions: string[] }> {
-    return this.boardRepo.deleteZone(boardId, objectId, deleteAssociatedSessions);
+    const board = await this.removeBoardObject(boardId, objectId);
+    return {
+      board,
+      affectedSessions: [],
+    };
   }
 
   /**
@@ -139,7 +237,8 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
    * Import board from blob (JSON)
    */
   async fromBlob(blob: BoardExportBlob, params?: BoardParams): Promise<Board> {
-    const userId = params?.user?.user_id || 'anonymous';
+    // Hook chain enforces auth before we get here.
+    const userId = params!.user!.user_id;
     this.boardRepo.validateBoardBlob(blob);
     const data = this.buildBoardDataFromBlob(blob, userId);
 
@@ -204,7 +303,8 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
     if (!boardIdentifier) throw new Error('Board ID or slug required');
     if (!name) throw new Error('Board name required');
 
-    const userId = params?.user?.user_id || 'anonymous';
+    // Hook chain enforces auth before we get here.
+    const userId = params!.user!.user_id;
     const resolvedBoardId = await this.resolveBoardId(boardIdentifier);
     const blob = await this.boardRepo.toBlob(resolvedBoardId);
     const boardData = this.buildBoardDataFromBlob(blob, userId, name);
@@ -216,6 +316,60 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
     // See: apps/agor-daemon/src/index.ts for examples of manual emission
 
     return clonedBoard;
+  }
+
+  /**
+   * Custom method: Archive a board (soft delete)
+   */
+  async archive(id: string, params?: BoardParams): Promise<Board> {
+    const board = await this.get(id, params);
+
+    if (board.archived) {
+      throw new Error(`Board "${board.name}" is already archived`);
+    }
+
+    console.log(`📦 Archiving board: ${board.name}`);
+
+    // Hook chain enforces auth before we get here.
+    const currentUserId = params!.user!.user_id;
+    const archivedBoard = await this.patch(
+      id,
+      {
+        archived: true,
+        archived_at: new Date().toISOString(),
+        archived_by: currentUserId,
+      } as Partial<Board>,
+      params
+    );
+
+    console.log(`✅ Archived board ${board.name}`);
+    return archivedBoard as Board;
+  }
+
+  /**
+   * Custom method: Unarchive a board
+   */
+  async unarchive(id: string, params?: BoardParams): Promise<Board> {
+    const board = await this.get(id, params);
+
+    if (!board.archived) {
+      throw new Error(`Board "${board.name}" is not archived`);
+    }
+
+    console.log(`📦 Unarchiving board: ${board.name}`);
+
+    const unarchivedBoard = await this.patch(
+      id,
+      {
+        archived: false,
+        archived_at: undefined,
+        archived_by: undefined,
+      } as Partial<Board>,
+      params
+    );
+
+    console.log(`✅ Unarchived board ${board.name}`);
+    return unarchivedBoard as Board;
   }
 
   private async resolveBoardId(
@@ -250,6 +404,7 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
       icon: blob.icon,
       color: blob.color,
       background_color: blob.background_color,
+      custom_css: blob.custom_css,
       objects: blob.objects,
       custom_context: blob.custom_context,
       created_by: userId,
@@ -260,6 +415,9 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
 /**
  * Service factory function
  */
-export function createBoardsService(db: Database): BoardsService {
-  return new BoardsService(db);
+export function createBoardsService(
+  db: Database,
+  emitBoardObjectPatched?: (boardObject: BoardObjectPatchedEventPayload) => void
+): BoardsService {
+  return new BoardsService(db, emitBoardObjectPatched);
 }

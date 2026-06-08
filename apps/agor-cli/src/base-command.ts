@@ -4,9 +4,9 @@
  * Reduces boilerplate by providing common functionality like daemon connection checking.
  */
 
-import type { AgorClient } from '@agor/core/api';
-import { createRestClient, isDaemonRunning } from '@agor/core/api';
-import { getDaemonUrl } from '@agor/core/config';
+import type { AgorClient } from '@agor-live/client';
+import { createRestClient, getApiKeyFromEnv, isDaemonRunning } from '@agor-live/client';
+import { getDaemonUrl } from '@agor-live/client/config';
 import { Command } from '@oclif/core';
 import chalk from 'chalk';
 import { loadToken } from './lib/auth';
@@ -24,10 +24,11 @@ export abstract class BaseCommand extends Command {
    */
   protected async connectToDaemon(): Promise<AgorClient> {
     // Get daemon URL from config
-    this.daemonUrl = await getDaemonUrl();
+    const daemonUrl = await getDaemonUrl();
+    this.daemonUrl = daemonUrl;
 
     // Check if daemon is running (fast fail with 1s timeout)
-    const running = await isDaemonRunning(this.daemonUrl);
+    const running = await isDaemonRunning(daemonUrl);
 
     if (!running) {
       this.log(
@@ -46,77 +47,46 @@ export abstract class BaseCommand extends Command {
       this.exit(1);
     }
 
+    // Check for API key auth (takes precedence over stored JWT)
+    const apiKey = getApiKeyFromEnv();
+    if (apiKey) {
+      return await createRestClient(daemonUrl, apiKey ?? undefined);
+    }
+
     // Create REST-only client (prevents hanging processes)
-    const client = await createRestClient(this.daemonUrl);
+    const client = await createRestClient(daemonUrl);
 
     // Load stored authentication token
     const storedAuth = await loadToken();
 
-    if (storedAuth) {
-      try {
-        // Authenticate with stored JWT token
-        await client.authenticate({
-          strategy: 'jwt',
-          accessToken: storedAuth.accessToken,
-        });
-      } catch (_error) {
-        // Token invalid or expired - clear it and show login prompt
-        const { clearToken } = await import('./lib/auth');
-        await clearToken();
-        this.error(
-          chalk.red('✗ Authentication failed') +
-            '\n\n' +
-            chalk.dim('Your session has expired or is invalid.') +
-            '\n' +
-            chalk.dim('Please login again:') +
-            '\n  ' +
-            chalk.cyan('agor login')
-        );
-      }
-    } else {
-      // No stored token - check if daemon allows anonymous access
-      try {
-        const response = await fetch(`${this.daemonUrl}/health`);
-        const health = (await response.json()) as { auth?: { requireAuth?: boolean } };
-        if (health.auth?.requireAuth) {
-          // Daemon requires authentication
-          this.error(
-            chalk.red('✗ Not authenticated') +
-              '\n\n' +
-              chalk.dim('This Agor instance requires authentication.') +
-              '\n' +
-              chalk.dim('Please login:') +
-              '\n  ' +
-              chalk.cyan('agor login')
-          );
-        }
-        // Try to authenticate with anonymous strategy
-        try {
-          await client.authenticate({ strategy: 'anonymous' });
-        } catch (_authError) {
-          // Anonymous auth also failed - give up
-          this.error(
-            chalk.red('✗ Authentication failed') +
-              '\n\n' +
-              chalk.dim('Please login:') +
-              '\n  ' +
-              chalk.cyan('agor login')
-          );
-        }
-      } catch (_error) {
-        // If we can't check auth status, try anonymous anyway
-        try {
-          await client.authenticate({ strategy: 'anonymous' });
-        } catch {
-          this.error(
-            chalk.red('✗ Not authenticated') +
-              '\n\n' +
-              chalk.dim('Please login to use the Agor CLI:') +
-              '\n  ' +
-              chalk.cyan('agor login')
-          );
-        }
-      }
+    if (!storedAuth) {
+      this.error(
+        chalk.red('✗ Not authenticated') +
+          '\n\n' +
+          chalk.dim('Please login to use the Agor CLI:') +
+          '\n  ' +
+          chalk.cyan('agor login')
+      );
+    }
+
+    try {
+      await client.authenticate({
+        strategy: 'jwt',
+        accessToken: storedAuth.accessToken,
+      });
+    } catch (_error) {
+      // Token invalid or expired - clear it and show login prompt
+      const { clearToken } = await import('./lib/auth');
+      await clearToken();
+      this.error(
+        chalk.red('✗ Authentication failed') +
+          '\n\n' +
+          chalk.dim('Your session has expired or is invalid.') +
+          '\n' +
+          chalk.dim('Please login again:') +
+          '\n  ' +
+          chalk.cyan('agor login')
+      );
     }
 
     return client;

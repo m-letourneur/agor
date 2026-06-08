@@ -1,13 +1,20 @@
 /**
  * Board Objects Repository
  *
- * Manages positioned entities (sessions and worktrees) on boards.
- * Phase 1: Hybrid support for both session cards and worktree cards.
+ * Manages positioned entities (sessions and branches) on boards.
+ * Phase 1: Hybrid support for both session cards and branch cards.
  */
 
-import type { BoardEntityObject, BoardID, WorktreeID } from '@agor/core/types';
+import type {
+  BoardEntityObject,
+  BoardEntityType,
+  BoardID,
+  BranchID,
+  CardID,
+} from '@agor/core/types';
 import { eq } from 'drizzle-orm';
 import { generateId } from '../../lib/ids';
+import { toAbsolutePosition } from '../../utils/board-placement.js';
 import type { Database } from '../client';
 import { deleteFrom, insert, select, update } from '../database-wrapper';
 import { type BoardObjectInsert, type BoardObjectRow, boardObjects } from '../schema';
@@ -74,48 +81,92 @@ export class BoardObjectRepository {
   }
 
   /**
-   * Find board object by worktree ID
+   * Find board object by branch ID
    */
-  async findByWorktreeId(worktreeId: WorktreeID): Promise<BoardEntityObject | null> {
+  async findByBranchId(branchId: BranchID): Promise<BoardEntityObject | null> {
     try {
       const row = await select(this.db)
         .from(boardObjects)
-        .where(eq(boardObjects.worktree_id, worktreeId))
+        .where(eq(boardObjects.branch_id, branchId))
         .one();
 
       return row ? this.rowToEntity(row) : null;
     } catch (error) {
       throw new RepositoryError(
-        `Failed to find board object by worktree: ${error instanceof Error ? error.message : String(error)}`,
+        `Failed to find board object by branch: ${error instanceof Error ? error.message : String(error)}`,
         error
       );
     }
   }
 
   /**
-   * Create a board object (add worktree to board)
+   * Find board object by card ID
+   */
+  async findByCardId(cardId: CardID): Promise<BoardEntityObject | null> {
+    try {
+      const row = await select(this.db)
+        .from(boardObjects)
+        .where(eq(boardObjects.card_id, cardId))
+        .one();
+
+      return row ? this.rowToEntity(row) : null;
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to find board object by card: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Remove all board objects for a card
+   */
+  async removeByCardId(cardId: CardID): Promise<void> {
+    try {
+      await deleteFrom(this.db, boardObjects).where(eq(boardObjects.card_id, cardId)).run();
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to remove board objects by card: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Create a board object (add branch or card to board)
    */
   async create(data: {
     board_id: BoardID;
-    worktree_id: WorktreeID;
+    branch_id?: BranchID;
+    card_id?: CardID;
     position: { x: number; y: number };
     zone_id?: string;
   }): Promise<BoardEntityObject> {
     try {
-      // Check if worktree already on a board
-      const existing = await select(this.db)
-        .from(boardObjects)
-        .where(eq(boardObjects.worktree_id, data.worktree_id))
-        .one();
+      // Validate: exactly one of branch_id or card_id must be provided
+      if (!data.branch_id && !data.card_id) {
+        throw new RepositoryError('Either branch_id or card_id is required');
+      }
+      if (data.branch_id && data.card_id) {
+        throw new RepositoryError('Cannot set both branch_id and card_id');
+      }
 
-      if (existing) {
-        throw new RepositoryError(`Worktree already on a board (object_id: ${existing.object_id})`);
+      // Check for duplicates
+      if (data.branch_id) {
+        const existing = await select(this.db)
+          .from(boardObjects)
+          .where(eq(boardObjects.branch_id, data.branch_id))
+          .one();
+        if (existing) {
+          throw new RepositoryError(`Branch already on a board (object_id: ${existing.object_id})`);
+        }
       }
 
       const newObject: BoardObjectInsert = {
         object_id: generateId(),
         board_id: data.board_id,
-        worktree_id: data.worktree_id,
+        branch_id: data.branch_id ?? null,
+        card_id: data.card_id ?? null,
         created_at: new Date(),
         data: {
           position: data.position,
@@ -268,14 +319,65 @@ export class BoardObjectRepository {
   }
 
   /**
-   * Remove all board objects for a worktree
+   * Clear zone_id on all board objects referencing a deleted zone.
+   * Called when a zone is deleted to prevent stale parent references.
    */
-  async removeByWorktreeId(worktreeId: WorktreeID): Promise<void> {
+  async clearZoneReferences(
+    boardId: BoardID,
+    zoneId: string,
+    zonePosition?: { x: number; y: number }
+  ): Promise<BoardEntityObject[]> {
     try {
-      await deleteFrom(this.db, boardObjects).where(eq(boardObjects.worktree_id, worktreeId)).run();
+      const rows = await select(this.db)
+        .from(boardObjects)
+        .where(eq(boardObjects.board_id, boardId))
+        .all();
+
+      const cleared: BoardEntityObject[] = [];
+      for (const row of rows) {
+        const data = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+        if (data.zone_id === zoneId) {
+          const relPos = data.position ?? { x: 0, y: 0 };
+          const absolutePosition = zonePosition ? toAbsolutePosition(relPos, zonePosition) : relPos;
+
+          await update(this.db, boardObjects)
+            .set({
+              data: {
+                position: absolutePosition,
+                zone_id: undefined,
+              },
+            })
+            .where(eq(boardObjects.object_id, row.object_id))
+            .run();
+
+          const updated = await select(this.db)
+            .from(boardObjects)
+            .where(eq(boardObjects.object_id, row.object_id))
+            .one();
+          if (updated) {
+            cleared.push(this.rowToEntity(updated));
+          }
+        }
+      }
+
+      return cleared;
     } catch (error) {
       throw new RepositoryError(
-        `Failed to remove board objects by worktree: ${error instanceof Error ? error.message : String(error)}`,
+        `Failed to clear zone references: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
+    }
+  }
+
+  /**
+   * Remove all board objects for a branch
+   */
+  async removeByBranchId(branchId: BranchID): Promise<void> {
+    try {
+      await deleteFrom(this.db, boardObjects).where(eq(boardObjects.branch_id, branchId)).run();
+    } catch (error) {
+      throw new RepositoryError(
+        `Failed to remove board objects by branch: ${error instanceof Error ? error.message : String(error)}`,
         error
       );
     }
@@ -287,10 +389,14 @@ export class BoardObjectRepository {
   private rowToEntity(row: BoardObjectRow): BoardEntityObject {
     const data = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
 
+    const entityType: BoardEntityType = row.card_id ? 'card' : 'branch';
+
     return {
       object_id: row.object_id,
       board_id: row.board_id as BoardID,
-      worktree_id: row.worktree_id as WorktreeID,
+      branch_id: (row.branch_id as BranchID) ?? undefined,
+      card_id: (row.card_id as CardID) ?? undefined,
+      entity_type: entityType,
       position: data.position,
       zone_id: data.zone_id,
       created_at: new Date(row.created_at).toISOString(),

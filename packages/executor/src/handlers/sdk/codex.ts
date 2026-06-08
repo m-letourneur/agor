@@ -5,6 +5,7 @@
  */
 
 import type { MessageSource, PermissionMode, SessionID, TaskID } from '@agor/core/types';
+import { TOOL_API_KEY_NAMES } from '@agor/core/types';
 import { CodexTool } from '../../sdk-handlers/codex/index.js';
 import type { AgorClient } from '../../services/feathers-client.js';
 
@@ -28,20 +29,22 @@ export async function executeCodexTask(params: {
   // Execute using base helper with Codex-specific factory
   await executeToolTask({
     ...params,
-    apiKeyEnvVar: 'OPENAI_API_KEY',
+    apiKeyEnvVar: TOOL_API_KEY_NAMES.codex!,
     toolName: 'codex',
     createTool: (repos, apiKey, useNativeAuth) =>
       new CodexTool(
         repos.messages,
         repos.sessions,
         repos.sessionMCP,
-        repos.worktrees,
+        repos.branches,
         repos.repos,
         apiKey,
         repos.messagesService,
         repos.tasksService,
+        repos.tasksStreamingService,
         useNativeAuth, // Flag for native auth (if applicable)
-        repos.mcpServers // MCPServerRepository for global MCP server resolution
+        repos.mcpServers, // MCPServerRepository for global MCP server resolution
+        repos.users
       ),
   });
 }

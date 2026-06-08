@@ -5,11 +5,12 @@
  * Collapsed by default with summary statistics and expandable to show full tool chain.
  */
 
-import type { Message } from '@agor/core/types';
+import type { Message } from '@agor-live/client';
 import { DownOutlined, RightOutlined, ThunderboltOutlined } from '@ant-design/icons';
 import { Collapse, Space, Typography, theme } from 'antd';
 import type React from 'react';
 import { useMemo, useState } from 'react';
+import { getToolDisplayName } from '../../utils/toolDisplayName';
 import { AgentChain } from '../AgentChain';
 import { Tag } from '../Tag';
 
@@ -43,7 +44,7 @@ export const TaskNestedBlock: React.FC<TaskNestedBlockProps> = ({
     for (const msg of messages) {
       if (msg.tool_uses) {
         for (const tool of msg.tool_uses) {
-          toolNames.add(tool.name);
+          toolNames.add(getToolDisplayName(tool.name, tool.input));
           toolCount++;
         }
       }
@@ -89,7 +90,7 @@ export const TaskNestedBlock: React.FC<TaskNestedBlockProps> = ({
 
   const header = (
     <div style={{ width: '100%' }}>
-      <Space direction="vertical" size={token.sizeXS} style={{ width: '100%' }}>
+      <Space orientation="vertical" size={token.sizeXS} style={{ width: '100%' }}>
         {/* Header line */}
         <Space size="small" style={{ width: '100%', justifyContent: 'space-between' }}>
           <Space size="small">

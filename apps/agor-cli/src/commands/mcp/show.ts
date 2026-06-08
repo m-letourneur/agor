@@ -2,7 +2,7 @@
  * Show details for an MCP server
  */
 
-import type { MCPServer } from '@agor/core/types';
+import { type MCPServer, shortId } from '@agor-live/client';
 import { Args } from '@oclif/core';
 import chalk from 'chalk';
 import { BaseCommand } from '../../base-command';
@@ -31,13 +31,12 @@ export default class McpShow extends BaseCommand {
       let server: MCPServer | null = null;
 
       try {
-        server = (await client.service('mcp-servers').get(args.id)) as MCPServer;
+        server = await client.service('mcp-servers').get(args.id);
       } catch {
         // If not found by ID, try to find by name
-        const result = await client.service('mcp-servers').find({
+        const servers = await client.service('mcp-servers').findAll({
           query: { $limit: 1 },
         });
-        const servers = (Array.isArray(result) ? result : result.data) as MCPServer[];
         server = servers.find((s) => s.name === args.id) || null;
       }
 
@@ -51,7 +50,7 @@ export default class McpShow extends BaseCommand {
       this.log(chalk.bold(chalk.cyan('MCP Server Details')));
       this.log('');
       this.log(`${chalk.cyan('ID')}: ${server.mcp_server_id}`);
-      this.log(`${chalk.cyan('Short ID')}: ${String(server.mcp_server_id).substring(0, 8)}`);
+      this.log(`${chalk.cyan('Short ID')}: ${shortId(String(server.mcp_server_id))}`);
       this.log(`${chalk.cyan('Name')}: ${server.name}`);
 
       if (server.display_name) {

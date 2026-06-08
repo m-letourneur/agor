@@ -1,5 +1,12 @@
-import type { AgorClient } from '@agor/core/api';
-import type { Board, BoardComment, Repo, Session, User, Worktree } from '@agor/core/types';
+import type {
+  AgorClient,
+  Board,
+  BoardComment,
+  Branch,
+  Repo,
+  Session,
+  User,
+} from '@agor-live/client';
 import { Drawer, Layout, Typography } from 'antd';
 import { useState } from 'react';
 import { Route, Routes } from 'react-router-dom';
@@ -15,11 +22,11 @@ interface MobileAppProps {
   client: AgorClient | null;
   user?: User | null;
   sessionById: Map<string, Session>; // O(1) ID lookups
-  sessionsByWorktree: Map<string, Session[]>; // O(1) worktree filtering
+  sessionsByBranch: Map<string, Session[]>; // O(1) branch filtering
   boardById: Map<string, Board>;
   commentById: Map<string, BoardComment>;
   repoById: Map<string, Repo>;
-  worktreeById: Map<string, Worktree>;
+  branchById: Map<string, Branch>;
   userById: Map<string, User>;
   onSendPrompt?: (sessionId: string, prompt: string) => void;
   onSendComment: (boardId: string, content: string) => void;
@@ -36,11 +43,11 @@ export const MobileApp: React.FC<MobileAppProps> = ({
   client,
   user,
   sessionById,
-  sessionsByWorktree,
+  sessionsByBranch,
   boardById,
   commentById,
   repoById,
-  worktreeById,
+  branchById,
   userById,
   onSendPrompt,
   onSendComment,
@@ -62,15 +69,15 @@ export const MobileApp: React.FC<MobileAppProps> = ({
         placement="left"
         onClose={() => setDrawerOpen(false)}
         open={drawerOpen}
-        width="85%"
+        size="85%"
         styles={{
           body: { padding: 0 },
         }}
       >
         <MobileNavTree
           boardById={boardById}
-          worktreeById={worktreeById}
-          sessionsByWorktree={sessionsByWorktree}
+          branchById={branchById}
+          sessionsByBranch={sessionsByBranch}
           commentById={commentById}
           onNavigate={() => setDrawerOpen(false)}
         />
@@ -123,7 +130,7 @@ export const MobileApp: React.FC<MobileAppProps> = ({
             <SessionPage
               client={client}
               sessionById={sessionById}
-              worktreeById={worktreeById}
+              branchById={branchById}
               repoById={repoById}
               userById={userById}
               currentUser={user}
@@ -143,7 +150,7 @@ export const MobileApp: React.FC<MobileAppProps> = ({
               client={client}
               boardById={boardById}
               commentById={commentById}
-              worktreeById={worktreeById}
+              branchById={branchById}
               userById={userById}
               currentUser={user}
               onMenuClick={() => setDrawerOpen(true)}

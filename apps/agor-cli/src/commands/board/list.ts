@@ -2,8 +2,8 @@
  * List all boards
  */
 
-import { PAGINATION } from '@agor/core/config';
-import type { Board, BoardEntityObject } from '@agor/core/types';
+import type { BoardEntityObject } from '@agor-live/client';
+import { PAGINATION, shortId } from '@agor-live/client';
 import { Flags } from '@oclif/core';
 import chalk from 'chalk';
 import Table from 'cli-table3';
@@ -28,10 +28,9 @@ export default class BoardList extends BaseCommand {
 
     try {
       // Fetch all boards (high limit for accurate counts)
-      const result = await client
+      const allBoards = await client
         .service('boards')
-        .find({ query: { $limit: PAGINATION.DEFAULT_LIMIT } });
-      const allBoards = (Array.isArray(result) ? result : result.data) as Board[];
+        .findAll({ query: { $limit: PAGINATION.DEFAULT_LIMIT } });
 
       if (allBoards.length === 0) {
         this.log(chalk.yellow('No boards found.'));
@@ -39,13 +38,11 @@ export default class BoardList extends BaseCommand {
         return;
       }
 
-      // Fetch all board objects to count worktrees per board
-      const boardObjectsResult = await client
+      // Fetch all board objects to count branches per board
+      const boardObjects = await client
         .service('board-objects')
-        .find({ query: { $limit: PAGINATION.DEFAULT_LIMIT } });
-      const boardObjects = (
-        Array.isArray(boardObjectsResult) ? boardObjectsResult : boardObjectsResult.data
-      ) as BoardEntityObject[];
+        .findAll({ query: { $limit: PAGINATION.DEFAULT_LIMIT } });
+      const typedBoardObjects = boardObjects as BoardEntityObject[];
 
       // Apply display limit
       const displayBoards = allBoards.slice(0, flags.limit);
@@ -55,7 +52,7 @@ export default class BoardList extends BaseCommand {
         head: [
           chalk.cyan('ID'),
           chalk.cyan('Name'),
-          chalk.cyan('Worktrees'),
+          chalk.cyan('Branches'),
           chalk.cyan('Description'),
           chalk.cyan('Created'),
         ],
@@ -65,11 +62,11 @@ export default class BoardList extends BaseCommand {
 
       // Add rows
       for (const board of displayBoards) {
-        const worktreeCount = boardObjects.filter((bo) => bo.board_id === board.board_id).length;
+        const branchCount = typedBoardObjects.filter((bo) => bo.board_id === board.board_id).length;
         table.push([
-          board.board_id.substring(0, 8),
+          shortId(board.board_id),
           `${board.icon || '📋'} ${board.name}`,
-          worktreeCount.toString(),
+          branchCount.toString(),
           board.description || '',
           new Date(board.created_at).toLocaleDateString(),
         ]);

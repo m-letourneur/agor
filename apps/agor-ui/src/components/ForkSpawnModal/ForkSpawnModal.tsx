@@ -1,56 +1,29 @@
 /**
- * Modal for forking or spawning sessions from WorktreeCard
+ * Modal for forking or spawning sessions
  *
  * Prompts user for initial prompt text and calls fork/spawn action
- * For spawn: includes advanced configuration options (agent, callback, etc.)
+ * For spawn: includes configuration options (agent, callback, etc.)
  */
 
-import type { AgorClient } from '@agor/core/api';
 import type {
   AgenticToolName,
-  CodexApprovalPolicy,
-  CodexSandboxMode,
+  AgorClient,
   MCPServer,
-  PermissionMode,
   Session,
+  SpawnConfig,
   User,
-} from '@agor/core/types';
-import { getDefaultPermissionMode } from '@agor/core/types';
+} from '@agor-live/client';
+import { getDefaultPermissionMode } from '@agor-live/client';
 import { DownOutlined } from '@ant-design/icons';
 import { Checkbox, Collapse, Form, Modal, Radio, Typography } from 'antd';
-import Handlebars from 'handlebars';
-import { useEffect, useMemo, useState } from 'react';
-import spawnSubsessionTemplate from '../../templates/spawn_subsession.hbs?raw';
+import { useCallback, useEffect, useState } from 'react';
 import { AgenticToolConfigForm } from '../AgenticToolConfigForm';
 import { AgentSelectionGrid } from '../AgentSelectionGrid/AgentSelectionGrid';
 import { AVAILABLE_AGENTS } from '../AgentSelectionGrid/availableAgents';
 import { AutocompleteTextarea } from '../AutocompleteTextarea';
-import { MarkdownRenderer } from '../MarkdownRenderer';
-import type { ModelConfig } from '../ModelSelector';
-
-// Register helper to check if value is defined (not undefined)
-// This allows us to distinguish between false and undefined in templates
-Handlebars.registerHelper('isDefined', (value) => value !== undefined);
-
-// Compile template once at module load (after helper registration)
-const compiledSpawnTemplate = Handlebars.compile(spawnSubsessionTemplate);
+import { SessionEnvVarsSelector } from '../SessionEnvVarsSelector';
 
 export type ForkSpawnAction = 'fork' | 'spawn';
-
-export interface SpawnConfig {
-  prompt: string;
-  agent?: AgenticToolName;
-  permissionMode?: PermissionMode;
-  modelConfig?: ModelConfig;
-  codexSandboxMode?: CodexSandboxMode;
-  codexApprovalPolicy?: CodexApprovalPolicy;
-  codexNetworkAccess?: boolean;
-  mcpServerIds?: string[];
-  enableCallback?: boolean;
-  includeLastMessage?: boolean;
-  includeOriginalPrompt?: boolean;
-  extraInstructions?: string;
-}
 
 export interface ForkSpawnModalProps {
   open: boolean;
@@ -79,148 +52,129 @@ export const ForkSpawnModal: React.FC<ForkSpawnModalProps> = ({
 }) => {
   const [form] = Form.useForm();
   const [loading, setLoading] = useState(false);
-  const [configPreset, setConfigPreset] = useState<'parent' | 'user'>('user');
+  const [configPreset, setConfigPreset] = useState<'parent' | 'custom'>('parent');
   const [selectedAgent, setSelectedAgent] = useState<AgenticToolName>(
     session?.agentic_tool || 'claude-code'
   );
-  const [formValues, setFormValues] = useState<Partial<SpawnConfig>>({});
+  const [envVarNames, setEnvVarNames] = useState<string[]>([]);
 
-  // Reset form when modal opens
+  const getCustomConfigDefaults = useCallback(
+    (agentTool: AgenticToolName) => {
+      const userDefaults = currentUser?.default_agentic_config?.[agentTool];
+      const sameToolAsParent = agentTool === session?.agentic_tool;
+      return {
+        agent: agentTool,
+        permissionMode:
+          userDefaults?.permissionMode ||
+          (sameToolAsParent ? session?.permission_config?.mode : undefined) ||
+          getDefaultPermissionMode(agentTool),
+        // Existing user defaults are sent as explicit form values. If the user
+        // has no saved model default and the child keeps the same tool, leaving
+        // this undefined would inherit the parent model in resolveChildSessionConfig;
+        // initialize that effective value so the picker doesn't imply a different default.
+        modelConfig:
+          userDefaults?.modelConfig ?? (sameToolAsParent ? session?.model_config : undefined),
+        codexSandboxMode: userDefaults?.codexSandboxMode,
+        codexApprovalPolicy: userDefaults?.codexApprovalPolicy,
+        codexNetworkAccess: userDefaults?.codexNetworkAccess,
+        mcpServerIds: userDefaults?.mcpServerIds || [],
+      };
+    },
+    [currentUser, session]
+  );
+
+  // Reset form and preset when modal opens
   useEffect(() => {
     if (open && session) {
-      // Get user's default config for the session's agent
+      setConfigPreset('parent');
+      setEnvVarNames([]);
       const agentTool = session.agentic_tool || 'claude-code';
-      const userDefaults = currentUser?.default_agentic_config?.[agentTool];
-
-      // Set initial values based on preset
-      const initialValues =
-        configPreset === 'parent'
-          ? {
-              prompt: initialPrompt,
-              agent: session.agentic_tool,
-              permissionMode:
-                session.permission_config?.mode || getDefaultPermissionMode(session.agentic_tool),
-              modelConfig: session.model_config,
-              codexSandboxMode: session.permission_config?.codex?.sandboxMode,
-              codexApprovalPolicy: session.permission_config?.codex?.approvalPolicy,
-              codexNetworkAccess: session.permission_config?.codex?.networkAccess,
-              mcpServerIds: [],
-              // Inherit parent's callback config - leave undefined if parent has no explicit config
-              enableCallback: session.callback_config?.enabled,
-              includeLastMessage: session.callback_config?.include_last_message,
-              includeOriginalPrompt: session.callback_config?.include_original_prompt,
-            }
-          : {
-              prompt: initialPrompt,
-              agent: agentTool,
-              permissionMode: userDefaults?.permissionMode || getDefaultPermissionMode(agentTool),
-              modelConfig: userDefaults?.modelConfig as ModelConfig | undefined,
-              codexSandboxMode: userDefaults?.codexSandboxMode,
-              codexApprovalPolicy: userDefaults?.codexApprovalPolicy,
-              codexNetworkAccess: userDefaults?.codexNetworkAccess,
-              mcpServerIds: userDefaults?.mcpServerIds || [],
-              // Leave callback config undefined by default - will use parent's settings
-              enableCallback: undefined,
-              includeLastMessage: undefined,
-              includeOriginalPrompt: undefined,
-            };
-
-      form.setFieldsValue(initialValues);
-      setSelectedAgent(agentTool);
-      setFormValues(initialValues as Partial<SpawnConfig>);
-    }
-  }, [open, session, configPreset, form, initialPrompt, currentUser]);
-
-  // Render template preview based on current form values
-  const renderedTemplate = useMemo(() => {
-    if (action === 'fork' || !formValues.prompt) {
-      return '';
-    }
-
-    try {
-      const hasConfig =
-        formValues.agent !== undefined ||
-        formValues.permissionMode !== undefined ||
-        formValues.modelConfig !== undefined ||
-        formValues.codexSandboxMode !== undefined ||
-        formValues.codexApprovalPolicy !== undefined ||
-        formValues.codexNetworkAccess !== undefined ||
-        (formValues.mcpServerIds?.length ?? 0) > 0 ||
-        formValues.enableCallback !== undefined ||
-        formValues.includeLastMessage !== undefined ||
-        formValues.includeOriginalPrompt !== undefined ||
-        formValues.extraInstructions !== undefined;
-
-      return compiledSpawnTemplate({
-        userPrompt: formValues.prompt || '',
-        hasConfig,
-        agenticTool: formValues.agent || selectedAgent,
-        permissionMode: formValues.permissionMode,
-        modelConfig: formValues.modelConfig,
-        codexSandboxMode: formValues.codexSandboxMode,
-        codexApprovalPolicy: formValues.codexApprovalPolicy,
-        codexNetworkAccess: formValues.codexNetworkAccess,
-        mcpServerIds: formValues.mcpServerIds,
-        hasCallbackConfig:
-          formValues.enableCallback !== undefined ||
-          formValues.includeLastMessage !== undefined ||
-          formValues.includeOriginalPrompt !== undefined,
-        callbackConfig: {
-          enableCallback: formValues.enableCallback,
-          includeLastMessage: formValues.includeLastMessage,
-          includeOriginalPrompt: formValues.includeOriginalPrompt,
-        },
-        extraInstructions: formValues.extraInstructions,
+      form.setFieldsValue({
+        prompt: initialPrompt,
+        enableCallback: session.callback_config?.enabled,
+        includeLastMessage: session.callback_config?.include_last_message,
+        includeOriginalPrompt: session.callback_config?.include_original_prompt,
       });
-    } catch (error) {
-      console.error('Template rendering error:', error);
-      return '⚠️ Template rendering error';
+      setSelectedAgent(agentTool);
     }
-  }, [action, formValues, selectedAgent]);
+  }, [open, session, form, initialPrompt]);
+
+  // When switching to "Custom config", load the values that will be
+  // effective if the user submits without touching individual fields.
+  useEffect(() => {
+    if (!open || !session || configPreset !== 'custom') return;
+    const agentTool = session.agentic_tool || 'claude-code';
+    form.setFieldsValue(getCustomConfigDefaults(agentTool));
+    setSelectedAgent(agentTool);
+  }, [open, session, configPreset, form, getCustomConfigDefaults]);
 
   const handleOk = async () => {
+    // Validate fields first. If validation fails, bail out WITHOUT clearing
+    // the form — the user's prompt text must be preserved.
     try {
-      const values = await form.validateFields();
-      const prompt = values.prompt?.trim();
+      await form.validateFields();
+    } catch (error) {
+      console.error('Form validation failed:', error);
+      return;
+    }
 
-      if (!prompt) {
-        return;
-      }
+    // Use getFieldsValue(true) to include values from collapsed panels
+    const values = form.getFieldsValue(true);
+    const prompt = values.prompt?.trim();
 
-      setLoading(true);
+    if (!prompt) {
+      return;
+    }
 
+    setLoading(true);
+
+    try {
       if (action === 'fork') {
-        // Fork - simple prompt string
         await onConfirm(prompt);
       } else {
-        // Spawn - full configuration object
-        // Only include callback fields if explicitly defined (not undefined)
-        const spawnConfig: SpawnConfig = {
-          prompt,
-          agent: values.agent || selectedAgent,
-          permissionMode: values.permissionMode,
-          modelConfig: values.modelConfig,
-          codexSandboxMode: values.codexSandboxMode,
-          codexApprovalPolicy: values.codexApprovalPolicy,
-          codexNetworkAccess: values.codexNetworkAccess,
-          mcpServerIds: values.mcpServerIds,
-          ...(values.enableCallback !== undefined && { enableCallback: values.enableCallback }),
-          ...(values.includeLastMessage !== undefined && {
-            includeLastMessage: values.includeLastMessage,
-          }),
-          ...(values.includeOriginalPrompt !== undefined && {
-            includeOriginalPrompt: values.includeOriginalPrompt,
-          }),
-          extraInstructions: values.extraInstructions,
-        };
+        // Build spawn config based on preset
+        const spawnConfig: Partial<SpawnConfig> = { prompt };
+
+        if (configPreset === 'custom') {
+          // Include full config overrides
+          spawnConfig.agent = values.agent || selectedAgent;
+          spawnConfig.permissionMode = values.permissionMode;
+          spawnConfig.modelConfig = values.modelConfig;
+          spawnConfig.codexSandboxMode = values.codexSandboxMode;
+          spawnConfig.codexApprovalPolicy = values.codexApprovalPolicy;
+          spawnConfig.codexNetworkAccess = values.codexNetworkAccess;
+          spawnConfig.mcpServerIds = values.mcpServerIds;
+          spawnConfig.extraInstructions = values.extraInstructions;
+          // Always send envVarNames in custom preset so the user can
+          // explicitly clear inherited selections (empty array = explicit
+          // clear; `undefined` = "copy parent", which is only the
+          // `parent` preset's intent).
+          spawnConfig.envVarNames = envVarNames;
+        }
+
+        // Callback fields are always included when explicitly set
+        if (values.enableCallback !== undefined) {
+          spawnConfig.enableCallback = values.enableCallback;
+        }
+        if (values.includeLastMessage !== undefined) {
+          spawnConfig.includeLastMessage = values.includeLastMessage;
+        }
+        if (values.includeOriginalPrompt !== undefined) {
+          spawnConfig.includeOriginalPrompt = values.includeOriginalPrompt;
+        }
+
         await onConfirm(spawnConfig);
       }
 
+      // Only reset + close on success. If onConfirm rejects, the modal stays
+      // open so the user's typed prompt is not lost.
       form.resetFields();
       onCancel();
     } catch (error) {
-      // Validation failed
-      console.error('Form validation failed:', error);
+      console.error(
+        `Failed to ${action} session — keeping modal open so prompt is preserved:`,
+        error
+      );
     } finally {
       setLoading(false);
     }
@@ -252,6 +206,7 @@ export const ForkSpawnModal: React.FC<ForkSpawnModalProps> = ({
       okText={`${actionLabel} Session`}
       confirmLoading={loading}
       width={700}
+      forceRender
     >
       <div style={{ marginBottom: 16 }}>
         <Typography.Text type="secondary" style={{ fontSize: 13 }}>
@@ -259,11 +214,7 @@ export const ForkSpawnModal: React.FC<ForkSpawnModalProps> = ({
         </Typography.Text>
       </div>
 
-      <Form
-        form={form}
-        layout="vertical"
-        onValuesChange={(_, allValues) => setFormValues(allValues)}
-      >
+      <Form form={form} layout="vertical">
         {/* Prompt */}
         <Form.Item
           name="prompt"
@@ -285,56 +236,93 @@ export const ForkSpawnModal: React.FC<ForkSpawnModalProps> = ({
           />
         </Form.Item>
 
-        {/* Advanced options for spawn only */}
+        {/* Spawn-only options */}
         {action === 'spawn' && (
           <>
             {/* Configuration Preset */}
-            <Form.Item label="Configuration Preset">
+            <Form.Item label="Configuration">
               <Radio.Group
                 value={configPreset}
                 onChange={(e) => setConfigPreset(e.target.value)}
                 buttonStyle="solid"
               >
-                <Radio.Button value="parent">Same as Parent</Radio.Button>
-                <Radio.Button value="user">User Defaults</Radio.Button>
+                <Radio.Button value="parent">Same as parent</Radio.Button>
+                <Radio.Button value="custom">Custom config</Radio.Button>
               </Radio.Group>
             </Form.Item>
 
-            {/* Agent Selection */}
-            <Form.Item name="agent" label="Agent">
-              <AgentSelectionGrid
-                agents={AVAILABLE_AGENTS}
-                selectedAgentId={selectedAgent}
-                onSelect={(agentId) => {
-                  setSelectedAgent(agentId as AgenticToolName);
-                  form.setFieldValue('agent', agentId);
-                  // Manually update formValues to trigger template re-render
-                  setFormValues((prev) => ({ ...prev, agent: agentId as AgenticToolName }));
-                }}
-                columns={2}
-              />
-            </Form.Item>
+            {/* Custom config: agent selection + agentic tool config + extra instructions */}
+            {configPreset === 'custom' && (
+              <>
+                {/* Agent Selection */}
+                <Form.Item name="agent" label="Agent">
+                  <AgentSelectionGrid
+                    agents={AVAILABLE_AGENTS}
+                    selectedAgentId={selectedAgent}
+                    onSelect={(agentId) => {
+                      const agentTool = agentId as AgenticToolName;
+                      setSelectedAgent(agentTool);
+                      form.setFieldsValue(getCustomConfigDefaults(agentTool));
+                    }}
+                    columns={2}
+                  />
+                </Form.Item>
 
-            {/* Agentic Tool Configuration (Collapsible) */}
-            <Collapse
-              ghost
-              expandIcon={({ isActive }) => <DownOutlined rotate={isActive ? 180 : 0} />}
-              items={[
-                {
-                  key: 'agentic-tool-config',
-                  label: <Typography.Text strong>Agentic Tool Configuration</Typography.Text>,
-                  children: (
-                    <AgenticToolConfigForm
-                      agenticTool={selectedAgent}
-                      mcpServerById={mcpServerById}
-                      showHelpText={false}
+                {/* Agentic Tool Configuration (Collapsible) */}
+                <Collapse
+                  ghost
+                  destroyOnHidden={false}
+                  expandIcon={({ isActive }) => <DownOutlined rotate={isActive ? 180 : 0} />}
+                  items={[
+                    {
+                      key: 'agentic-tool-config',
+                      label: <Typography.Text strong>Agentic Tool Configuration</Typography.Text>,
+                      children: (
+                        <AgenticToolConfigForm
+                          agenticTool={selectedAgent}
+                          mcpServerById={mcpServerById}
+                          showHelpText={false}
+                        />
+                      ),
+                    },
+                  ]}
+                />
+
+                {/* Session-scope env var selections (only the creator / admin
+                    can actually persist these; backend silently ignores for others). */}
+                {currentUser && client && (
+                  <Form.Item label="Environment Variables" style={{ marginTop: 16 }}>
+                    <SessionEnvVarsSelector
+                      ownerUserId={currentUser.user_id}
+                      client={client}
+                      value={envVarNames}
+                      onChange={setEnvVarNames}
+                      hideEmptyMessage
                     />
-                  ),
-                },
-              ]}
-            />
+                  </Form.Item>
+                )}
 
-            {/* Callback Options */}
+                {/* Extra Instructions */}
+                <Form.Item
+                  name="extraInstructions"
+                  label="Extra Instructions (optional)"
+                  help="Append additional context or constraints to the spawn prompt"
+                  style={{ marginTop: 16 }}
+                >
+                  <AutocompleteTextarea
+                    value={form.getFieldValue('extraInstructions') || ''}
+                    onChange={(value) => form.setFieldValue('extraInstructions', value)}
+                    placeholder='e.g., "Only use safe operations", "Prioritize performance" (type @ for autocomplete)'
+                    autoSize={{ minRows: 2, maxRows: 4 }}
+                    client={client}
+                    sessionId={session?.session_id || null}
+                    userById={userById}
+                  />
+                </Form.Item>
+              </>
+            )}
+
+            {/* Callback Options — always visible */}
             <div style={{ marginTop: 16, marginBottom: 16 }}>
               <Typography.Text strong>Callback Options</Typography.Text>
               <Form.Item name="enableCallback" valuePropName="checked" style={{ marginTop: 8 }}>
@@ -368,59 +356,6 @@ export const ForkSpawnModal: React.FC<ForkSpawnModalProps> = ({
                 }
               </Form.Item>
             </div>
-
-            {/* Extra Instructions */}
-            <Form.Item
-              name="extraInstructions"
-              label="Extra Instructions (optional)"
-              help="Append additional context or constraints to the spawn prompt"
-            >
-              <AutocompleteTextarea
-                value={form.getFieldValue('extraInstructions') || ''}
-                onChange={(value) => form.setFieldValue('extraInstructions', value)}
-                placeholder='e.g., "Only use safe operations", "Prioritize performance" (type @ for autocomplete)'
-                autoSize={{ minRows: 2, maxRows: 4 }}
-                client={client}
-                sessionId={session?.session_id || null}
-                userById={userById}
-              />
-            </Form.Item>
-
-            {/* Template Preview */}
-            {renderedTemplate && (
-              <Collapse
-                ghost
-                style={{ marginTop: 24 }}
-                expandIcon={({ isActive }) => <DownOutlined rotate={isActive ? 180 : 0} />}
-                items={[
-                  {
-                    key: 'template-preview',
-                    label: (
-                      <Typography.Text strong>
-                        🔍 Parent Agent Instruction Preview (Live)
-                      </Typography.Text>
-                    ),
-                    extra: (
-                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                        This is what will be sent to the parent agent
-                      </Typography.Text>
-                    ),
-                    children: (
-                      <div>
-                        <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
-                          The parent agent will receive these instructions to prepare a rich,
-                          context-aware prompt for the spawned subsession using its current session
-                          context.
-                        </Typography.Paragraph>
-                        <div style={{ maxHeight: 400, overflow: 'auto' }}>
-                          <MarkdownRenderer content={`\`\`\`\n${renderedTemplate}\n\`\`\``} />
-                        </div>
-                      </div>
-                    ),
-                  },
-                ]}
-              />
-            )}
           </>
         )}
       </Form>

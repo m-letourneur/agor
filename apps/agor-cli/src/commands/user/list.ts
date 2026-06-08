@@ -4,8 +4,8 @@
 
 import { join } from 'node:path';
 import { getConfigPath } from '@agor/core/config';
-import { createDatabase, select, users } from '@agor/core/db';
-import type { User } from '@agor/core/types';
+import { createDatabase, select, shortId, users } from '@agor/core/db';
+import type { User } from '@agor-live/client';
 import { Command } from '@oclif/core';
 import chalk from 'chalk';
 import Table from 'cli-table3';
@@ -90,9 +90,9 @@ export default class UserList extends Command {
 
       // Add rows
       for (const user of userList) {
-        const shortId = user.user_id.substring(0, 8);
+        const idShort = shortId(user.user_id);
         const roleColor =
-          user.role === 'owner'
+          user.role === 'superadmin'
             ? chalk.red
             : user.role === 'admin'
               ? chalk.yellow
@@ -101,7 +101,7 @@ export default class UserList extends Command {
                 : chalk.gray;
 
         table.push([
-          chalk.gray(shortId),
+          chalk.gray(idShort),
           user.email,
           user.name || chalk.gray('(not set)'),
           roleColor(user.role),

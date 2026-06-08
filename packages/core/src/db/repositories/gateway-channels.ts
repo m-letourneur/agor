@@ -10,10 +10,12 @@ import type {
   GatewayAgenticConfig,
   GatewayChannel,
   GatewayChannelID,
+  GatewayEnvVar,
   UUID,
 } from '@agor/core/types';
+import { prefixToLikePattern } from '@agor/core/types';
 import { eq, like } from 'drizzle-orm';
-import { formatShortId, generateId } from '../../lib/ids';
+import { generateId } from '../../lib/ids';
 import type { Database } from '../client';
 import { deleteFrom, insert, select, update } from '../database-wrapper';
 import { decryptApiKey, encryptApiKey } from '../encryption';
@@ -26,7 +28,13 @@ import {
 } from './base';
 
 /** Sensitive config fields that should be encrypted at rest */
-const SENSITIVE_CONFIG_FIELDS = ['bot_token', 'app_token', 'signing_secret'];
+const SENSITIVE_CONFIG_FIELDS = [
+  'bot_token',
+  'app_token',
+  'signing_secret', // Slack
+  'private_key',
+  'webhook_secret', // GitHub
+];
 
 /** Sentinel value used by the API to redact sensitive fields in responses */
 const REDACTED_SENTINEL = '••••••••';
@@ -68,6 +76,68 @@ function decryptConfig(config: Record<string, unknown>): Record<string, unknown>
   return decrypted;
 }
 
+function encryptAgenticConfig(
+  agenticConfig: Record<string, unknown> | null
+): Record<string, unknown> | null {
+  if (!agenticConfig) return null;
+
+  const encrypted = { ...agenticConfig };
+  const rawEnvVars = encrypted.envVars;
+
+  if (Array.isArray(rawEnvVars)) {
+    encrypted.envVars = (rawEnvVars as GatewayEnvVar[]).map((envVar) => ({
+      ...envVar,
+      value: envVar.value ? encryptApiKey(envVar.value) : envVar.value,
+    }));
+  } else if (rawEnvVars && typeof rawEnvVars === 'object') {
+    // Legacy shape support: Record<string, string>
+    encrypted.envVars = Object.fromEntries(
+      Object.entries(rawEnvVars as Record<string, unknown>).map(([key, value]) => [
+        key,
+        typeof value === 'string' && value ? encryptApiKey(value) : value,
+      ])
+    );
+  }
+
+  return encrypted;
+}
+
+function decryptAgenticConfig(
+  agenticConfig: Record<string, unknown> | null
+): Record<string, unknown> | null {
+  if (!agenticConfig) return null;
+
+  const decrypted = { ...agenticConfig };
+  const rawEnvVars = decrypted.envVars;
+
+  if (Array.isArray(rawEnvVars)) {
+    decrypted.envVars = (rawEnvVars as GatewayEnvVar[]).map((envVar) => {
+      try {
+        return {
+          ...envVar,
+          value: envVar.value ? decryptApiKey(envVar.value) : envVar.value,
+        };
+      } catch {
+        return envVar;
+      }
+    });
+  } else if (rawEnvVars && typeof rawEnvVars === 'object') {
+    // Legacy shape support: Record<string, string>
+    decrypted.envVars = Object.fromEntries(
+      Object.entries(rawEnvVars as Record<string, unknown>).map(([key, value]) => {
+        if (typeof value !== 'string' || !value) return [key, value];
+        try {
+          return [key, decryptApiKey(value)];
+        } catch {
+          return [key, value];
+        }
+      })
+    );
+  }
+
+  return decrypted;
+}
+
 /**
  * Gateway channel repository implementation
  */
@@ -81,17 +151,20 @@ export class GatewayChannelRepository
    */
   private rowToChannel(row: GatewayChannelRow): GatewayChannel {
     const config = row.config as Record<string, unknown>;
+    const agenticConfig = decryptAgenticConfig(
+      (row.agentic_config as Record<string, unknown> | null) ?? null
+    );
 
     return {
       id: row.id as GatewayChannelID,
       created_by: row.created_by,
       name: row.name,
       channel_type: row.channel_type as ChannelType,
-      target_worktree_id: row.target_worktree_id as UUID,
+      target_branch_id: row.target_branch_id as UUID,
       agor_user_id: row.agor_user_id as UUID,
       channel_key: row.channel_key,
       config: decryptConfig(config),
-      agentic_config: (row.agentic_config as unknown as GatewayAgenticConfig) ?? null,
+      agentic_config: (agenticConfig as unknown as GatewayAgenticConfig) ?? null,
       enabled: Boolean(row.enabled),
       created_at: new Date(row.created_at).toISOString(),
       updated_at: new Date(row.updated_at).toISOString(),
@@ -105,21 +178,28 @@ export class GatewayChannelRepository
   private channelToInsert(data: Partial<GatewayChannel>): GatewayChannelInsert {
     const now = Date.now();
     const id = data.id ?? generateId();
+    if (!data.created_by) {
+      throw new RepositoryError('GatewayChannel must have a created_by');
+    }
+
+    const encryptedAgenticConfig = encryptAgenticConfig(
+      (data.agentic_config as unknown as Record<string, unknown> | null) ?? null
+    );
 
     return {
       id,
       created_at: new Date(data.created_at ?? now),
       updated_at: new Date(data.updated_at ?? now),
-      created_by: data.created_by ?? 'anonymous',
+      created_by: data.created_by,
       name: data.name ?? 'Untitled Channel',
       channel_type: data.channel_type ?? 'slack',
-      target_worktree_id: data.target_worktree_id ?? '',
+      target_branch_id: data.target_branch_id ?? '',
       agor_user_id: data.agor_user_id ?? '',
       channel_key: data.channel_key ?? generateId(),
       enabled: data.enabled ?? true,
       last_message_at: data.last_message_at ? new Date(data.last_message_at) : null,
       config: data.config ? encryptConfig(data.config) : {},
-      agentic_config: (data.agentic_config as unknown as Record<string, unknown>) ?? null,
+      agentic_config: encryptedAgenticConfig,
     };
   }
 
@@ -131,8 +211,7 @@ export class GatewayChannelRepository
       return id;
     }
 
-    const normalized = id.replace(/-/g, '').toLowerCase();
-    const pattern = `${normalized}%`;
+    const pattern = prefixToLikePattern(id);
 
     const results = await select(this.db)
       .from(gatewayChannels)
@@ -147,7 +226,7 @@ export class GatewayChannelRepository
       throw new AmbiguousIdError(
         'GatewayChannel',
         id,
-        results.map((r: { id: string }) => formatShortId(r.id as UUID))
+        results.map((r: { id: string }) => r.id)
       );
     }
 
@@ -258,7 +337,7 @@ export class GatewayChannelRepository
         .set({
           name: insertData.name,
           channel_type: insertData.channel_type,
-          target_worktree_id: insertData.target_worktree_id,
+          target_branch_id: insertData.target_branch_id,
           agor_user_id: insertData.agor_user_id,
           enabled: insertData.enabled,
           config: insertData.config,

@@ -7,6 +7,14 @@ echo "🚀 Starting Agor development environment..."
 # No pnpm install needed at runtime - this is the key to fast startups!
 echo "✅ Using pre-built dependencies from Docker image"
 
+# Mark /app as a safe git directory for non-branch clones (where the
+# bind-mounted source tree is owned by the host UID and trips git's
+# "dubious ownership" guard inside the container). Harmless in Agor's
+# branch-managed setup, where /app/.git is a FILE pointing to a host-only
+# gitdir that can't be resolved from inside the container at all — those
+# setups feed AGOR_BUILD_SHA via env from .agor.yml's start command instead.
+git config --global --add safe.directory /app 2>/dev/null || true
+
 # Fix home directory permissions (volumes may have wrong UID/GID from previous builds)
 echo "🔧 Fixing home directory permissions..."
 mkdir -p /home/agor/.agor /home/agor/.cache
@@ -76,6 +84,22 @@ while [ ! -f "/app/packages/executor/dist/index.d.ts" ]; do
 done
 echo "✅ @agor/executor initial build complete (including type definitions)"
 
+echo "🔨 Building @agor-live/client (initial build)..."
+pnpm --filter @agor-live/client build
+
+echo "⏳ Waiting for @agor-live/client type definitions..."
+MAX_WAIT=30
+WAITED=0
+while [ ! -f "/app/packages/client/dist/index.d.ts" ]; do
+  if [ $WAITED -ge $MAX_WAIT ]; then
+    echo "❌ Timeout waiting for client type definitions!"
+    exit 1
+  fi
+  sleep 0.5
+  WAITED=$((WAITED + 1))
+done
+echo "✅ @agor-live/client initial build complete (including type definitions)"
+
 # Start watch modes for hot-reload
 echo "🔄 Starting watch modes..."
 pnpm --filter @agor/core dev &
@@ -84,12 +108,15 @@ CORE_PID=$!
 pnpm --filter @agor/executor dev &
 EXECUTOR_PID=$!
 
-echo "✅ Watch modes started (core and executor will rebuild on file changes)"
+pnpm --filter @agor-live/client dev &
+CLIENT_PID=$!
+
+echo "✅ Watch modes started (core, executor, and client will rebuild on file changes)"
 
 # Initialize database and configure daemon settings for Docker
 # (idempotent: creates database on first run, preserves JWT secrets on subsequent runs)
 echo "📦 Initializing Agor environment..."
-pnpm agor init --skip-if-exists --set-config --daemon-port "${DAEMON_PORT:-3030}" --daemon-host localhost
+pnpm agor init --skip-if-exists --set-config --daemon-port "${DAEMON_PORT:-3030}" --daemon-host "${DAEMON_HOST:-0.0.0.0}"
 
 # Run database migrations (idempotent: safe to run on every start)
 # This ensures schema is up-to-date even when using existing database volumes
@@ -112,19 +139,33 @@ if [ "$AGOR_USE_EXECUTOR" = "true" ]; then
   fi
 fi
 
-# Configure RBAC settings from environment (set by postgres entrypoint)
+# Translate public-facing RBAC env vars to the internal AGOR_SET_* contract the
+# sed logic below reads. The postgres entrypoint also performs this translation
+# before exec'ing us — doing it again here is idempotent (same export values)
+# and lets plain `docker-compose.yml` consumers set AGOR_RBAC_ENABLED /
+# AGOR_UNIX_USER_MODE directly, matching the names documented in the postgres
+# profile and CLAUDE.md.
+if [ "$AGOR_RBAC_ENABLED" = "true" ]; then
+  export AGOR_SET_RBAC_FLAG="true"
+fi
+if [ -n "$AGOR_UNIX_USER_MODE" ]; then
+  export AGOR_SET_UNIX_MODE="$AGOR_UNIX_USER_MODE"
+fi
+
+# Configure RBAC settings from environment (set by postgres entrypoint or by
+# the public-facing translation above).
 if [ "$AGOR_SET_RBAC_FLAG" = "true" ] || [ -n "$AGOR_SET_UNIX_MODE" ]; then
   echo "🔐 Configuring RBAC settings..."
 
-  # Enable worktree RBAC if flag is set
+  # Enable branch RBAC if flag is set
   if [ "$AGOR_SET_RBAC_FLAG" = "true" ]; then
-    if ! grep -q "worktree_rbac" /home/agor/.agor/config.yaml 2>/dev/null; then
-      sed -i '/^execution:/a\  worktree_rbac: true' /home/agor/.agor/config.yaml
-      echo "✅ Worktree RBAC enabled"
+    if ! grep -q "branch_rbac" /home/agor/.agor/config.yaml 2>/dev/null; then
+      sed -i '/^execution:/a\  branch_rbac: true' /home/agor/.agor/config.yaml
+      echo "✅ Branch RBAC enabled"
     else
       # Update existing value to true
-      sed -i 's/worktree_rbac:.*/worktree_rbac: true/' /home/agor/.agor/config.yaml
-      echo "✅ Worktree RBAC updated to enabled"
+      sed -i 's/branch_rbac:.*/branch_rbac: true/' /home/agor/.agor/config.yaml
+      echo "✅ Branch RBAC updated to enabled"
     fi
   fi
 
@@ -157,6 +198,16 @@ echo "👤 Ensuring default admin user exists..."
 ADMIN_OUTPUT=$(pnpm --filter @agor/cli exec tsx bin/dev.ts user create-admin --force 2>&1)
 echo "$ADMIN_OUTPUT"
 
+# In strict mode the daemon validates that a session creator's unix_username exists as a
+# real OS account before spawning the executor. The admin DB user is created above via the
+# CLI (direct DB write, no Feathers hook), so the normal after-create hook that calls
+# unix.sync-user never fires. Provision the OS account explicitly here while we still have
+# a clean pre-daemon window and sudoers access.
+if [ "$AGOR_SET_UNIX_MODE" = "strict" ]; then
+  echo "🔒 Provisioning bootstrap admin OS user (strict mode)..."
+  pnpm agor admin ensure-user --username admin || echo "⚠️  Could not provision admin OS user — check sudoers"
+fi
+
 # Get FULL admin user UUID from database (the CLI only shows short ID)
 # Use dedicated script to query the database
 echo "🔍 Querying admin user ID from database..."
@@ -184,7 +235,7 @@ fi
 
 # Create RBAC test users if enabled (PostgreSQL + RBAC mode)
 if [ "$CREATE_RBAC_TEST_USERS" = "true" ]; then
-  echo "👥 Creating RBAC test users and worktrees..."
+  echo "👥 Creating RBAC test users and branches..."
   pnpm tsx scripts/create-rbac-test-users.ts
 fi
 
@@ -203,5 +254,6 @@ VITE_DAEMON_PORT="${DAEMON_PORT:-3030}" pnpm --filter agor-ui dev --host 0.0.0.0
 
 # If UI exits, kill daemon, executor watch, and core watch
 kill $DAEMON_PID 2>/dev/null || true
+kill $CLIENT_PID 2>/dev/null || true
 kill $EXECUTOR_PID 2>/dev/null || true
 kill $CORE_PID 2>/dev/null || true

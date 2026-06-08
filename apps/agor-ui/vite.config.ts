@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { getDefaultConfig, loadConfigSync } from '@agor/core/config';
+import { getDefaultConfig, loadConfigSync } from '@agor-live/client/config';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite';
 import viteCompression from 'vite-plugin-compression';
@@ -43,6 +43,7 @@ export default defineConfig({
 
   // Path alias resolution
   resolve: {
+    conditions: ['source'],
     alias: {
       '@': path.resolve(__dirname, './src'),
     },
@@ -50,19 +51,37 @@ export default defineConfig({
 
   // Mark Node.js-only packages as external so they're not bundled
   build: {
+    chunkSizeWarningLimit: 1000,
     rollupOptions: {
       external: ['@openai/codex-sdk', '@anthropic-ai/claude-agent-sdk', '@google/gemini-cli-core'],
+      output: {
+        // Coarse manual chunking so heavy single-use libs don't land in the
+        // initial bundle. Tune as the app's hot path stabilizes; the goal
+        // here is "warn if a chunk crosses ~1MB" not perfect split.
+        manualChunks(id: string) {
+          if (!id.includes('node_modules')) return undefined;
+          if (id.includes('@ant-design') || /\/antd\//.test(id)) return 'antd';
+          if (id.includes('reactflow')) return 'reactflow';
+          if (id.includes('@uiw/react-codemirror') || id.includes('@codemirror/')) return 'editor';
+          if (id.includes('react-syntax-highlighter')) return 'syntax';
+          if (id.includes('emoji-picker-react') || id.includes('emojibase')) return 'emoji';
+          if (id.includes('@tsparticles/')) return 'particles';
+          if (id.includes('@xterm/')) return 'xterm';
+          if (id.includes('@codesandbox/sandpack')) return 'sandpack';
+          return undefined;
+        },
+      },
     },
   },
 
   server: {
-    // Bind to 0.0.0.0 for Codespaces/Docker accessibility
+    // Bind to 0.0.0.0 for Docker accessibility
     host: '0.0.0.0',
     port: 5173,
     // Watch for changes in workspace packages
     watch: {
-      // Watch the @agor/core dist directory for changes
-      ignored: ['!**/node_modules/@agor/core/**'],
+      // Watch the @agor-live/client package for changes
+      ignored: ['!**/node_modules/@agor-live/client/**'],
     },
     fs: {
       // Allow serving files from the monorepo root

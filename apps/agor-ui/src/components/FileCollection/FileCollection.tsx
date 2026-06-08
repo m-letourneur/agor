@@ -24,6 +24,7 @@ import { Button, Empty, Input, Spin, Tooltip, Tree } from 'antd';
 import type React from 'react';
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ConceptListItem } from '../../types';
+import { copyToClipboard } from '../../utils/clipboard';
 import { useThemedMessage } from '../../utils/message';
 
 const { Search } = Input;
@@ -272,8 +273,8 @@ const FileCollectionInner: React.FC<FileCollectionProps> = ({
 
   // Handle copy path - stable callback
   const handleCopyPath = useCallback(
-    (file: FileItem) => {
-      navigator.clipboard.writeText(file.path);
+    async (file: FileItem) => {
+      await copyToClipboard(file.path);
       showSuccess('Path copied to clipboard!');
     },
     [showSuccess]
@@ -414,12 +415,13 @@ const FileCollectionInner: React.FC<FileCollectionProps> = ({
       </div>
 
       <Tree
+        className="agor-flat-tree"
         treeData={treeData}
         onSelect={handleSelect}
         showIcon={false}
         expandedKeys={expandedKeys}
         onExpand={handleExpand}
-        style={{ background: 'transparent' }}
+        style={{ background: 'transparent', borderRadius: 0, padding: 0 }}
         virtual
         height={600}
       />

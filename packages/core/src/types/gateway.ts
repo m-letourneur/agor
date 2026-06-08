@@ -6,7 +6,7 @@
  */
 
 import type { AgenticToolName, CodexApprovalPolicy, CodexSandboxMode } from './agentic-tool';
-import type { SessionID, UserID, UUID, WorktreeID } from './id';
+import type { BranchID, SessionID, UserID, UUID } from './id';
 import type { PermissionMode } from './session';
 import type { DefaultModelConfig } from './user';
 
@@ -25,7 +25,7 @@ export type ThreadSessionMapID = UUID;
 // ============================================================================
 
 /** Supported messaging platform types */
-export type ChannelType = 'slack' | 'discord' | 'whatsapp' | 'telegram';
+export type ChannelType = 'slack' | 'discord' | 'whatsapp' | 'telegram' | 'github';
 
 /** Thread lifecycle status */
 export type ThreadStatus = 'active' | 'archived' | 'paused';
@@ -41,6 +41,19 @@ export type ThreadStatus = 'active' | 'archived' | 'paused';
  * When a channel has agentic_config, sessions created via that channel
  * use these settings. Falls back to user defaults when not set.
  */
+/**
+ * A single gateway-level environment variable with override behavior.
+ *
+ * - `forceOverride: false` (default) — fallback only; used when the user
+ *   hasn't defined this key at the user level.
+ * - `forceOverride: true` — always applied, even if the user has their own value.
+ */
+export interface GatewayEnvVar {
+  key: string;
+  value: string;
+  forceOverride: boolean;
+}
+
 export interface GatewayAgenticConfig {
   agent: AgenticToolName;
   modelConfig?: DefaultModelConfig;
@@ -49,6 +62,16 @@ export interface GatewayAgenticConfig {
   codexSandboxMode?: CodexSandboxMode;
   codexApprovalPolicy?: CodexApprovalPolicy;
   codexNetworkAccess?: boolean;
+  /**
+   * Gateway-level environment variables (e.g., service account tokens).
+   *
+   * Each entry specifies a key, value, and override mode:
+   * - Fallback (`forceOverride: false`) — merged BEFORE user env vars so user
+   *   values take precedence when both exist.
+   * - Force override (`forceOverride: true`) — merged AFTER user env vars so
+   *   the channel value always wins.
+   */
+  envVars?: GatewayEnvVar[];
 }
 
 // ============================================================================
@@ -59,15 +82,15 @@ export interface GatewayAgenticConfig {
  * Gateway Channel - A registered messaging platform integration
  *
  * Users create channels to connect messaging platforms (Slack, Discord, etc.)
- * to Agor. Each channel targets a specific worktree and routes messages
- * to/from sessions within that worktree.
+ * to Agor. Each channel targets a specific branch and routes messages
+ * to/from sessions within that branch.
  */
 export interface GatewayChannel {
   id: GatewayChannelID;
   created_by: string;
   name: string;
   channel_type: ChannelType;
-  target_worktree_id: WorktreeID;
+  target_branch_id: BranchID;
   agor_user_id: UserID;
   channel_key: string; // UUID — the auth secret for inbound webhooks
   config: Record<string, unknown>; // Platform credentials (encrypted at rest)
@@ -89,7 +112,7 @@ export interface ThreadSessionMap {
   channel_id: GatewayChannelID;
   thread_id: string; // Platform-specific (e.g., "C123456-1707340800.123456")
   session_id: SessionID;
-  worktree_id: WorktreeID;
+  branch_id: BranchID;
   created_at: string;
   last_message_at: string;
   status: ThreadStatus;

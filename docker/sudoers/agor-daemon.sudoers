@@ -31,6 +31,10 @@
 # IMPORTANT: Code must ALWAYS use `sudo -n` to prevent freezes if this fails.
 Defaults:agor !requiretty
 
+# Preserve the git-hardening env var across `sudo -u <user>`.
+# See docs/internal/credential-leak-defenses-2026-05-11.md.
+Defaults:agor env_keep += "GIT_CONFIG_PARAMETERS"
+
 # ============================================================================
 # USER IMPERSONATION - Agent Process Execution
 # ============================================================================
@@ -117,10 +121,12 @@ agor ALL=(ALL) NOPASSWD: /usr/bin/tee /home/*/.agor/*
 agor ALL=(ALL) NOPASSWD: /usr/bin/tee /var/agor/*
 
 # ============================================================================
-# QUERY COMMANDS - Read-Only Operations
+# QUERY AND TRAVERSAL COMMANDS
 # ============================================================================
-# These are safe, read-only commands used to check system state.
-# No security risk from these.
+# id, getent, readlink, test: read-only state checks, no security risk.
+# find: used with -exec chmod g+s for setgid propagation. Note that
+# find with -exec can run arbitrary commands as root — command construction
+# is controlled in our codebase (group-manager.ts), not from user input.
 
 agor ALL=(ALL) NOPASSWD: /usr/bin/id *
 agor ALL=(ALL) NOPASSWD: /usr/bin/getent *

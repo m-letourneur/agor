@@ -5,12 +5,18 @@
  * Used on app startup to determine if login page should be shown and display instance label.
  */
 
+import type { ManagedEnvExecutionMode } from '@agor/core/environment/webhook';
+import type { DaemonServicesConfig } from '@agor-live/client';
 import { useEffect, useState } from 'react';
 import { getDaemonUrl } from '../config/daemon';
+import type { BranchStorageConfig } from '../utils/branchStorage';
 
 interface AuthConfig {
   requireAuth: boolean;
-  allowAnonymous: boolean;
+  externalLaunch?: {
+    enabled?: boolean;
+    loginRedirectUrl?: string;
+  };
 }
 
 interface InstanceConfig {
@@ -22,12 +28,51 @@ interface SystemCredentials {
   ANTHROPIC_API_KEY?: boolean;
   OPENAI_API_KEY?: boolean;
   GEMINI_API_KEY?: boolean;
+  CURSOR_API_KEY?: boolean;
 }
 
 interface OnboardingConfig {
+  assistantPending?: boolean;
+  /** @deprecated Use assistantPending instead */
   persistedAgentPending?: boolean;
   frameworkRepoUrl?: string;
   systemCredentials?: SystemCredentials;
+}
+
+export interface FeaturesConfig {
+  /**
+   * Whether the web terminal is enabled for members (execution.allow_web_terminal).
+   * Defaults to true when the daemon config key is unset.
+   */
+  webTerminal?: boolean;
+  /**
+   * Minimum role required to trigger managed environment commands
+   * (start/stop/nuke/logs). Value: 'none' | 'viewer' | 'member' | 'admin' |
+   * 'superadmin'. UI uses this to disable trigger buttons with a tooltip for
+   * users below the threshold. Server-side enforcement in
+   * services/branches.ts is the source of truth. Defaults to 'member'.
+   */
+  managedEnvsMinimumRole?: 'none' | 'viewer' | 'member' | 'admin' | 'superadmin';
+  /**
+   * How managed environment lifecycle fields are handled by this instance.
+   * Defaults to 'hybrid': shell commands and URL webhooks are both supported.
+   */
+  managedEnvsExecutionMode?: ManagedEnvExecutionMode;
+  /**
+   * True when the daemon runs in a multi-user Unix isolation mode
+   * (insulated/strict). The UI uses this to hide "trust everyone on this
+   * instance" surfaces (e.g. the `instance` scope option in the artifact
+   * consent modal). Server-side gates are the source of truth.
+   */
+  multiUser?: boolean;
+  /** Experimental Cursor SDK provider enabled on the daemon. */
+  cursorSdk?: boolean;
+  /**
+   * Resolved branch storage policy from execution.branch_storage.
+   * Defaults server-side to { defaultMode: 'worktree',
+   * allowedModes: ['worktree', 'clone'] } when unset.
+   */
+  branchStorage?: BranchStorageConfig;
 }
 
 interface HealthResponse {
@@ -38,12 +83,16 @@ interface HealthResponse {
   auth: AuthConfig;
   instance?: InstanceConfig;
   onboarding?: OnboardingConfig;
+  services?: DaemonServicesConfig;
+  features?: FeaturesConfig;
 }
 
 export function useAuthConfig() {
   const [config, setConfig] = useState<AuthConfig | null>(null);
   const [instanceConfig, setInstanceConfig] = useState<InstanceConfig | null>(null);
   const [onboardingConfig, setOnboardingConfig] = useState<OnboardingConfig | null>(null);
+  const [servicesConfig, setServicesConfig] = useState<DaemonServicesConfig | undefined>(undefined);
+  const [featuresConfig, setFeaturesConfig] = useState<FeaturesConfig | undefined>(undefined);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
 
@@ -59,13 +108,17 @@ export function useAuthConfig() {
         setConfig(health.auth);
         setInstanceConfig(health.instance ?? null);
         setOnboardingConfig(health.onboarding ?? null);
+        setServicesConfig(health.services);
+        setFeaturesConfig(health.features);
         setError(null);
       } catch (err) {
         setError(err instanceof Error ? err : new Error(String(err)));
         // Default to requiring auth on error (secure by default)
-        setConfig({ requireAuth: true, allowAnonymous: false });
+        setConfig({ requireAuth: true });
         setInstanceConfig(null);
         setOnboardingConfig(null);
+        setServicesConfig(undefined);
+        setFeaturesConfig(undefined);
       } finally {
         setLoading(false);
       }
@@ -74,5 +127,13 @@ export function useAuthConfig() {
     fetchAuthConfig();
   }, []);
 
-  return { config, instanceConfig, onboardingConfig, loading, error };
+  return {
+    config,
+    instanceConfig,
+    onboardingConfig,
+    servicesConfig,
+    featuresConfig,
+    loading,
+    error,
+  };
 }

@@ -1,6 +1,7 @@
-import type { SessionStatus, TaskStatus } from '@agor/core/types';
+import type { ContextUsageSnapshot } from '@agor/core/types';
+import type { SessionStatus, TaskStatus } from '@agor-live/client';
+import { shortId } from '@agor-live/client';
 // TODO: Move normalization to DB or daemon API
-// import { normalizeRawSdkResponse } from '@agor/core/utils/sdk-normalizer';
 import {
   ApartmentOutlined,
   BranchesOutlined,
@@ -13,6 +14,8 @@ import {
   FileTextOutlined,
   ForkOutlined,
   GithubOutlined,
+  IdcardOutlined,
+  LinkOutlined,
   MessageOutlined,
   PercentageOutlined,
   RobotOutlined,
@@ -20,10 +23,14 @@ import {
   ThunderboltOutlined,
   ToolOutlined,
 } from '@ant-design/icons';
-import { Collapse, Popover, Tooltip, theme } from 'antd';
+import { Badge, Collapse, Popover, Tooltip, theme } from 'antd';
 import type React from 'react';
 import { copyToClipboard } from '../../utils/clipboard';
+import { resolveContextWindowPercentage } from '../../utils/contextWindow';
+import { parseGitStateSha } from '../../utils/gitState';
+import { type SessionForIds, SessionIdsList } from '../SessionIds';
 import { Tag } from '../Tag';
+import { getUrlDisplayLabel, isGitHubUrl, type UrlDisplayRepo } from './url-helpers';
 
 /**
  * Standardized color palette for pills/badges
@@ -51,7 +58,7 @@ export const PILL_COLORS = {
   // Features
   report: 'green', // Has report
   concept: 'geekblue', // Loaded concepts
-  worktree: 'blue', // Managed worktree
+  branch: 'blue', // Managed branch
 } as const;
 
 interface BasePillProps {
@@ -193,6 +200,7 @@ interface ContextWindowPillProps extends BasePillProps {
       costUsd?: number;
       primaryModel?: string;
       durationMs?: number;
+      contextUsageSnapshot?: ContextUsageSnapshot;
     };
   };
 }
@@ -216,6 +224,33 @@ const ContextWindowPopoverContent: React.FC<{
   const sdkResponse = taskMetadata?.raw_sdk_response;
   // Get normalized SDK response (pre-computed by executor)
   const normalized = taskMetadata?.normalized_sdk_response;
+
+  // Add authoritative context usage from SDK's getContextUsage() if available
+  const contextUsageSnapshot = normalized?.contextUsageSnapshot ?? null;
+
+  if (contextUsageSnapshot) {
+    advancedItems.push({
+      key: 'sdk-context-usage',
+      label: 'Context Window (SDK)',
+      children: (
+        <div style={{ fontSize: '0.9em', color: token.colorTextSecondary }}>
+          <div>
+            Used: <strong>{contextUsageSnapshot.totalTokens.toLocaleString()}</strong> tokens
+          </div>
+          <div>
+            Limit: <strong>{contextUsageSnapshot.maxTokens.toLocaleString()}</strong> tokens
+          </div>
+          <div>
+            Percentage: <strong>{contextUsageSnapshot.percentage}%</strong>
+          </div>
+          <div style={{ fontSize: '0.85em', color: token.colorTextTertiary, marginTop: 4 }}>
+            Authoritative snapshot reported by the agent (Claude SDK getContextUsage() or Codex CLI
+            token_count event).
+          </div>
+        </div>
+      ),
+    });
+  }
 
   // Add per-model usage if available (Claude Code multi-model)
   // Check for modelUsage field (only Claude SDK has this)
@@ -300,8 +335,8 @@ const ContextWindowPopoverContent: React.FC<{
         </div>
         <div style={{ fontSize: '0.85em', color: token.colorTextTertiary, marginTop: 6 }}>
           {limit > 0
-            ? 'Cumulative conversation tokens'
-            : 'Cumulative conversation tokens (limit unknown)'}
+            ? 'Current context window snapshot'
+            : 'Current context window snapshot (limit unknown)'}
         </div>
       </div>
 
@@ -370,9 +405,18 @@ export const ContextWindowPill: React.FC<ContextWindowPillProps> = ({
   taskMetadata,
   style,
 }) => {
-  // Handle division by zero - if no limit, show as unknown percentage
-  const percentage = limit > 0 ? Math.round((used / limit) * 100) : 0;
-  const hasLimit = limit > 0;
+  // Prefer the executor-supplied snapshot — its totalTokens/maxTokens are
+  // authoritative (agent-reported), and its `percentage` matches the agent's
+  // own "Context XX% used" display (e.g. Codex applies a baseline subtraction
+  // that does NOT equal raw `used / limit`). Fall back to the explicit
+  // used/limit props when no snapshot is available.
+  const snapshot = taskMetadata?.normalized_sdk_response?.contextUsageSnapshot;
+  const effectiveUsed = snapshot?.totalTokens ?? used;
+  const effectiveLimit = snapshot?.maxTokens ?? limit;
+  const hasLimit = effectiveLimit > 0;
+  const percentage = hasLimit
+    ? Math.round(resolveContextWindowPercentage(effectiveUsed, effectiveLimit, snapshot))
+    : 0;
 
   // Color-code based on usage: green (<50%), yellow (50-80%), red (>80%)
   const getColor = () => {
@@ -392,8 +436,8 @@ export const ContextWindowPill: React.FC<ContextWindowPillProps> = ({
     <Popover
       content={
         <ContextWindowPopoverContent
-          used={used}
-          limit={limit}
+          used={effectiveUsed}
+          limit={effectiveLimit}
           percentage={percentage}
           taskMetadata={taskMetadata}
         />
@@ -454,6 +498,18 @@ export const ModelPill: React.FC<ModelPillProps> = ({ model, style }) => {
   );
 };
 
+/**
+ * Small amber dot indicating uncommitted ("dirty") working tree changes.
+ * Mirrors the VSCode unsaved-file affordance. Rendered inline at the end of
+ * a git-SHA pill (purely decorative — the parent pill carries the tooltip
+ * that explains both the SHA and the dot, so the dot is `aria-hidden`).
+ */
+const DirtyDot: React.FC = () => (
+  <span aria-hidden="true" style={{ display: 'inline-flex', flexShrink: 0, marginLeft: 6 }}>
+    <Badge status="warning" />
+  </span>
+);
+
 interface GitShaPillProps extends BasePillProps {
   sha: string;
   isDirty?: boolean;
@@ -464,66 +520,78 @@ export const GitShaPill: React.FC<GitShaPillProps> = ({
   sha,
   isDirty = false,
   showDirtyIndicator = true,
-  size,
   style,
 }) => {
   const { token } = theme.useToken();
-  const cleanSha = sha.replace('-dirty', '');
+  const { cleanSha } = parseGitStateSha(sha);
   const displaySha = cleanSha.substring(0, 7);
+  const showDirty = isDirty && showDirtyIndicator;
+  const tooltip = showDirty
+    ? 'Git commit SHA (working tree has uncommitted changes) · click to copy'
+    : 'Git commit SHA · click to copy';
+
+  const handleClick = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    await copyToClipboard(cleanSha);
+  };
 
   return (
-    <Tag
-      icon={<GithubOutlined />}
-      color={isDirty && showDirtyIndicator ? PILL_COLORS.warning : PILL_COLORS.git}
-      style={style}
-    >
-      <span style={{ fontFamily: token.fontFamilyCode }}>{displaySha}</span>
-      {isDirty && showDirtyIndicator && ' (dirty)'}
-    </Tag>
+    <Tooltip title={tooltip}>
+      <Tag
+        icon={<GithubOutlined />}
+        color={PILL_COLORS.git}
+        style={{ ...style, cursor: 'pointer' }}
+        onClick={handleClick}
+      >
+        <span style={{ fontFamily: token.fontFamilyCode }}>{displaySha}</span>
+        {showDirty && <DirtyDot />}
+      </Tag>
+    </Tooltip>
   );
 };
 
 interface GitStatePillProps extends BasePillProps {
   branch?: string; // Branch name (renamed from 'ref' to avoid React reserved word)
   sha: string;
-  worktreeName?: string; // Hide branch name if it matches worktree name
+  branchName?: string; // Hide branch name if it matches branch name
   showDirtyIndicator?: boolean;
 }
 
 export const GitStatePill: React.FC<GitStatePillProps> = ({
   branch,
   sha,
-  worktreeName,
+  branchName,
   showDirtyIndicator = true,
   style,
 }) => {
   const { token } = theme.useToken();
-  const isDirty = sha.endsWith('-dirty');
-  const cleanSha = sha.replace('-dirty', '');
+  const { cleanSha, isDirty } = parseGitStateSha(sha);
   const displaySha = cleanSha.substring(0, 7);
+  const showDirty = isDirty && showDirtyIndicator;
 
-  // Only show branch if it differs from worktree name
-  const shouldShowBranch = branch && branch !== worktreeName;
+  // Only show branch if it differs from branch name
+  const shouldShowBranch = branch && branch !== branchName;
 
-  const handleClick = (e: React.MouseEvent) => {
+  const tooltip = showDirty
+    ? 'Git commit SHA (working tree has uncommitted changes) · click to copy'
+    : 'Git commit SHA · click to copy';
+
+  const handleClick = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    copyToClipboard(cleanSha, {
-      showSuccess: true,
-      successMessage: 'Git SHA copied to clipboard',
-    });
+    await copyToClipboard(cleanSha);
   };
 
   return (
-    <Tooltip title="Click to copy full SHA">
+    <Tooltip title={tooltip}>
       <Tag
         icon={<ForkOutlined />}
-        color={isDirty && showDirtyIndicator ? 'cyan' : PILL_COLORS.git}
+        color={PILL_COLORS.git}
         style={{ ...style, cursor: 'pointer' }}
         onClick={handleClick}
       >
         {shouldShowBranch && <span>{branch} : </span>}
         <span style={{ fontFamily: token.fontFamilyCode }}>{displaySha}</span>
-        {isDirty && showDirtyIndicator && ' (dirty)'}
+        {showDirty && <DirtyDot />}
       </Tag>
     </Tooltip>
   );
@@ -536,108 +604,6 @@ interface SessionIdPillProps extends BasePillProps {
   showCopy?: boolean;
 }
 
-/**
- * Session ID Popover Content Component
- * Displays both Agor session ID and agentic tool session ID with copy buttons
- */
-const SessionIdPopoverContent: React.FC<{
-  sessionId: string;
-  sdkSessionId?: string;
-  agenticTool?: string;
-}> = ({ sessionId, sdkSessionId, agenticTool }) => {
-  const { token } = theme.useToken();
-
-  const handleCopyAgor = () => {
-    copyToClipboard(sessionId, {
-      showSuccess: true,
-      successMessage: 'Agor session ID copied to clipboard',
-    });
-  };
-
-  const handleCopySdk = () => {
-    if (sdkSessionId) {
-      copyToClipboard(sdkSessionId, {
-        showSuccess: true,
-        successMessage: `${agenticTool || 'SDK'} session ID copied to clipboard`,
-      });
-    }
-  };
-
-  return (
-    <div style={{ width: 400, maxWidth: '90vw' }}>
-      {/* Agor Session ID */}
-      <div style={{ marginBottom: sdkSessionId ? 16 : 0 }}>
-        <div style={{ fontWeight: 600, fontSize: '0.95em', marginBottom: 8 }}>Agor Session ID</div>
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            padding: 8,
-            background: token.colorBgContainer,
-            borderRadius: token.borderRadius,
-            border: `1px solid ${token.colorBorder}`,
-          }}
-        >
-          <div style={{ flex: 1, fontFamily: token.fontFamilyCode, fontSize: '0.9em' }}>
-            <div style={{ color: token.colorTextSecondary, fontSize: '0.85em', marginBottom: 2 }}>
-              {sessionId.substring(0, 8)}
-            </div>
-            <div style={{ wordBreak: 'break-all', fontSize: '0.75em', opacity: 0.7 }}>
-              {sessionId}
-            </div>
-          </div>
-          <Tag
-            icon={<CopyOutlined />}
-            color={PILL_COLORS.session}
-            style={{ cursor: 'pointer', margin: 0 }}
-            onClick={handleCopyAgor}
-          >
-            Copy
-          </Tag>
-        </div>
-      </div>
-
-      {/* SDK Session ID (if available) */}
-      {sdkSessionId && (
-        <div>
-          <div style={{ fontWeight: 600, fontSize: '0.95em', marginBottom: 8 }}>
-            {agenticTool || 'SDK'} Session ID
-          </div>
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 8,
-              padding: 8,
-              background: token.colorBgContainer,
-              borderRadius: token.borderRadius,
-              border: `1px solid ${token.colorBorder}`,
-            }}
-          >
-            <div style={{ flex: 1, fontFamily: token.fontFamilyCode, fontSize: '0.9em' }}>
-              <div style={{ color: token.colorTextSecondary, fontSize: '0.85em', marginBottom: 2 }}>
-                {sdkSessionId.substring(0, 8)}
-              </div>
-              <div style={{ wordBreak: 'break-all', fontSize: '0.75em', opacity: 0.7 }}>
-                {sdkSessionId}
-              </div>
-            </div>
-            <Tag
-              icon={<CopyOutlined />}
-              color={PILL_COLORS.session}
-              style={{ cursor: 'pointer', margin: 0 }}
-              onClick={handleCopySdk}
-            >
-              Copy
-            </Tag>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
 export const SessionIdPill: React.FC<SessionIdPillProps> = ({
   sessionId,
   sdkSessionId,
@@ -649,7 +615,7 @@ export const SessionIdPill: React.FC<SessionIdPillProps> = ({
   const { token } = theme.useToken();
   // Prefer SDK session ID (more useful for CLI/logs) over Agor internal ID
   const displayId = sdkSessionId || sessionId;
-  const shortId = displayId.substring(0, 8);
+  const idShort = shortId(displayId);
 
   const pill = (
     <Tag
@@ -657,7 +623,7 @@ export const SessionIdPill: React.FC<SessionIdPillProps> = ({
       color={PILL_COLORS.session}
       style={{ cursor: showCopy ? 'pointer' : 'default', ...style }}
     >
-      <span style={{ fontFamily: token.fontFamilyCode }}>{shortId}</span>
+      <span style={{ fontFamily: token.fontFamilyCode }}>{idShort}</span>
     </Tag>
   );
 
@@ -667,14 +633,25 @@ export const SessionIdPill: React.FC<SessionIdPillProps> = ({
 
   return (
     <Popover
-      content={
-        <SessionIdPopoverContent
-          sessionId={sessionId}
-          sdkSessionId={sdkSessionId}
-          agenticTool={agenticTool}
-        />
+      title={
+        <span>
+          <IdcardOutlined style={{ marginRight: 8 }} />
+          Session IDs
+        </span>
       }
-      title={null}
+      content={
+        <div style={{ width: 400, maxWidth: '90vw' }}>
+          <SessionIdsList
+            session={
+              {
+                session_id: sessionId,
+                sdk_session_id: sdkSessionId,
+                agentic_tool: agenticTool,
+              } as SessionForIds
+            }
+          />
+        </div>
+      }
       trigger="hover"
       placement="top"
       mouseEnterDelay={0.3}
@@ -709,6 +686,11 @@ export const StatusPill: React.FC<StatusPillProps> = ({ status, style }) => {
       icon: <ToolOutlined />,
       color: PILL_COLORS.processing,
       text: 'Running',
+    },
+    timed_out: {
+      icon: <ClockCircleOutlined />,
+      color: PILL_COLORS.warning,
+      text: 'Timed Out',
     },
     idle: {
       icon: <ToolOutlined />,
@@ -756,7 +738,7 @@ export const ForkPill: React.FC<ForkPillProps> = ({
     <Tooltip
       title={
         <div>
-          <div>Forked from session {fromSessionId.substring(0, 8)}</div>
+          <div>Forked from session {shortId(fromSessionId)}</div>
           {messageIndex !== undefined && <div>Message index: {messageIndex}</div>}
           <div style={{ marginTop: 4, fontSize: '0.9em', opacity: 0.8 }}>
             Click to copy session ID
@@ -770,7 +752,7 @@ export const ForkPill: React.FC<ForkPillProps> = ({
         style={{ ...style, cursor: 'pointer' }}
         onClick={handleCopySessionId}
       >
-        FORKED from {fromSessionId.substring(0, 8)}
+        FORKED from {shortId(fromSessionId)}
         {messageIndex !== undefined && ` as of message ${messageIndex}`}
       </Tag>
     </Tooltip>
@@ -798,7 +780,7 @@ export const SpawnPill: React.FC<SpawnPillProps> = ({
     <Tooltip
       title={
         <div>
-          <div>Spawned from session {fromSessionId.substring(0, 8)}</div>
+          <div>Spawned from session {shortId(fromSessionId)}</div>
           {messageIndex !== undefined && <div>Message index: {messageIndex}</div>}
           <div style={{ marginTop: 4, fontSize: '0.9em', opacity: 0.8 }}>
             Click to copy session ID
@@ -812,7 +794,7 @@ export const SpawnPill: React.FC<SpawnPillProps> = ({
         style={{ ...style, cursor: 'pointer' }}
         onClick={handleCopySessionId}
       >
-        SPAWNED from {fromSessionId.substring(0, 8)}
+        SPAWNED from {shortId(fromSessionId)}
         {messageIndex !== undefined && ` as of message ${messageIndex}`}
       </Tag>
     </Tooltip>
@@ -825,6 +807,7 @@ interface ReportPillProps extends BasePillProps {
 
 export const ReportPill: React.FC<ReportPillProps> = ({ reportId, style }) => (
   <Tag icon={<FileTextOutlined />} color={PILL_COLORS.report} style={style}>
+    {/* shortid-guard:ignore reportId is a `<session>/<task>.md` file path, not a UUIDv7 */}
     {reportId ? `Report ${reportId.substring(0, 7)}` : 'Has Report'}
   </Tag>
 );
@@ -838,20 +821,6 @@ export const ConceptPill: React.FC<ConceptPillProps> = ({ name, style }) => (
     📦 {name}
   </Tag>
 );
-
-interface WorktreePillProps extends BasePillProps {
-  managed?: boolean;
-}
-
-export const WorktreePill: React.FC<WorktreePillProps> = ({ managed = true, style }) => {
-  const { token } = theme.useToken();
-
-  return (
-    <Tag color={PILL_COLORS.worktree} style={style}>
-      <span style={{ fontFamily: token.fontFamilyCode }}>{managed ? 'Managed' : 'Worktree'}</span>
-    </Tag>
-  );
-};
 
 interface DirtyStatePillProps extends BasePillProps {}
 
@@ -867,28 +836,60 @@ export const DirtyStatePill: React.FC<DirtyStatePillProps> = ({ style }) => {
 
 interface BranchPillProps extends BasePillProps {
   branch: string;
+  compact?: boolean;
+  title?: string;
 }
 
-export const BranchPill: React.FC<BranchPillProps> = ({ branch, style }) => {
+export const BranchPill: React.FC<BranchPillProps> = ({
+  branch,
+  compact = false,
+  title,
+  style,
+}) => {
   const { token } = theme.useToken();
 
   return (
-    <Tag icon={<BranchesOutlined />} color={PILL_COLORS.git} style={style}>
-      <span style={{ fontFamily: token.fontFamilyCode }}>{branch}</span>
+    <Tag
+      icon={<BranchesOutlined />}
+      color={PILL_COLORS.git}
+      title={title}
+      style={{
+        maxWidth: compact ? '100%' : undefined,
+        marginInlineEnd: compact ? 0 : undefined,
+        cursor: 'default',
+        ...style,
+      }}
+    >
+      <span
+        style={{
+          display: compact ? 'inline-block' : undefined,
+          maxWidth: compact ? 220 : undefined,
+          overflow: compact ? 'hidden' : undefined,
+          textOverflow: compact ? 'ellipsis' : undefined,
+          whiteSpace: compact ? 'nowrap' : undefined,
+          verticalAlign: compact ? 'bottom' : undefined,
+          fontFamily: token.fontFamilyCode,
+        }}
+      >
+        {branch}
+      </span>
     </Tag>
   );
 };
 
 interface RepoPillProps extends BasePillProps {
   repoName: string;
-  worktreeName?: string;
+  branchName?: string;
   onClick?: () => void;
+  /** Tag color. Defaults to 'cyan'; pass 'default' for a muted theme-neutral tag. */
+  color?: string;
 }
 
 export const RepoPill: React.FC<RepoPillProps> = ({
   repoName,
-  worktreeName,
+  branchName,
   onClick,
+  color = 'cyan',
   size,
   style,
 }) => {
@@ -897,16 +898,16 @@ export const RepoPill: React.FC<RepoPillProps> = ({
   return (
     <Tag
       icon={<BranchesOutlined />}
-      color="cyan"
+      color={color}
       style={{ ...style, cursor: onClick ? 'pointer' : 'default' }}
       onClick={onClick}
     >
       <span style={{ fontFamily: token.fontFamilyCode }}>
         {repoName}
-        {worktreeName && (
+        {branchName && (
           <>
             {' '}
-            <ApartmentOutlined style={{ fontSize: '0.85em', opacity: 0.7 }} /> {worktreeName}
+            <ApartmentOutlined style={{ fontSize: '0.85em', opacity: 0.7 }} /> {branchName}
           </>
         )}
       </span>
@@ -914,43 +915,80 @@ export const RepoPill: React.FC<RepoPillProps> = ({
   );
 };
 
+export { getUrlDisplayLabel, isGitHubUrl } from './url-helpers';
+
+function getIssueIcon(url: string): React.ReactNode {
+  if (isGitHubUrl(url)) return <GithubOutlined />;
+  return <LinkOutlined />;
+}
+
+function getPrIcon(url: string): React.ReactNode {
+  if (isGitHubUrl(url)) return <GithubOutlined />;
+  return <BranchesOutlined />;
+}
+
+const pillTextStyle: React.CSSProperties = {
+  maxWidth: 160,
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+  display: 'inline-block',
+  verticalAlign: 'middle',
+};
+
 interface IssuePillProps extends BasePillProps {
   issueUrl: string;
   issueNumber?: string;
+  currentRepo?: UrlDisplayRepo;
 }
 
-export const IssuePill: React.FC<IssuePillProps> = ({ issueUrl, issueNumber, style }) => {
-  const displayText = issueNumber || issueUrl.split('/').pop() || '?';
+export const IssuePill: React.FC<IssuePillProps> = ({
+  issueUrl,
+  issueNumber,
+  currentRepo,
+  style,
+}) => {
+  const displayText = issueNumber || getUrlDisplayLabel(issueUrl, { currentRepo });
 
   return (
-    <Tag
-      icon={<GithubOutlined />}
-      color={PILL_COLORS.git}
-      style={{ ...style, cursor: 'pointer' }}
-      onClick={() => window.open(issueUrl, '_blank')}
-    >
-      Issue: {displayText}
-    </Tag>
+    <Tooltip title={issueUrl}>
+      <Tag
+        icon={getIssueIcon(issueUrl)}
+        color={PILL_COLORS.git}
+        style={{ ...style, cursor: 'pointer', maxWidth: 220 }}
+        onClick={() => window.open(issueUrl, '_blank')}
+      >
+        <span style={pillTextStyle}>Issue: {displayText}</span>
+      </Tag>
+    </Tooltip>
   );
 };
 
 interface PullRequestPillProps extends BasePillProps {
   prUrl: string;
   prNumber?: string;
+  currentRepo?: UrlDisplayRepo;
 }
 
-export const PullRequestPill: React.FC<PullRequestPillProps> = ({ prUrl, prNumber, style }) => {
-  const displayText = prNumber || prUrl.split('/').pop() || '?';
+export const PullRequestPill: React.FC<PullRequestPillProps> = ({
+  prUrl,
+  prNumber,
+  currentRepo,
+  style,
+}) => {
+  const displayText = prNumber || getUrlDisplayLabel(prUrl, { currentRepo });
 
   return (
-    <Tag
-      icon={<GithubOutlined />}
-      color={PILL_COLORS.git}
-      style={{ ...style, cursor: 'pointer' }}
-      onClick={() => window.open(prUrl, '_blank')}
-    >
-      PR: {displayText}
-    </Tag>
+    <Tooltip title={prUrl}>
+      <Tag
+        icon={getPrIcon(prUrl)}
+        color={PILL_COLORS.git}
+        style={{ ...style, cursor: 'pointer', maxWidth: 220 }}
+        onClick={() => window.open(prUrl, '_blank')}
+      >
+        <span style={pillTextStyle}>PR: {displayText}</span>
+      </Tag>
+    </Tooltip>
   );
 };
 

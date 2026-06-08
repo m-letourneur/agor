@@ -1,4 +1,4 @@
-import { createClient } from '@agor/core/api';
+import { createRestClient } from '@agor-live/client';
 import { InfoCircleOutlined } from '@ant-design/icons';
 import { Alert, Select, Space, Spin, Typography } from 'antd';
 import { useEffect, useState } from 'react';
@@ -43,16 +43,14 @@ export const OpenCodeModelSelector: React.FC<OpenCodeModelSelectorProps> = ({
   const [hasSetDefault, setHasSetDefault] = useState(false);
 
   // Fetch providers/models from daemon endpoint
-  // biome-ignore lint/correctness/useExhaustiveDependencies: Only fetch once on mount
   useEffect(() => {
     const fetchProviders = async () => {
       try {
         setLoading(true);
         setError(null);
 
-        // Create client to fetch OpenCode models
         const daemonUrl = getDaemonUrl();
-        const client = createClient(daemonUrl);
+        const client = await createRestClient(daemonUrl);
 
         const response = (await client
           .service('opencode/models')
@@ -124,7 +122,7 @@ export const OpenCodeModelSelector: React.FC<OpenCodeModelSelectorProps> = ({
   if (error) {
     return (
       <Alert
-        message="OpenCode Unavailable"
+        title="OpenCode Unavailable"
         description={error}
         type="warning"
         showIcon
@@ -141,7 +139,7 @@ export const OpenCodeModelSelector: React.FC<OpenCodeModelSelectorProps> = ({
   if (providers.length === 0) {
     return (
       <Alert
-        message="No Providers Available"
+        title="No Providers Available"
         description="OpenCode server returned no providers. Check your OpenCode installation."
         type="info"
         showIcon
@@ -150,7 +148,7 @@ export const OpenCodeModelSelector: React.FC<OpenCodeModelSelectorProps> = ({
   }
 
   return (
-    <Space direction="vertical" style={{ width: '100%' }}>
+    <Space orientation="vertical" style={{ width: '100%' }}>
       {/* Provider Dropdown */}
       <div>
         <Text strong style={{ display: 'block', marginBottom: 8 }}>
@@ -162,16 +160,18 @@ export const OpenCodeModelSelector: React.FC<OpenCodeModelSelectorProps> = ({
           onChange={handleProviderChange}
           placeholder="Select provider"
         >
-          {providers.map((provider) => (
-            <Select.Option key={provider.id} value={provider.id}>
-              <Space>
-                <span>{provider.name}</span>
-                <Text type="secondary" style={{ fontSize: 12 }}>
-                  ({provider.models.length} models)
-                </Text>
-              </Space>
-            </Select.Option>
-          ))}
+          {[...providers]
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .map((provider) => (
+              <Select.Option key={provider.id} value={provider.id}>
+                <Space>
+                  <span>{provider.name}</span>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    ({provider.models.length} models)
+                  </Text>
+                </Space>
+              </Select.Option>
+            ))}
         </Select>
       </div>
 
@@ -189,11 +189,13 @@ export const OpenCodeModelSelector: React.FC<OpenCodeModelSelectorProps> = ({
             showSearch
             optionFilterProp="children"
           >
-            {availableModels.map((model) => (
-              <Select.Option key={model.id} value={model.id}>
-                {model.name}
-              </Select.Option>
-            ))}
+            {[...availableModels]
+              .sort((a, b) => a.name.localeCompare(b.name))
+              .map((model) => (
+                <Select.Option key={model.id} value={model.id}>
+                  {model.name}
+                </Select.Option>
+              ))}
           </Select>
         </div>
       )}

@@ -13,12 +13,14 @@
  * (like AgentChain) are responsible for wrapping this in ThoughtChain items.
  */
 
-import type { ContentBlock as CoreContentBlock } from '@agor/core/types';
+import type { ContentBlock as CoreContentBlock, DiffEnrichment } from '@agor-live/client';
 import { theme } from 'antd';
 import type React from 'react';
 import { shouldUseAnsiRendering } from '../../utils/ansi';
+import { toolResultToDisplayText } from '../../utils/toolResultToDisplayText';
 import { CollapsibleText } from '../CollapsibleText';
 import { CollapsibleAnsiText } from '../CollapsibleText/CollapsibleAnsiText';
+import { ThemedSyntaxHighlighter } from '../ThemedSyntaxHighlighter';
 import { getToolRenderer } from './renderers';
 
 interface ToolUseBlock {
@@ -33,6 +35,8 @@ interface ToolResultBlock {
   tool_use_id: string;
   content: string | CoreContentBlock[];
   is_error?: boolean;
+  /** Executor-enriched diff data (best-effort, may not be present) */
+  diff?: DiffEnrichment;
 }
 
 interface ToolUseRendererProps {
@@ -55,21 +59,53 @@ export const ToolUseRenderer: React.FC<ToolUseRendererProps> = ({ toolUse, toolR
   // Check for custom renderer
   const CustomRenderer = getToolRenderer(name);
 
+  // Shared collapsible input parameters block
+  const inputParamsBlock = (
+    <details style={{ marginTop: token.sizeUnit }}>
+      <summary
+        style={{
+          cursor: 'pointer',
+          fontSize: 11,
+          color: token.colorTextTertiary,
+          userSelect: 'none',
+        }}
+      >
+        Input parameters
+      </summary>
+      <ThemedSyntaxHighlighter
+        language="json"
+        PreTag="pre"
+        customStyle={{
+          marginTop: token.sizeUnit / 2,
+          fontSize: 11,
+          maxHeight: 300,
+          overflow: 'auto',
+        }}
+      >
+        {JSON.stringify(input, null, 2)}
+      </ThemedSyntaxHighlighter>
+    </details>
+  );
+
   // If custom renderer exists, use it
   if (CustomRenderer) {
     return (
-      <CustomRenderer
-        toolUseId={toolUse.id}
-        input={input}
-        result={
-          toolResult
-            ? {
-                content: toolResult.content,
-                is_error: toolResult.is_error,
-              }
-            : undefined
-        }
-      />
+      <div>
+        <CustomRenderer
+          toolUseId={toolUse.id}
+          input={input}
+          result={
+            toolResult
+              ? {
+                  content: toolResult.content,
+                  is_error: toolResult.is_error,
+                  diff: toolResult.diff,
+                }
+              : undefined
+          }
+        />
+        {inputParamsBlock}
+      </div>
     );
   }
 
@@ -77,19 +113,7 @@ export const ToolUseRenderer: React.FC<ToolUseRendererProps> = ({ toolUse, toolR
   // Extract text content from tool result
   const getResultText = (): string => {
     if (!toolResult) return '';
-
-    if (typeof toolResult.content === 'string') {
-      return toolResult.content;
-    }
-
-    if (Array.isArray(toolResult.content)) {
-      return toolResult.content
-        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
-        .map((block) => block.text)
-        .join('\n\n');
-    }
-
-    return '';
+    return toolResultToDisplayText(toolResult.content);
   };
 
   const resultText = getResultText();
@@ -144,26 +168,10 @@ export const ToolUseRenderer: React.FC<ToolUseRendererProps> = ({ toolUse, toolR
       </div>
 
       {/* Tool input parameters (collapsible below result) */}
-      <details style={{ marginTop: token.sizeUnit }}>
-        <summary
-          style={{ cursor: 'pointer', fontSize: token.fontSizeSM, color: token.colorTextSecondary }}
-        >
-          Show input parameters
-        </summary>
-        <pre
-          style={{
-            marginTop: token.sizeUnit / 2,
-            background: token.colorBgLayout,
-            padding: token.sizeUnit,
-            borderRadius: token.borderRadius,
-            fontFamily: 'Monaco, Menlo, Ubuntu Mono, Consolas, source-code-pro, monospace',
-            fontSize: token.fontSizeSM,
-            overflowX: 'auto',
-          }}
-        >
-          {JSON.stringify(input, null, 2)}
-        </pre>
-      </details>
+      {inputParamsBlock}
     </div>
-  ) : null;
+  ) : (
+    // No result yet — still show input parameters so users can see what's running
+    <div>{inputParamsBlock}</div>
+  );
 };

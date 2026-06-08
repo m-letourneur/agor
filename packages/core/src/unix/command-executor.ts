@@ -315,7 +315,7 @@ export class SudoCliExecutor implements CommandExecutor {
 
   async exec(command: string): Promise<CommandResult> {
     // For SudoCliExecutor, the "command" is the admin subcommand
-    // e.g., "create-worktree-group --worktree-id abc123"
+    // e.g., "create-branch-group --branch-id abc123"
     const fullCommand = this.buildCommand(command);
 
     console.log(`[SudoCliExecutor] Executing: ${fullCommand}`);
@@ -528,11 +528,17 @@ export class ThrowingExecutor implements CommandExecutor {
   }
 
   async execAll(commands: string[]): Promise<CommandResult> {
-    const result = await this.delegate.execAll(commands);
-    if (result.exitCode !== 0) {
-      throw new CommandError(commands.join(' && '), result);
+    // Execute commands one at a time via this.exec so that on failure the
+    // CommandError carries the specific sub-command that failed (not the
+    // full `cmd1 && cmd2 && ...` joined string), making diagnostics clearer.
+    let combinedStdout = '';
+    let combinedStderr = '';
+    for (const command of commands) {
+      const result = await this.exec(command);
+      combinedStdout += result.stdout;
+      combinedStderr += result.stderr;
     }
-    return result;
+    return { stdout: combinedStdout, stderr: combinedStderr, exitCode: 0 };
   }
 
   async execWithInput(command: string[], options: ExecWithInputOptions): Promise<CommandResult> {
